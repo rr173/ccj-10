@@ -38,6 +38,26 @@ def test_only_holder_can_write_and_write_is_attributed_to_generation(client):
     assert (lease["generation"], False) in gens
 
 
+def test_same_holder_can_write_repeatedly_while_lease_valid(client):
+    lease = acquire(client, "cfg-repeat", "node-1")
+
+    # 租约没过期，同一持有者连续改动都应成功
+    for i in range(3):
+        rv = write(client, lease, f"v{i}")
+        assert rv.status_code == 201, rv.get_json()
+        assert rv.get_json()["accepted"] is True
+
+    res = client.get("/resources/cfg-repeat").get_json()
+    assert res["value"] == "v2"
+    assert res["last_passed_generation"] == lease["generation"]
+
+    # 三次写入全部留痕且都归属同一代租约
+    writes = client.get("/resources/cfg-repeat/writes").get_json()["writes"]
+    accepted = [w for w in writes if w["accepted"]]
+    assert len(accepted) == 3
+    assert {w["generation"] for w in accepted} == {lease["generation"]}
+
+
 def test_same_holder_reacquire_returns_same_generation(client):
     lease = acquire(client, "cfg-B", "node-1")
     rv = client.post("/leases/acquire", json={

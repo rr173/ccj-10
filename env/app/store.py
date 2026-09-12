@@ -352,8 +352,10 @@ class Store:
             res = self._conn.execute(
                 "SELECT * FROM resources WHERE resource=?", (resource,)
             ).fetchone()
-            # 当前世代号一定严格大于历史放行号（获取时 current_gen 单调 +1）
-            assert generation > res["last_passed_gen"]
+            # 栅栏不变量：当前世代号不落后于已放行号。
+            # 同一租约可重复写入（generation == last_passed_gen 属正常），
+            # 只有更旧的世代号才越界——而上面的生效租约校验已排除这种情况。
+            assert generation >= res["last_passed_gen"]
             self._conn.execute(
                 "UPDATE resources SET value=?, updated_by_gen=?, updated_at_ms=?, "
                 "last_passed_gen=? WHERE resource=?",
