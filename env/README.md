@@ -122,12 +122,134 @@ POST /resources/r/writes
 | `detail` | 拒绝原因（如 `generation_fence`、`ineligible_recipient`、`transfer_id_conflict`、`delegation_revoked`）或补充（如 `write_id=N`、`expires_wall_ms=...`） |
 | `wall_ms` / `logical` | 事件发生时的墙钟与逻辑钟读数 |
 
+## 审计回放与一致性诊断（只读）
+
+管理员可以针对某个**资源**或某张**委托凭证**，按时间范围或历史序号查看完整事件流，
+并在任意历史节点还原"当时的资源值、当前租约、委托状态与世代号"，还能比较两个节点、
+对历史做一致性诊断。所有审计接口都是**只读**的：只执行 SELECT，绝不调用过期收割、
+绝不改动正在运行的租约和委托（每个响应都带 `"read_only": true`）。
+
+### 稳定视图（snapshot）与固定分页
+
+- 每个审计响应都带 `view.snapshot_seq`（本次读看到的最大审计序号）与
+  `view.latest_seq`（全局最新序号）；
+- 回传 `?snapshot=<seq>` 即可把整组分页/回放/比较/诊断固定在**同一份历史**上：
+  并发写入要么整体在快照之前、要么整体在之后，绝不会读到半套状态；
+- 事件一律按全局 `seq` **升序**返回；分页用游标 `?after=<上一页最后一条 seq>&limit=`，
+  顺序固定，响应里 `next` 是下一页游标，`reached_end` 表示到末尾；
+- 历史是只增的 SQLite 记录，**服务重启后对同一份历史得到完全相同的结果**。
+
+### 事件流接口
+
+| 接口 | 作用域 |
+|---|---|
+| `GET /audit/events` | 全资源交错事件流（按全局 seq 升序） |
+| `GET /resources/<r>/audit/events` | 某资源的完整事件流 |
+| `GET /delegations/<credential_id>/audit/events` | 某委托凭证的完整轨迹 |
+
+通用查询参数（可任意组合）：
+
+| 参数 | 含义 |
+|---|---|
+| `from_ms` / `to_ms` | 墙钟时间范围（闭区间，按事件 `wall_ms` 过滤） |
+| `seq_min` / `seq_max` | 历史序号范围 |
+| `after` / `limit` | 分页游标与页大小（1–1000，默认 100） |
+| `outcome=ok,rejected` | 只看被接受/被拒绝的操作 |
+| `event=write,transfer,...` | 只看指定事件类型 |
+| `snapshot` | 固定稳定视图上界 |
+
+每条事件除原有字段外还带：
+
+- `accepted`：布尔，操作是否被接受；
+- `value`：被接受的写入事件当时落下去的资源值；
+- `narration`：中文叙述，说明**这一步是什么操作、被接受还是被拒绝、涉及谁、
+  拒绝原因是什么**（例如"协作者 node-y 持委托凭证 … 的写入被拒绝：
+  请求者不是凭证指定的协作者（授权者 node-1，锚定世代号 1）"）。
+
+### 历史节点回放
+
+```
+GET /resources/<r>/audit/replay?head=1
+GET /resources/<r>/audit/replay?at_seq=12
+GET /resources/<r>/audit/replay?at_wall_ms=1750000000000
+GET /delegations/<credential_id>/audit/replay?head=1
+```
+
+节点三选一（必须且只能给一个）：`head`（视图内最新）、`at_seq`（精确序号）、
+`at_wall_ms`（该时刻含之前最后一条事件）。响应包含：
+
+- `node`：被还原到的那个事件（含中文叙述、接受与否、涉及谁）；
+- `state_as_of_node.resource`：**当时的资源值**、值来源事件序号、
+  已放行最大世代号、资源当前（当时）世代号；
+- `state_as_of_node.lease`：**当时的当前租约**（持有者、世代号、active/released/
+  transferred/expired、续约次数、如何收尾）；
+- `state_as_of_node.generations`：到该节点为止发放过的全部世代号；
+- `state_as_of_node.delegations`：**当时各委托凭证的状态**（active/revoked/
+  expired/fenced、终态原因与终态事件序号、接受/拒绝写入次数）。
+
+凭证回放额外返回 `credential`（该凭证在节点处的状态）与其完整事件链。
+
+### 两节点比较：第一次产生差异的事件
+
+```
+GET /resources/<r>/audit/compare?a_at_seq=3&b_head=1
+GET /resources/<r>/audit/compare?a_at_seq=2&b_at_seq=9
+```
+
+两端各支持 `a_/b_` 前缀 + `at_seq|at_wall_ms|head`，要求 a 不晚于 b。响应给出：
+
+- `identical`：两节点业务状态是否完全一致；
+- `first_divergence`：**(a,b] 之间第一条让状态偏离 a 的事件**（被拒绝的操作
+  不改变状态，不会成为差异点）及其 `changed_fields`；
+- `state_at_first_divergence`：首异事件发生后每个变化字段在 a 点与该点的值；
+- `changed_fields_at_b`：到 b 点为止所有变化字段的前后值（资源值、当前租约
+  持有者/世代号、各凭证状态等）；
+- `rejected_events_between`：区间内被拒绝的操作与原因（它们不产生状态差异）。
+
+### 一致性诊断
+
+```
+GET /resources/<r>/audit/diagnose          # 单资源
+GET /delegations/<credential_id>/audit/diagnose   # 单凭证
+GET /audit/diagnose                        # 全局
+```
+
+诊断由事件流纯重放 + 与运行态审计表勾稽得到，输出 `issues`（每条带 `severity`、
+`seq`、`code`、中文 `message`）与 `summary`（按严重度与错误码计数，
+`consistent` 为 true 表示无 error）。可识别的问题包括：
+
+- **序号缺失**：`seq_missing`（全局 1..MAX 之间缺号，说明事件被删/损坏/绕过审计；
+  不同资源交错占用序号造成的"缺口"属正常，不会误报）；
+- **序号重复/重号**：`seq_duplicate`、`write_id_duplicate`；
+- **乱序**：`logical_clock_regressed`（逻辑钟只增不减，回退即篡改痕迹；
+  墙钟回拨 `wall_clock_moved_backward` 记为 info）；
+- **状态互相矛盾**，例如：
+  - 成功的获取/续约/释放/转移在投影中找不到匹配的生效租约
+    （`*_without_matching_active_lease`、`active_lease_superseded_without_handover`）；
+  - 成功写入的持有者/租约/世代号与生效租约对不上（栅栏被绕过的迹象）；
+  - 转移后世代号没有严格增大、成功转移缺少新租约；
+  - 委托凭证重复发放、无发放却有撤销/过期/栅栏、同一凭证被终止两次；
+  - 委托写入在凭证已失效/协作者不符/授权租约已换代时仍被标记接受；
+  - 事件与 `leases`/`writes`/`transfers`/`delegations` 表勾稽不符（跨表矛盾）。
+
+### 显式错误（不生成误导性空报告）
+
+| 场景 | 状态码 | error |
+|---|---|---|
+| 资源没有任何历史 / 凭证不存在 | 404 | `history_not_found` / `credential_not_found` |
+| `at_seq` 不存在、属于别的资源、越过 `snapshot` 上界 | 416 | `node_out_of_range`（附 `available_min_seq/available_max_seq` 等可用范围） |
+| `at_wall_ms` 早于首条事件、翻页游标越过末条事件、`snapshot` 超过最新序号 | 416 | `node_out_of_range` |
+| 时间/序号/过滤窗口内没有事件 | 404 | `no_events_in_range`（附事件实际区间） |
+| 节点选择器缺失/给了多个、参数非整数、`outcome/limit` 非法、a 晚于 b | 400 | `bad_request` |
+
 ## 持久性
 
 SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库中包含：
 生效租约、每资源世代号、写入审计、**转移记录（幂等键）**、**限时委托凭证**、
-**统一租约历史**、逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
-正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放；
+**统一租约历史（含每条被接受写入当时的资源值，供事件溯源回放）**、
+逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
+正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放，
+**审计回放、节点比较与一致性诊断对同一份历史给出逐字节一致的结果**；
 启动时即按墙钟收割已到期的委托。旧版本数据库会在启动时自动补列迁移。
 逻辑钟由后台 ticker 每秒 +1（每次推进都 fsync 落库）。
 
@@ -149,6 +271,15 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 | GET | `/resources/<r>/history` | **完整租约历史**：获取/续约/释放/转移/写入/委托，含被拒操作，按审计顺序；`?credential_id=<id>` 只看某张凭证的轨迹 |
 | GET | `/delegations/<credential_id>` | **按凭证号查委托**：授权者、协作者、有效期、锚定世代号、状态/终态原因 |
 | GET | `/writes/<id>` | **按写入 ID 反查：哪一代租约（或哪张委托凭证）放行** |
+| GET | `/audit/events` | **全局审计事件流**（seq 升序、固定分页、稳定视图；支持时间/序号/类型/结果过滤） |
+| GET | `/resources/<r>/audit/events` | 某资源的完整事件流（每条带 accepted、写入值与中文叙述） |
+| GET | `/delegations/<id>/audit/events` | 某委托凭证的完整事件流 |
+| GET | `/resources/<r>/audit/replay` | **历史节点回放**：`?head=1` / `?at_seq=` / `?at_wall_ms=` 三选一，还原当时资源值、当前租约、委托状态、世代号 |
+| GET | `/delegations/<id>/audit/replay` | 凭证视角的节点回放（附当时资源/租约上下文） |
+| GET | `/resources/<r>/audit/compare` | **比较两个历史节点**（`?a_at_seq=&b_at_seq=` 等），指出第一次产生差异的事件 |
+| GET | `/resources/<r>/audit/diagnose` | 单资源一致性诊断：缺号/重号/乱序/状态矛盾/跨表勾稽 |
+| GET | `/delegations/<id>/audit/diagnose` | 单凭证一致性诊断 |
+| GET | `/audit/diagnose` | 全局一致性诊断（含全局 seq 缺号检查） |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
 | GET | `/debug/now` | 两种时钟当前读数 |
@@ -228,3 +359,11 @@ PYTHONPATH=. pytest tests/ -q
 原租约释放/转移/硬过期连带栅栏、按凭证号过滤完整生命周期、
 重启后委托状态与审计顺序一致、旧库自动迁移、
 发放/撤销与并发写入下不出现"既能写又已撤销"。
+审计能力覆盖：事件流 seq 升序与固定游标分页、snapshot 在并发写入下稳定、
+多线程真实 HTTP 并发读不出现越界/半套视图、
+按序号/墙钟/最新节点回放资源值/当前租约/委托状态/世代号、
+每步中文叙述（接受/拒绝/涉及谁/原因）、
+两节点比较定位首异事件且拒绝事件不产生差异、同节点比较 identical、
+缺号（删事件后全局诊断）、重号、逻辑钟回退、不可能的成功事件等状态矛盾、
+凭证维度诊断、历史不存在 404/节点越界 416/过滤窗口空 404/参数错误 400、
+审计只读不收割不改变运行态、重启后回放与诊断结果一致。

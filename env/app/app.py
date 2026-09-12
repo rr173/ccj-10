@@ -21,6 +21,21 @@
   GET    /resources/<r>/history 完整租约历史（获取/续约/释放/转移/写入/委托，
                                含被拒绝的操作，按审计顺序排列）
   GET    /writes/<id>          按写入 ID 反查放行世代
+
+审计回放与一致性诊断（全部只读，不会改动运行中的租约/委托）：
+  GET    /audit/events                          全资源事件流（seq 升序、固定分页）
+  GET    /resources/<r>/audit/events            某资源的完整事件流
+  GET    /delegations/<id>/audit/events         某委托凭证的完整事件流
+       过滤: ?from_ms&to_ms | ?seq_min&seq_max | ?outcome=ok,rejected
+             | ?event=write,transfer | ?after=<seq>&limit | ?snapshot=<seq>
+  GET    /resources/<r>/audit/replay            还原历史节点的资源值/当前租约/
+                                                委托状态/世代号（?at_seq|at_wall_ms|head）
+  GET    /delegations/<id>/audit/replay         按凭证回放其在某节点的状态
+  GET    /resources/<r>/audit/compare           比较两节点（?a_at_seq&b_at_seq 等），
+                                                指出第一次产生差异的事件
+  GET    /resources/<r>/audit/diagnose          单资源一致性诊断（缺号/重号/乱序/矛盾）
+  GET    /delegations/<id>/audit/diagnose       单凭证一致性诊断
+  GET    /audit/diagnose                        全局诊断（含全局 seq 缺号检查）
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
   POST   /debug/tick           手动推进逻辑钟
   POST   /debug/wall-shift     拨墙钟（可正可负）
@@ -35,6 +50,15 @@ import time
 
 from flask import Flask, jsonify, request
 
+from .audit import (
+    AuditBadRequest,
+    AuditError,
+    AuditReader,
+    CredentialNotFound as AuditCredentialNotFound,
+    HistoryNotFound,
+    NoEventsInRange,
+    NodeOutOfRange,
+)
 from .store import (
     Conflict,
     DelegationNotFound,
@@ -69,6 +93,9 @@ def create_app(
         delegation_max_ttl_ms=_env_int("DELEGATION_MAX_TTL_MS", 60_000),
     )
     app.extensions["store"] = store
+    # 审计回放/诊断读取器：与写入路径共用同一把进程锁，但只读不写
+    audit = AuditReader(store)
+    app.extensions["audit"] = audit
     if enable_debug_api is None:
         enable_debug_api = os.environ.get("ENABLE_DEBUG_API", "1") == "1"
 
@@ -244,6 +271,105 @@ def create_app(
         return jsonify(w)
 
     # ------------------------------------------------------------------
+    # 审计回放与一致性诊断（全部只读，绝不改动运行中的租约/委托）
+    #
+    # 稳定视图：每个响应带 view.snapshot_seq；翻页/多次查询回传
+    # ?snapshot=<seq> 即固定在同一份历史上，并发写入不会让结果漂移。
+    # 节点三选一：at_seq=<seq> | at_wall_ms=<t> | head（最新）。
+    # ------------------------------------------------------------------
+    def _common_event_args():
+        args = request.args
+        outcomes = [o for o in args.get("outcome", "").split(",") if o]
+        bad = [o for o in outcomes if o not in ("ok", "rejected")]
+        if bad:
+            raise AuditBadRequest("outcome 只能取 ok / rejected",
+                                  bad_outcomes=bad)
+        event_types = [e for e in args.get("event", "").split(",") if e]
+        return {
+            "after_seq": args.get("after"),
+            "limit": args.get("limit", 100),
+            "snapshot": args.get("snapshot"),
+            "seq_min": args.get("seq_min"),
+            "seq_max": args.get("seq_max"),
+            "from_ms": args.get("from_ms"),
+            "to_ms": args.get("to_ms"),
+            "outcomes": outcomes or None,
+            "event_types": event_types or None,
+        }
+
+    def _node_args(prefix: str = ""):
+        args = request.args
+        return {
+            f"{prefix}at_seq": args.get(f"{prefix}at_seq"),
+            f"{prefix}at_wall_ms": args.get(f"{prefix}at_wall_ms"),
+            f"{prefix}head": args.get(f"{prefix}head", "").lower()
+            in ("1", "true", "yes"),
+        }
+
+    @app.get("/audit/events")
+    def audit_global_events():
+        # 全局事件流（所有资源交错），按全局 seq 升序固定排列
+        return jsonify(audit.list_events(scope="global",
+                                         **_common_event_args()))
+
+    @app.get("/resources/<resource>/audit/events")
+    def audit_resource_events(resource):
+        return jsonify(audit.list_events(
+            scope="resource", resource=resource, **_common_event_args()))
+
+    @app.get("/delegations/<credential_id>/audit/events")
+    def audit_credential_events(credential_id):
+        return jsonify(audit.list_events(
+            scope="credential", credential_id=credential_id,
+            **_common_event_args()))
+
+    @app.get("/resources/<resource>/audit/replay")
+    def audit_resource_replay(resource):
+        kw = _node_args()
+        return jsonify(audit.replay_resource(
+            resource,
+            at_seq=kw["at_seq"], at_wall_ms=kw["at_wall_ms"],
+            head=kw["head"], snapshot=request.args.get("snapshot"),
+        ))
+
+    @app.get("/delegations/<credential_id>/audit/replay")
+    def audit_credential_replay(credential_id):
+        kw = _node_args()
+        return jsonify(audit.replay_credential(
+            credential_id,
+            at_seq=kw["at_seq"], at_wall_ms=kw["at_wall_ms"],
+            head=kw["head"], snapshot=request.args.get("snapshot"),
+        ))
+
+    @app.get("/resources/<resource>/audit/compare")
+    def audit_compare(resource):
+        a = _node_args("a_")
+        b = _node_args("b_")
+        return jsonify(audit.compare_nodes(
+            resource,
+            a_seq=a["a_at_seq"], a_wall_ms=a["a_at_wall_ms"], a_head=a["a_head"],
+            b_seq=b["b_at_seq"], b_wall_ms=b["b_at_wall_ms"], b_head=b["b_head"],
+            snapshot=request.args.get("snapshot"),
+        ))
+
+    @app.get("/resources/<resource>/audit/diagnose")
+    def audit_diagnose_resource(resource):
+        return jsonify(
+            audit.diagnose_resource(resource,
+                                    snapshot=request.args.get("snapshot")))
+
+    @app.get("/delegations/<credential_id>/audit/diagnose")
+    def audit_diagnose_credential(credential_id):
+        return jsonify(
+            audit.diagnose_credential(credential_id,
+                                      snapshot=request.args.get("snapshot")))
+
+    @app.get("/audit/diagnose")
+    def audit_diagnose_global():
+        return jsonify(
+            audit.diagnose_global(snapshot=request.args.get("snapshot")))
+
+    # ------------------------------------------------------------------
     # 调试：手动驱动两种时钟，演练"拨表/逻辑卡死"故障
     # ------------------------------------------------------------------
     @app.post("/debug/tick")
@@ -274,6 +400,16 @@ def create_app(
     # ------------------------------------------------------------------
     # 错误处理
     # ------------------------------------------------------------------
+    @app.errorhandler(AuditBadRequest)
+    @app.errorhandler(NoEventsInRange)
+    @app.errorhandler(HistoryNotFound)
+    @app.errorhandler(AuditCredentialNotFound)
+    @app.errorhandler(NodeOutOfRange)
+    def _audit_error(exc: AuditError):
+        # 回放/诊断的参数与范围错误一律给出明确的结构化错误，
+        # 绝不降级成 200 + 空报告
+        return jsonify(exc.to_response()), exc.status
+
     @app.errorhandler(GenerationTooSmall)
     def _gen_conflict(exc):
         return jsonify({"error": "generation_fence", "message": str(exc)}), 409

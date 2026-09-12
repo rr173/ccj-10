@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS lease_events (
     to_generation INTEGER,
     credential_id TEXT,                 -- 委托事件：涉及的凭证
     detail        TEXT,                 -- 拒绝原因 / write_id 等补充
+    value         TEXT,                 -- 仅被接受的写入事件：当时落下去的资源值（审计回放用）
     wall_ms       INTEGER NOT NULL,
     logical       INTEGER NOT NULL
 );
@@ -236,6 +237,10 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE lease_events ADD COLUMN credential_id TEXT"
             )
+        if "value" not in events_cols:
+            self._conn.execute(
+                "ALTER TABLE lease_events ADD COLUMN value TEXT"
+            )
         # 新库旧库都走这里：列已存在时 IF NOT EXISTS 是空操作
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_credential "
@@ -275,15 +280,16 @@ class Store:
         to_generation: int | None = None,
         credential_id: str | None = None,
         detail: str | None = None,
+        value: str | None = None,
         now: int | None = None,
     ) -> None:
         self._conn.execute(
             "INSERT INTO lease_events(resource, event, outcome, holder, peer, "
             "lease_id, generation, to_lease_id, to_generation, credential_id, "
-            "detail, wall_ms, logical) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "detail, value, wall_ms, logical) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 resource, event, outcome, holder, peer, lease_id, generation,
-                to_lease_id, to_generation, credential_id, detail,
+                to_lease_id, to_generation, credential_id, detail, value,
                 now if now is not None else self.clock.wall_ms(),
                 self.clock.logical(),
             ),
@@ -957,6 +963,7 @@ class Store:
                     holder, lease_id=row["id"] if row else None,
                     generation=generation,
                     detail=f"write_id={cur.lastrowid}" if accepted else reason,
+                    value=value if accepted else None,
                     now=now,
                 )
                 self._conn.commit()
@@ -1043,6 +1050,7 @@ class Store:
                 peer=d["authorizer"], lease_id=d["lease_id"],
                 generation=d["generation"], credential_id=credential_id,
                 detail=f"write_id={cur.lastrowid}" if accepted else reason,
+                value=value if accepted else None,
                 now=now,
             )
             self._conn.commit()

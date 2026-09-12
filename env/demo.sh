@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 端到端演练：获取租约 -> 双时钟抗拨表 -> 交接 -> 旧世代号被栅栏拒绝 -> 审计反查
-#             -> 安全转移（幂等/防重放）-> 完整租约历史
+#             -> 安全转移（幂等/防重放）-> 完整租约历史 -> 委托
+#             -> 审计事件流/节点回放/两节点比较/一致性诊断（全部只读）
 # 用法: ./demo.sh [BASE_URL]
 set -euo pipefail
 
@@ -144,3 +145,84 @@ echo
 echo "== 17. 按凭证号查委托与其完整历史（授权者/协作者/有效期/世代号/每次结果） =="
 curl -s "$BASE/delegations/$CID" | python3 -m json.tool
 curl -s "$BASE/resources/$R/history?credential_id=$CID" | python3 -m json.tool
+
+echo
+echo "== 18. 审计事件流（seq 升序、固定分页、每条带中文叙述） =="
+PAGE=$(curl -s "$BASE/resources/$R/audit/events?limit=5")
+echo "$PAGE" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for e in d['events']:
+    print(f\"  seq={e['seq']:>3} {e['event']:<16} {e['outcome']:<9} {e['holder']:<9} -> {e.get('narration')}\")
+print('  next =', d['next'], ' reached_end =', d['reached_end'],
+      ' snapshot =', d['view']['snapshot_seq'])
+"
+SNAP=$(echo "$PAGE" | j "['view']['snapshot_seq']")
+echo "   固定快照 snapshot=$SNAP 再查一次（并发写入不会改变结果）："
+curl -s "$BASE/resources/$R/audit/events?snapshot=$SNAP&limit=1000" \
+  | j "['view']['snapshot_seq']" | sed 's/^/   snapshot = /'
+
+echo
+echo "== 19. 历史节点回放：还原 v1 写入那一刻的资源值/租约/委托/世代号 =="
+V1_SEQ=$(curl -s "$BASE/resources/$R/audit/events?event=write&limit=1000" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['events'][0]['seq'])")
+echo "   v1 写入事件 seq=$V1_SEQ"
+curl -s "$BASE/resources/$R/audit/replay?at_seq=$V1_SEQ" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+s=d['state_as_of_node']
+print('   节点:', d['node']['narration'])
+print('   当时资源值 =', s['resource']['value'],
+      ' 当前世代号 =', s['resource']['current_generation'])
+print('   当时租约持有者 =', s['lease']['holder'],
+      ' 租约世代 =', s['lease']['generation'],
+      ' 状态 =', s['lease']['state'])
+print('   委托数量 =', len(s['delegations']), '（v1 时代还没有委托）')
+"
+
+echo
+echo "== 20. 比较两个历史节点：第一次产生差异的事件 =="
+HEAD_SEQ=$(curl -s "$BASE/resources/$R/audit/events?limit=1000" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['events'][-1]['seq'])")
+curl -s "$BASE/resources/$R/audit/compare?a_at_seq=$V1_SEQ&b_at_seq=$HEAD_SEQ" \
+  | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+f=d['first_divergence']
+print('   identical =', d['identical'], ' 区间事件数 =', d['events_between'])
+print('   首异事件 seq=%s %s/%s' % (f['seq'], f['event'], f['outcome']))
+print('   ->', f['narration'])
+print('   首异时变化字段:', ', '.join(f['changed_fields']))
+"
+
+echo
+echo "== 21. 一致性诊断（资源 / 凭证 / 全局）—— 健康历史应 consistent=true =="
+curl -s "$BASE/resources/$R/audit/diagnose" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('   资源诊断:', d['summary'])
+"
+curl -s "$BASE/delegations/$CID/audit/diagnose" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('   凭证诊断:', d['summary'], ' 投影状态 =', d['projected_state']['state'])
+"
+curl -s "$BASE/audit/diagnose" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('   全局诊断:', d['summary'], ' 资源 =', d['resources'])
+"
+
+echo
+echo "== 22. 显式错误（不是空报告）：历史不存在 404 / 节点越界 416 / 窗口为空 404 =="
+curl -s -o /tmp/e1.json -w "   不存在的资源历史: HTTP %{http_code}\n" \
+  "$BASE/resources/no-such-resource/audit/events"
+cat /tmp/e1.json | python3 -c "import sys,json;print('    ->',json.load(sys.stdin)['error'])"
+curl -s -o /tmp/e2.json -w "   序号越界回放:     HTTP %{http_code}\n" \
+  "$BASE/resources/$R/audit/replay?at_seq=99999999"
+cat /tmp/e2.json | python3 -c "import sys,json;d=json.load(sys.stdin);print('    ->',d['error'],'可用范围:',d.get('available_min_seq'),'..',d.get('available_max_seq'))"
+curl -s -o /tmp/e3.json -w "   空时间窗口:       HTTP %{http_code}\n" \
+  "$BASE/resources/$R/audit/events?to_ms=1"
+cat /tmp/e3.json | python3 -c "import sys,json;print('    ->',json.load(sys.stdin)['error'])"
+echo
+echo "演练完成。所有审计接口均为只读，未改动上面运行中的任何租约与委托。"
