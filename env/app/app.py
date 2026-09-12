@@ -4,10 +4,14 @@
   POST   /leases/acquire       获取（新世代号）
   POST   /leases/renew         续约（世代号不变，软 TTL 顺延）
   POST   /leases/release       释放
+  POST   /leases/transfer      安全转移（原子交接：旧持有者即刻失效，
+                               新持有者拿更大世代号；transfer_id 幂等）
   POST   /resources/<r>/writes 受租约保护的写入（栅栏校验点）
   GET    /resources/<r>        查资源当前世代/值
   GET    /resources/<r>/leases 查当前租约
   GET    /resources/<r>/writes 查某次/每次写入是哪一代租约放行的
+  GET    /resources/<r>/history 完整租约历史（获取/续约/释放/转移/写入，
+                               含被拒绝的操作，按审计顺序排列）
   GET    /writes/<id>          按写入 ID 反查放行世代
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
   POST   /debug/tick           手动推进逻辑钟
@@ -101,6 +105,21 @@ def create_app(
         store.release(resource, holder, generation)
         return jsonify({"released": True, "resource": resource})
 
+    @app.post("/leases/transfer")
+    def transfer():
+        data = body()
+        resource = require(data, "resource")
+        holder = require(data, "holder")
+        generation = int(require(data, "generation"))
+        # to_holder 的校验放在 store 层，不合格接收者也会记入历史
+        result = store.transfer(
+            resource, holder, generation,
+            to_holder=data.get("to_holder"),
+            transfer_id=data.get("transfer_id"),
+            ttl_ms=data.get("ttl_ms"),
+        )
+        return jsonify(result), 200 if result["replayed"] else 201
+
     # ------------------------------------------------------------------
     # 受保护写入
     # ------------------------------------------------------------------
@@ -135,6 +154,13 @@ def create_app(
         limit = min(int(request.args.get("limit", 100)), 1000)
         return jsonify(
             {"resource": resource, "writes": store.list_writes(resource, limit)}
+        )
+
+    @app.get("/resources/<resource>/history")
+    def get_history(resource):
+        limit = min(int(request.args.get("limit", 200)), 1000)
+        return jsonify(
+            {"resource": resource, "events": store.list_history(resource, limit)}
         )
 
     @app.get("/writes/<int:write_id>")

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # 端到端演练：获取租约 -> 双时钟抗拨表 -> 交接 -> 旧世代号被栅栏拒绝 -> 审计反查
+#             -> 安全转移（幂等/防重放）-> 完整租约历史
 # 用法: ./demo.sh [BASE_URL]
 set -euo pipefail
 
@@ -66,3 +67,37 @@ curl -s "$BASE/resources/$R" | python3 -m json.tool
 echo
 echo "== 7. 完整写入审计（含被拒的那次，写着拒绝原因） =="
 curl -s "$BASE/resources/$R/writes" | python3 -m json.tool
+
+echo
+echo "== 8. node-2 把租约安全转移给 node-3（原子交接，幂等键 xfer-\$R） =="
+TR=$(curl -s -X POST "$BASE/leases/transfer" -H 'Content-Type: application/json' \
+  -d "{\"resource\":\"$R\",\"holder\":\"node-2\",\"generation\":$GEN2,\"to_holder\":\"node-3\",\"transfer_id\":\"xfer-$R\"}")
+echo "$TR" | python3 -m json.tool
+GEN3=$(echo "$TR" | j "['to']['generation']")
+echo "   node-2 世代=$GEN2 -> node-3 世代=$GEN3 （严格增大）"
+
+echo
+echo "== 9. 同一笔转移原样重提（网络重试）—— 必须回放首次结果，不再次转移 =="
+curl -s -o /tmp/tr2.json -w "   HTTP %{http_code}\n" -X POST \
+  "$BASE/leases/transfer" -H 'Content-Type: application/json' \
+  -d "{\"resource\":\"$R\",\"holder\":\"node-2\",\"generation\":$GEN2,\"to_holder\":\"node-3\",\"transfer_id\":\"xfer-$R\"}"
+python3 -c "import json;d=json.load(open('/tmp/tr2.json'));print('   replayed =',d['replayed'],' to.generation =',d['to']['generation'])"
+
+echo
+echo "== 10. node-2 旧凭证重放（转移/写入）—— 必须全部拒绝 =="
+curl -s -o /dev/null -w "   旧凭证再转移: HTTP %{http_code}\n" -X POST \
+  "$BASE/leases/transfer" -H 'Content-Type: application/json' \
+  -d "{\"resource\":\"$R\",\"holder\":\"node-2\",\"generation\":$GEN2,\"to_holder\":\"node-9\",\"transfer_id\":\"xfer2-$R\"}"
+curl -s -o /dev/null -w "   旧世代号写入: HTTP %{http_code}\n" -X POST \
+  "$BASE/resources/$R/writes" -H 'Content-Type: application/json' \
+  -d "{\"holder\":\"node-2\",\"generation\":$GEN2,\"value\":\"stale\"}"
+
+echo
+echo "== 11. node-3 用新世代 $GEN3 写入 —— 放行 =="
+curl -s -X POST "$BASE/resources/$R/writes" -H 'Content-Type: application/json' \
+  -d "{\"holder\":\"node-3\",\"generation\":$GEN3,\"value\":\"v3\"}" >/dev/null
+curl -s "$BASE/resources/$R" | python3 -m json.tool
+
+echo
+echo "== 12. 完整租约历史（获取/续约/释放/转移/写入，成功与拒绝都在） =="
+curl -s "$BASE/resources/$R/history" | python3 -m json.tool

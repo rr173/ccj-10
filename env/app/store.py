@@ -28,6 +28,7 @@ from .clock import Clock
 STATE_ACTIVE = "active"
 STATE_EXPIRED = "expired"
 STATE_RELEASED = "released"
+STATE_TRANSFERRED = "transferred"   # 已转移：旧持有者即刻失去一切权限
 
 # 过期原因（state=expired 时）
 REASON_HARD_WALL = "hard_wall_deadline_reached"       # 逻辑钟卡死也救不了：到硬上限
@@ -91,6 +92,36 @@ CREATE TABLE IF NOT EXISTS writes (
     created_at_ms      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_writes_resource ON writes(resource, id);
+-- 转移记录：transfer_id 是幂等键，重复提交同一笔转移直接回放首次结果
+CREATE TABLE IF NOT EXISTS transfers (
+    transfer_id     TEXT PRIMARY KEY,
+    resource        TEXT NOT NULL,
+    from_holder     TEXT NOT NULL,
+    to_holder       TEXT NOT NULL,
+    from_lease_id   TEXT NOT NULL,
+    from_generation INTEGER NOT NULL,
+    new_lease_id    TEXT NOT NULL,
+    new_generation  INTEGER NOT NULL,
+    created_at_ms   INTEGER NOT NULL
+);
+-- 统一租约历史：每次获取/续约/释放/转移/写入（含被拒绝的）都留一条，
+-- seq 全局单调递增即审计顺序，落库后重启不丢
+CREATE TABLE IF NOT EXISTS lease_events (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    resource      TEXT NOT NULL,
+    event         TEXT NOT NULL,        -- acquire/renew/release/transfer/write
+    outcome       TEXT NOT NULL,        -- ok / rejected
+    holder        TEXT NOT NULL,        -- 操作发起者
+    peer          TEXT,                 -- 另一方：transfer 的接收者 / acquire 冲突时的持有者
+    lease_id      TEXT,
+    generation    INTEGER,
+    to_lease_id   TEXT,                 -- 仅 transfer：产生的新租约
+    to_generation INTEGER,
+    detail        TEXT,                 -- 拒绝原因 / write_id 等补充
+    wall_ms       INTEGER NOT NULL,
+    logical       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_resource ON lease_events(resource, seq);
 """
 
 
@@ -139,6 +170,34 @@ class Store:
             "INSERT INTO meta(key, value) VALUES(?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
+        )
+
+    # ---- 统一历史：与状态变更同事务写入，调用方负责 commit --------------
+    def _record_event_locked(
+        self,
+        resource: str,
+        event: str,
+        outcome: str,
+        holder: str,
+        *,
+        peer: str | None = None,
+        lease_id: str | None = None,
+        generation: int | None = None,
+        to_lease_id: str | None = None,
+        to_generation: int | None = None,
+        detail: str | None = None,
+        now: int | None = None,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO lease_events(resource, event, outcome, holder, peer, "
+            "lease_id, generation, to_lease_id, to_generation, detail, "
+            "wall_ms, logical) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                resource, event, outcome, holder, peer, lease_id, generation,
+                to_lease_id, to_generation, detail,
+                now if now is not None else self.clock.wall_ms(),
+                self.clock.logical(),
+            ),
         )
 
     # ---- 逻辑钟推进（后台 ticker / 测试接口调用） -----------------------
@@ -231,7 +290,21 @@ class Store:
             ).fetchone()
             if existing is not None:
                 if existing["holder"] == holder:
+                    self._record_event_locked(
+                        resource, "acquire", "ok", holder,
+                        lease_id=existing["id"],
+                        generation=existing["generation"],
+                        detail="reused_existing",
+                    )
+                    self._conn.commit()
                     return self._lease_view_locked(existing), False
+                self._record_event_locked(
+                    resource, "acquire", "rejected", holder,
+                    peer=existing["holder"], lease_id=existing["id"],
+                    generation=existing["generation"],
+                    detail="resource_held_by_other",
+                )
+                self._conn.commit()
                 raise Conflict(f"资源 {resource} 已被 {existing['holder']} 持有")
 
             ttl = self._clamp_ttl(ttl_ms)
@@ -248,6 +321,10 @@ class Store:
                     lease_id, resource, holder, gen, now, now + ttl,
                     now + self.hard_ttl_ms, self.logical_grace, logical, now,
                 ),
+            )
+            self._record_event_locked(
+                resource, "acquire", "ok", holder,
+                lease_id=lease_id, generation=gen, now=now,
             )
             self._conn.commit()
             row = self._conn.execute(
@@ -277,9 +354,20 @@ class Store:
             self._reap_locked()
             row = self._get_active_locked(resource)
             if row is None:
+                self._record_event_locked(
+                    resource, "renew", "rejected", holder,
+                    generation=generation, detail="no_active_lease",
+                )
+                self._conn.commit()
                 raise LeaseGone(f"资源 {resource} 没有生效中的租约，续约被拒绝；"
                                 "请重新获取并取得更大的世代号")
             if row["holder"] != holder or row["generation"] != generation:
+                self._record_event_locked(
+                    resource, "renew", "rejected", holder,
+                    lease_id=row["id"], generation=generation,
+                    detail="holder_or_generation_mismatch",
+                )
+                self._conn.commit()
                 raise Conflict("持有者或世代号与当前生效租约不符")
 
             now = self.clock.wall_ms()
@@ -291,6 +379,10 @@ class Store:
                 "UPDATE leases SET wall_deadline_ms=?, last_seen_logical=?, "
                 "renewed_count=renewed_count+1 WHERE id=?",
                 (new_soft, self.clock.logical(), row["id"]),
+            )
+            self._record_event_locked(
+                resource, "renew", "ok", holder,
+                lease_id=row["id"], generation=generation, now=now,
             )
             self._conn.commit()
             row = self._conn.execute(
@@ -304,14 +396,196 @@ class Store:
             self._reap_locked()
             row = self._get_active_locked(resource)
             if row is None:
+                self._record_event_locked(
+                    resource, "release", "rejected", holder,
+                    generation=generation, detail="no_active_lease",
+                )
+                self._conn.commit()
                 raise LeaseGone(f"资源 {resource} 没有生效中的租约")
             if row["holder"] != holder or row["generation"] != generation:
+                self._record_event_locked(
+                    resource, "release", "rejected", holder,
+                    lease_id=row["id"], generation=generation,
+                    detail="holder_or_generation_mismatch",
+                )
+                self._conn.commit()
                 raise Conflict("持有者或世代号与当前生效租约不符")
             self._conn.execute(
                 "UPDATE leases SET state=? WHERE id=?",
                 (STATE_RELEASED, row["id"]),
             )
+            self._record_event_locked(
+                resource, "release", "ok", holder,
+                lease_id=row["id"], generation=generation,
+            )
             self._conn.commit()
+
+    # ---- 安全转移 -------------------------------------------------------
+    def transfer(
+        self,
+        resource: str,
+        holder: str,
+        generation: int,
+        to_holder,
+        transfer_id=None,
+        ttl_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """把生效中的租约原子地转给 to_holder。
+
+        单事务内完成：旧租约置为 transferred（旧持有者即刻失去写权限）、
+        资源世代号 +1、以更大世代号发放新租约（新持有者即刻可写）、
+        落转移记录与历史事件。崩溃只会整体回滚，不留半完成状态。
+
+        transfer_id 是幂等键：同一笔转移重复提交直接回放首次结果，
+        不会再次转移；同一 transfer_id 配不同参数则拒绝。
+        """
+        with self._lock:
+            self._reap_locked()
+            now = self.clock.wall_ms()
+            if transfer_id is not None:
+                transfer_id = str(transfer_id)
+
+            # 1) 幂等键先行：已执行过的转移，参数一致 -> 回放首次结果
+            if transfer_id:
+                prev = self._conn.execute(
+                    "SELECT * FROM transfers WHERE transfer_id=?",
+                    (transfer_id,),
+                ).fetchone()
+                if prev is not None:
+                    same = (
+                        prev["resource"] == resource
+                        and prev["from_holder"] == holder
+                        and prev["from_generation"] == generation
+                        and prev["to_holder"] == to_holder
+                    )
+                    if not same:
+                        self._record_event_locked(
+                            resource, "transfer", "rejected", holder,
+                            peer=to_holder if isinstance(to_holder, str)
+                            else None,
+                            generation=generation,
+                            detail="transfer_id_conflict", now=now,
+                        )
+                        self._conn.commit()
+                        raise Conflict(
+                            f"transfer_id {transfer_id} 已被一笔参数不同的"
+                            "转移占用，本次请求被拒绝"
+                        )
+                    lease_row = self._conn.execute(
+                        "SELECT * FROM leases WHERE id=?",
+                        (prev["new_lease_id"],),
+                    ).fetchone()
+                    return self._transfer_view_locked(prev, lease_row,
+                                                      replayed=True)
+
+            # 2) 接收者资格：非空字符串、不能转给当前持有者自己
+            if not isinstance(to_holder, str) or not to_holder.strip():
+                self._record_event_locked(
+                    resource, "transfer", "rejected", holder,
+                    generation=generation, detail="ineligible_recipient",
+                    now=now,
+                )
+                self._conn.commit()
+                raise Conflict("接收者不符合条件：to_holder 必须是非空字符串")
+            if to_holder == holder:
+                self._record_event_locked(
+                    resource, "transfer", "rejected", holder,
+                    peer=to_holder, generation=generation,
+                    detail="ineligible_recipient:self", now=now,
+                )
+                self._conn.commit()
+                raise Conflict("接收者不符合条件：不能转移给当前持有者自己")
+
+            # 3) 旧凭证校验：必须是当前生效租约的持有者与世代号
+            row = self._get_active_locked(resource)
+            if row is None:
+                self._record_event_locked(
+                    resource, "transfer", "rejected", holder,
+                    peer=to_holder, generation=generation,
+                    detail="no_active_lease", now=now,
+                )
+                self._conn.commit()
+                raise LeaseGone(f"资源 {resource} 没有生效中的租约，转移被拒绝")
+            if row["holder"] != holder or row["generation"] != generation:
+                self._record_event_locked(
+                    resource, "transfer", "rejected", holder,
+                    peer=to_holder, lease_id=row["id"], generation=generation,
+                    detail="holder_or_generation_mismatch", now=now,
+                )
+                self._conn.commit()
+                raise Conflict("持有者或世代号与当前生效租约不符，转移被拒绝")
+
+            # 4) 原子交接：以下全部写操作一次 commit，要么全成要么全不成
+            transfer_id = transfer_id or str(uuid.uuid4())
+            new_gen = self._next_generation_locked(resource)
+            new_lease_id = str(uuid.uuid4())
+            ttl = self._clamp_ttl(ttl_ms)
+            logical = self.clock.logical()
+            self._conn.execute(
+                "UPDATE leases SET state=? WHERE id=?",
+                (STATE_TRANSFERRED, row["id"]),
+            )
+            self._conn.execute(
+                "INSERT INTO leases(id, resource, holder, generation, "
+                "granted_wall_ms, wall_deadline_ms, hard_wall_deadline_ms, "
+                "logical_grace, last_seen_logical, created_at_ms) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    new_lease_id, resource, to_holder, new_gen, now,
+                    now + ttl, now + self.hard_ttl_ms, self.logical_grace,
+                    logical, now,
+                ),
+            )
+            self._conn.execute(
+                "INSERT INTO transfers(transfer_id, resource, from_holder, "
+                "to_holder, from_lease_id, from_generation, new_lease_id, "
+                "new_generation, created_at_ms) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    transfer_id, resource, holder, to_holder, row["id"],
+                    row["generation"], new_lease_id, new_gen, now,
+                ),
+            )
+            self._record_event_locked(
+                resource, "transfer", "ok", holder,
+                peer=to_holder, lease_id=row["id"],
+                generation=row["generation"], to_lease_id=new_lease_id,
+                to_generation=new_gen, now=now,
+            )
+            self._conn.commit()
+            transfer_row = self._conn.execute(
+                "SELECT * FROM transfers WHERE transfer_id=?", (transfer_id,)
+            ).fetchone()
+            lease_row = self._conn.execute(
+                "SELECT * FROM leases WHERE id=?", (new_lease_id,)
+            ).fetchone()
+            return self._transfer_view_locked(transfer_row, lease_row,
+                                              replayed=False)
+
+    def _transfer_view_locked(self, t, lease_row, *, replayed: bool):
+        lease_view = None
+        if lease_row is not None:
+            status = self._classify_locked(lease_row)
+            lease_view = self._lease_view_locked(lease_row,
+                                                 state=status["state"])
+            if status["state"] != STATE_ACTIVE:
+                lease_view["expire_reason"] = status["expire_reason"]
+        return {
+            "transfer_id": t["transfer_id"],
+            "resource": t["resource"],
+            "replayed": replayed,
+            "from": {
+                "holder": t["from_holder"],
+                "lease_id": t["from_lease_id"],
+                "generation": t["from_generation"],
+            },
+            "to": {
+                "holder": t["to_holder"],
+                "lease_id": t["new_lease_id"],
+                "generation": t["new_generation"],
+            },
+            "lease": lease_view,
+            "created_at_ms": t["created_at_ms"],
+        }
 
     # ---- 受租约保护的写入（栅栏点） -------------------------------------
     def write(
@@ -331,6 +605,13 @@ class Store:
                         resource, generation, row["id"] if row else "",
                         holder, 1 if accepted else 0, reason, now,
                     ),
+                )
+                self._record_event_locked(
+                    resource, "write", "ok" if accepted else "rejected",
+                    holder, lease_id=row["id"] if row else None,
+                    generation=generation,
+                    detail=f"write_id={cur.lastrowid}" if accepted else reason,
+                    now=now,
                 )
                 self._conn.commit()
                 return {
@@ -432,14 +713,36 @@ class Store:
                 "created_at_ms": r["created_at_ms"],
             }
 
-    def _lease_view_locked(self, row) -> dict[str, Any]:
+    def list_history(self, resource: str, limit: int = 200) -> list[dict[str, Any]]:
+        """按资源返回统一租约历史，按审计顺序（seq）从旧到新排列。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM lease_events WHERE resource=? "
+                "ORDER BY seq DESC LIMIT ?",
+                (resource, int(limit)),
+            ).fetchall()
+            return [
+                {
+                    "seq": r["seq"], "resource": r["resource"],
+                    "event": r["event"], "outcome": r["outcome"],
+                    "holder": r["holder"], "peer": r["peer"],
+                    "lease_id": r["lease_id"], "generation": r["generation"],
+                    "to_lease_id": r["to_lease_id"],
+                    "to_generation": r["to_generation"],
+                    "detail": r["detail"],
+                    "wall_ms": r["wall_ms"], "logical": r["logical"],
+                }
+                for r in reversed(rows)
+            ]
+
+    def _lease_view_locked(self, row, state: str = STATE_ACTIVE) -> dict[str, Any]:
         logical = self.clock.logical()
         return {
             "resource": row["resource"],
             "lease_id": row["id"],
             "holder": row["holder"],
             "generation": row["generation"],
-            "state": STATE_ACTIVE,
+            "state": state,
             "granted_wall_ms": row["granted_wall_ms"],
             "wall_deadline_ms": row["wall_deadline_ms"],
             "hard_wall_deadline_ms": row["hard_wall_deadline_ms"],

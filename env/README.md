@@ -35,11 +35,50 @@ wall_ms < hard_wall_deadline_ms
 - 资源记录 `last_passed_generation`，并对每次写入（含被拒的）留审计：
   可通过 `GET /writes/<id>` 查出某次写入是**哪一代租约、哪个 lease_id、哪个持有者**放行的。
 
+## 安全转移（transfer）
+
+持有者可以把**仍有效**的租约直接转给指定接收者，无需先释放再重新获取：
+
+```
+POST /leases/transfer
+{"resource":"r","holder":"node-a","generation":3,"to_holder":"node-b","transfer_id":"xfer-001"}
+```
+
+- **原子交接**：旧租约置为 `transferred`、世代号 +1、以更大世代号向接收者发放新租约，
+  全部在同一个事务里完成——旧持有者即刻失去写权限，新持有者即刻可写，
+  崩溃只会整体回滚，不会留下半完成状态；
+- **幂等**：`transfer_id` 是幂等键。同一笔转移重复提交（网络重试）返回首次结果
+  （HTTP 200 + `"replayed": true`），不会再次转移；同一 `transfer_id` 搭配不同参数
+  （换接收者/换世代号）直接 409 拒绝；
+- **防重放**：转移完成后，旧持有者的 `holder + generation` 对转移/续约/释放/写入
+  一律被拒（409），并全部记入历史；
+- **接收者资格**：`to_holder` 必须是非空字符串且不能是当前持有者自己，
+  不合格时拒绝且不产生任何状态变化；
+- 新租约按 `ttl_ms`（缺省用默认 TTL）重新计时，硬墙钟上限也从交接时刻重新起算。
+
+## 完整租约历史
+
+`GET /resources/<r>/history` 按审计顺序（`seq` 全局单调递增，重启后延续）返回该资源的
+每一次**获取、续约、释放、转移、写入**，成功（`"outcome":"ok"`）与拒绝
+（`"outcome":"rejected"`，`detail` 给出原因）都留痕。每条事件包含：
+
+| 字段 | 含义 |
+|---|---|
+| `seq` | 全局单调递增序号，即审计顺序 |
+| `event` / `outcome` | 操作类型（acquire/renew/release/transfer/write）与结果（ok/rejected） |
+| `holder` / `peer` | 操作发起者 / 另一方（转移的接收者、获取冲突时的持有者） |
+| `lease_id` / `generation` | 相关租约编号与世代号 |
+| `to_lease_id` / `to_generation` | 仅转移事件：新租约编号与新世代号 |
+| `detail` | 拒绝原因（如 `generation_fence`、`ineligible_recipient`、`transfer_id_conflict`）或补充（如 `write_id=N`） |
+| `wall_ms` / `logical` | 事件发生时的墙钟与逻辑钟读数 |
+
 ## 持久性
 
 SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库中包含：
-生效租约、每资源世代号、写入审计、逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
-正在生效的租约不会丢失。逻辑钟由后台 ticker 每秒 +1（每次推进都 fsync 落库）。
+生效租约、每资源世代号、写入审计、**转移记录（幂等键）**、**统一租约历史**、
+逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
+正在生效的租约不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放。
+逻辑钟由后台 ticker 每秒 +1（每次推进都 fsync 落库）。
 
 ## API
 
@@ -48,10 +87,12 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 | POST | `/leases/acquire` | `{resource, holder, ttl_ms?}` → 新世代号租约（201）；同持有者复用（200）；被占（409） |
 | POST | `/leases/renew` | `{resource, holder, generation}` → 顺延软 TTL；租约已失效返回 412（须重新获取更大世代号） |
 | POST | `/leases/release` | `{resource, holder, generation}` |
+| POST | `/leases/transfer` | `{resource, holder, generation, to_holder, transfer_id?, ttl_ms?}` → 原子转移（201）；同 `transfer_id` 重提返回首次结果（200）；参数冲突/接收者不合格/旧凭证重放 409 |
 | POST | `/resources/<r>/writes` | `{holder, generation, value}` → 受保护写入；世代号过期 409，无生效租约 412 |
 | GET | `/resources/<r>` | 当前世代号、已放行最大世代号、当前值 |
 | GET | `/resources/<r>/leases` | 当前租约全文（含三种期限与逻辑钟读数） |
 | GET | `/resources/<r>/writes` | 该资源全部写入审计（含拒绝记录） |
+| GET | `/resources/<r>/history` | **完整租约历史**：获取/续约/释放/转移/写入，含被拒操作，按审计顺序 |
 | GET | `/writes/<id>` | **按写入 ID 反查：哪一代租约放行** |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
@@ -120,4 +161,8 @@ PYTHONPATH=. pytest tests/ -q
 
 覆盖：基础持有/写入/审计、同持有者复用、续约、墙钟拨快 10s 不误回收、
 逻辑钟卡死到硬上限强制过期、双沉默才过期、重启后租约/世代号/墙钟偏移恢复、
-交接后旧世代号与伪造世代号写入被拒、世代号跨多次交接单调递增。
+交接后旧世代号与伪造世代号写入被拒、世代号跨多次交接单调递增、
+转移原子交接（旧持有者即刻失效、新持有者更大世代号即刻可写）、
+重复提交幂等回放、transfer_id 换参数冲突、旧凭证重放全被拒、
+不合格接收者零副作用、历史覆盖五种操作且成功/拒绝可区分、
+重启后历史/审计顺序/转移结果一致。
