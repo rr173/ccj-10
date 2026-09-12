@@ -10,6 +10,7 @@ def client(tmp_path):
         str(db),
         start_ticker=False,  # 测试里用 /debug/tick 确定性地驱动逻辑钟
         enable_debug_api=True,
+        start_archive_worker=False,  # 归档生成由测试显式驱动，保证确定性
     )
     app.config.update(TESTING=True)
     with app.test_client() as c:

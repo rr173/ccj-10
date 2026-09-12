@@ -1066,52 +1066,14 @@ class AuditReader:
         _exactly_one_node(seq, wall, head)
         with self._snapshot() as (conn, max_seq):
             snap = self._resolve_snapshot(snapshot, max_seq)
-            chain_rows = conn.execute(
-                "SELECT * FROM lease_events WHERE credential_id=? AND seq<=? "
-                "ORDER BY seq ASC",
-                (credential_id, snap),
-            ).fetchall()
+            node, resource, _chain = self._resolve_credential_node(
+                conn, snap, credential_id, seq=seq, wall_ms=wall, head=head)
             drow = conn.execute(
                 "SELECT * FROM delegations WHERE credential_id=?",
                 (credential_id,),
             ).fetchone()
-            if not chain_rows and drow is None:
-                raise CredentialNotFound(
-                    f"委托凭证 {credential_id} 不存在（既无凭证记录也无历史事件）",
-                    credential_id=credential_id, snapshot_seq=snap,
-                )
-            chain = [event_dict(r) for r in chain_rows]
-
-            if head:
-                if not chain:
-                    raise NodeOutOfRange(
-                        f"凭证 {credential_id} 在稳定视图内没有任何事件，"
-                        "无法定位节点", credential_id=credential_id,
-                        snapshot_seq=snap,
-                    )
-                node = chain[-1]
-            elif seq is not None:
-                matches = [e for e in chain if e["seq"] == seq]
-                if not matches:
-                    self._raise_credential_seq_miss(conn, seq, snap,
-                                                    credential_id)
-                node = matches[0]
-            else:
-                before = [e for e in chain if e["wall_ms"] <= wall]
-                if not before:
-                    first = chain[0]
-                    raise NodeOutOfRange(
-                        f"凭证 {credential_id} 在 wall_ms<={wall} 时还没有"
-                        f"任何事件（首次事件 seq={first['seq']}, "
-                        f"wall_ms={first['wall_ms']}）",
-                        requested_wall_ms=wall, credential_id=credential_id,
-                        first_event_seq=first["seq"],
-                        first_event_wall_ms=first["wall_ms"],
-                    )
-                node = before[-1]
 
             # 节点所在资源的完整回放，用于说明当时授权租约/资源值/世代号
-            resource = node["resource"]
             resource_events = self._resource_events(
                 conn, snap, resource, node["seq"])
             st = project(resource, resource_events, check_clocks=True)
@@ -1129,6 +1091,69 @@ class AuditReader:
                 payload["credential_note"] = (
                     "凭证在运行态表中存在，但在该历史节点之前尚无发放事件")
             return payload
+
+    def _resolve_credential_node(
+        self, conn, snap: int, credential_id: str,
+        *, seq: int | None, wall_ms: int | None, head: bool,
+    ) -> tuple[dict, str, list[dict]]:
+        """把 at_seq/at_wall_ms/head 解析成凭证事件链上的确定节点。
+
+        返回 (节点事件, 所属资源, 视图内完整凭证链)。归档创建与凭证回放
+        共用这一套解析语义，保证"同一节点"在两条路径上含义一致。
+        """
+        chain_rows = conn.execute(
+            "SELECT * FROM lease_events WHERE credential_id=? AND seq<=? "
+            "ORDER BY seq ASC",
+            (credential_id, snap),
+        ).fetchall()
+        drow = conn.execute(
+            "SELECT * FROM delegations WHERE credential_id=?",
+            (credential_id,),
+        ).fetchone()
+        if not chain_rows and drow is None:
+            raise CredentialNotFound(
+                f"委托凭证 {credential_id} 不存在（既无凭证记录也无历史事件）",
+                credential_id=credential_id, snapshot_seq=snap,
+            )
+        chain = [event_dict(r) for r in chain_rows]
+
+        if head:
+            if not chain:
+                raise NodeOutOfRange(
+                    f"凭证 {credential_id} 在稳定视图内没有任何事件，"
+                    "无法定位节点", credential_id=credential_id,
+                    snapshot_seq=snap,
+                )
+            node = chain[-1]
+        elif seq is not None:
+            matches = [e for e in chain if e["seq"] == seq]
+            if not matches:
+                self._raise_credential_seq_miss(conn, seq, snap,
+                                                credential_id)
+            node = matches[0]
+        else:
+            before = [e for e in chain if e["wall_ms"] <= wall_ms]
+            if not before:
+                if not chain:
+                    # 凭证存在但稳定视图内还没有任何事件
+                    # （snapshot 早于发放事件，或事件已被删除）
+                    raise NodeOutOfRange(
+                        f"凭证 {credential_id} 在稳定视图（snapshot<={snap}）"
+                        "内没有任何事件，无法按墙钟定位节点",
+                        requested_wall_ms=wall_ms,
+                        credential_id=credential_id, snapshot_seq=snap,
+                    )
+                first = chain[0]
+                raise NodeOutOfRange(
+                    f"凭证 {credential_id} 在 wall_ms<={wall_ms} 时还没有"
+                    f"任何事件（首次事件 seq={first['seq']}, "
+                    f"wall_ms={first['wall_ms']}）",
+                    requested_wall_ms=wall_ms, credential_id=credential_id,
+                    first_event_seq=first["seq"],
+                    first_event_wall_ms=first["wall_ms"],
+                )
+            node = before[-1]
+        return node, node["resource"], chain
 
     def _raise_credential_seq_miss(self, conn, seq, snap, credential_id):
         if seq > snap:

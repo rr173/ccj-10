@@ -403,6 +403,20 @@ def test_credential_replay_and_events_scope(client):
     assert body["state_as_of_node"]["resource"]["name"] == "cfg-cred"
 
 
+def test_credential_replay_wall_ms_with_empty_chain_in_snapshot(client):
+    # 凭证存在，但 snapshot 固定在发放事件之前：视图内链为空，
+    # 按墙钟定位节点必须给 416 而不是崩溃
+    lease = acquire(client, "cfg-empty-chain", "node-1")
+    d = grant(client, lease)
+    ev = events(client, "/resources/cfg-empty-chain/audit/events")["events"]
+    grant_seq = [e for e in ev if e["event"] == "delegate_grant"][0]["seq"]
+    rv = client.get(
+        f"/delegations/{d['credential_id']}/audit/replay"
+        f"?at_wall_ms=99999999999999&snapshot={grant_seq - 1}")
+    assert rv.status_code == 416
+    assert rv.get_json()["error"] == "node_out_of_range"
+
+
 # ---------------------------------------------------------------------------
 # 两节点比较：第一次产生差异的事件
 # ---------------------------------------------------------------------------

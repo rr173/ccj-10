@@ -36,6 +36,17 @@
   GET    /resources/<r>/audit/diagnose          单资源一致性诊断（缺号/重号/乱序/矛盾）
   GET    /delegations/<id>/audit/diagnose       单凭证一致性诊断
   GET    /audit/diagnose                        全局诊断（含全局 seq 缺号检查）
+可验证审计归档（只写归档自有表，绝不改动租约/委托/原始历史）：
+  POST   /audit/archives                        在指定稳定节点创建只读归档
+                                                {scope, resource?|credential_id?,
+                                                 at_seq|at_wall_ms|head, idempotency_key}
+                                                同对象+同节点+同键 → 同一份归档（200 回放）
+  GET    /audit/archives                        列归档（?scope&resource&credential_id&status）
+  GET    /audit/archives/<id>                   查生成进度/状态/校验值/核验标记
+  GET    /audit/archives/<id>/download          下载冻结的归档文档（含内容校验值）
+  POST   /audit/archives/<id>/verify            独立核验：标记 verified / verify_failed
+                                                （失败给出首个差异位置）
+  POST   /audit/archives/<id>/retry             失败的归档复位重试（从已存进度继续）
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
   POST   /debug/tick           手动推进逻辑钟
   POST   /debug/wall-shift     拨墙钟（可正可负）
@@ -48,8 +59,16 @@ import os
 import threading
 import time
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
+from .archive import (
+    ArchiveBadState,
+    ArchiveConflict,
+    ArchiveError,
+    ArchiveManager,
+    ArchiveNotFound,
+    ArchiveNotReady,
+)
 from .audit import (
     AuditBadRequest,
     AuditError,
@@ -79,6 +98,7 @@ def create_app(
     *,
     start_ticker: bool = True,
     enable_debug_api: bool | None = None,
+    start_archive_worker: bool = True,
 ) -> Flask:
     app = Flask(__name__)
 
@@ -96,6 +116,10 @@ def create_app(
     # 审计回放/诊断读取器：与写入路径共用同一把进程锁，但只读不写
     audit = AuditReader(store)
     app.extensions["audit"] = audit
+    # 可验证审计归档：只写 archives/archive_events 自有表
+    archive = ArchiveManager(
+        store, audit, chunk_size=_env_int("ARCHIVE_CHUNK_SIZE", 100))
+    app.extensions["archive"] = archive
     if enable_debug_api is None:
         enable_debug_api = os.environ.get("ENABLE_DEBUG_API", "1") == "1"
 
@@ -370,6 +394,67 @@ def create_app(
             audit.diagnose_global(snapshot=request.args.get("snapshot")))
 
     # ------------------------------------------------------------------
+    # 可验证审计归档
+    #
+    # 在指定稳定历史节点把某资源/某凭证的事件范围、回放状态、诊断结果与
+    # 内容校验值冻结成只读归档。生成是后台分块进行的：进度落库，重启/
+    # 失败后从已保存的进度继续，重试不会重复写入。归档、下载、核验只写
+    # 归档自有表，绝不修改正在运行的租约、委托和原始审计历史。
+    # ------------------------------------------------------------------
+    @app.post("/audit/archives")
+    def archive_create():
+        data = body()
+        view, created = archive.create_archive(
+            scope=data.get("scope"),
+            resource=data.get("resource"),
+            credential_id=data.get("credential_id"),
+            at_seq=data.get("at_seq"),
+            at_wall_ms=data.get("at_wall_ms"),
+            head=bool(data.get("head", False)),
+            idempotency_key=data.get("idempotency_key"),
+        )
+        # 同对象+同节点+同幂等键重复创建：200 回放同一份归档
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/archives")
+    def archive_list():
+        return jsonify(archive.list_archives(
+            scope=request.args.get("scope"),
+            resource=request.args.get("resource"),
+            credential_id=request.args.get("credential_id"),
+            status=request.args.get("status"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/archives/<archive_id>")
+    def archive_status(archive_id):
+        return jsonify(archive.get_archive(archive_id))
+
+    @app.get("/audit/archives/<archive_id>/download")
+    def archive_download(archive_id):
+        text, view = archive.download(archive_id)
+        # 落库原文逐字节返回：下载者可用 content_sha256 独立复算
+        return Response(
+            text, mimetype="application/json",
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="audit-archive-{archive_id}.json"',
+                "X-Archive-SHA256": view["content_sha256"] or "",
+            },
+        )
+
+    @app.post("/audit/archives/<archive_id>/verify")
+    def archive_verify(archive_id):
+        # 独立核验：通过标记 verified，失败标记 verify_failed 并给出
+        # 首个差异位置；只写归档自有表
+        return jsonify(archive.verify(archive_id))
+
+    @app.post("/audit/archives/<archive_id>/retry")
+    def archive_retry(archive_id):
+        return jsonify(archive.retry(archive_id))
+
+    # ------------------------------------------------------------------
     # 调试：手动驱动两种时钟，演练"拨表/逻辑卡死"故障
     # ------------------------------------------------------------------
     @app.post("/debug/tick")
@@ -408,6 +493,15 @@ def create_app(
     def _audit_error(exc: AuditError):
         # 回放/诊断的参数与范围错误一律给出明确的结构化错误，
         # 绝不降级成 200 + 空报告
+        return jsonify(exc.to_response()), exc.status
+
+    @app.errorhandler(ArchiveNotFound)
+    @app.errorhandler(ArchiveNotReady)
+    @app.errorhandler(ArchiveConflict)
+    @app.errorhandler(ArchiveBadState)
+    def _archive_error(exc: ArchiveError):
+        # 归档的显式错误：不存在 404 / 未完成 409 / 幂等键冲突 409 /
+        # 状态不允许 409
         return jsonify(exc.to_response()), exc.status
 
     @app.errorhandler(GenerationTooSmall)
@@ -455,6 +549,25 @@ def create_app(
 
     if start_ticker:
         t = threading.Thread(target=_run_ticker, name="logical-ticker", daemon=True)
+        t.start()
+
+    # ------------------------------------------------------------------
+    # 后台归档生成：分块冻结事件、进度落库；启动即续跑未完成的归档，
+    # 进程重启或上次后台失败都能从已保存的进度继续
+    # ------------------------------------------------------------------
+    archive_interval = float(os.environ.get("ARCHIVE_WORKER_INTERVAL_S", "0.2"))
+
+    def _run_archive_worker():
+        while not stop_event.wait(archive_interval):
+            try:
+                archive.process_pending()
+            except Exception:  # noqa: BLE001 - 后台线程不能因单次异常退出
+                app.logger.exception("归档后台处理失败")
+
+    if start_archive_worker:
+        archive.process_pending()  # 启动即续跑重启前未完成的归档
+        t = threading.Thread(target=_run_archive_worker,
+                             name="archive-worker", daemon=True)
         t.start()
 
     def _stop(*_):

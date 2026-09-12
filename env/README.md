@@ -242,15 +242,95 @@ GET /audit/diagnose                        # 全局
 | 时间/序号/过滤窗口内没有事件 | 404 | `no_events_in_range`（附事件实际区间） |
 | 节点选择器缺失/给了多个、参数非整数、`outcome/limit` 非法、a 晚于 b | 400 | `bad_request` |
 
+## 可验证审计归档（verifiable archive）
+
+审计回放是"随查随算"，归档则把某个**资源**或某张**委托凭证**在某个稳定历史
+节点上的"当时状态"**冻结**成一份只读文档：事件范围、回放状态、诊断结果与内容
+校验值在创建时钉死，之后无论租约怎么变化，归档都逐字节不变，可下载、可独立核验。
+
+### 创建（幂等）
+
+```
+POST /audit/archives
+{"scope":"resource","resource":"cfg-1","at_seq":12,"idempotency_key":"audit-2026-09"}
+{"scope":"credential","credential_id":"ab12...","head":true,"idempotency_key":"k-2"}
+```
+
+- 节点选择器与回放一致：`at_seq` / `at_wall_ms` / `head` 三选一（必填）；
+- `idempotency_key` **必填**。**同一对象 + 同一节点 + 同一幂等键**重复创建
+  只会得到同一份归档（HTTP 200 + `"replayed": true`）；同一幂等键配不同节点
+  直接 409（`archive_id_conflict`）——系统里绝不会出现两份互相矛盾的归档。
+  换幂等键对同一节点再归档是允许的，且历史内容（事件/回放状态/诊断）必然一致；
+- 创建即钉死两个上界：`node_seq`（归档的事件上界）与 `snapshot_seq`
+  （创建时的稳定视图上界）。归档只含 `seq <= node_seq` 的作用域事件——
+  **生成期间再有新的租约写入也进不了归档**，不会读到半套事件；
+- 创建返回 201 与归档视图（含 `archive_id`、进度），生成由后台分块进行。
+
+### 生成进度与断点续跑
+
+- 后台 worker 按块（`ARCHIVE_CHUNK_SIZE`，默认 100 条）把事件冻结进
+  `archive_events` 表，每块提交后进度落库
+  （`GET /audit/archives/<id>` 可见 `processed_events / total_events / percent`）；
+- **服务重启或后台失败**：`pending/building/failed` 的归档从已保存的
+  `last_frozen_seq` 继续，启动即自动续跑；`archive_events` 主键
+  `(archive_id, seq)` + `INSERT OR IGNORE` 保证**失败重试不会重复写入**；
+- 自动重试有上限（5 次），`POST /audit/archives/<id>/retry` 可手动复位
+  `failed` 归档（进度保留，只重置尝试计数）。
+
+### 归档文档（下载）
+
+`GET /audit/archives/<id>/download` 在完成后返回落库原文（字节稳定，
+响应头带 `X-Archive-SHA256`）：
+
+| 字段 | 含义 |
+|---|---|
+| `node_seq` / `snapshot_seq` / `node` | 冻结的历史节点与创建时稳定视图 |
+| `event_range` / `events` | 事件范围（首末序号、条数）与全部事件原文 |
+| `replay_state` | 该节点的回放状态：资源值、当前租约、世代号、各凭证状态（凭证归档另含 `credential` 视图） |
+| `diagnosis` | 基于归档事件流的**纯重放诊断**（序号/时钟/状态矛盾），`basis=pure_replay_over_archived_events` |
+| `content_sha256` | 内容校验值：对除本字段外的规范化 JSON（键排序）计算的 SHA-256，下载者可独立复算 |
+
+### 独立核验（标记 verified / verify_failed）
+
+`POST /audit/archives/<id>/verify` 对已完成的归档做三层独立核验，
+并把结果标记在归档上（`verify_status`，重启不丢）：
+
+1. 归档文档与保存的 `content_sha256` 一致（内容未被改动）；
+2. 归档事件与**原始审计历史**同范围逐条逐字段一致（历史未被删改）；
+3. 回放状态与诊断可由冻结事件**独立重算**得到（派生内容自洽）。
+
+任一失败即标记 `verify_failed`，且 `verify_detail` / 响应的
+`first_divergence` 给出**首个差异位置**（`section` / `path` / `seq` /
+双方取值与中文说明），例如 `events[2]` 序号分叉、
+`replay_state.resource.value` 被伪造。全部通过则标记 `verified`。
+
+### 只读边界
+
+归档的创建、生成、下载、核验只写 `archives` / `archive_events` 两张自有表，
+**绝不修改正在运行的租约、委托和原始审计历史**（`lease_events` / `leases` /
+`delegations` / `writes` 等一个字节都不动）；归档完成后当前租约照常可写。
+
+| 场景 | 状态码 | error |
+|---|---|---|
+| 归档不存在 | 404 | `archive_not_found` |
+| 未完成就下载/核验 | 409 | `archive_not_ready` |
+| 同幂等键配不同节点 | 409 | `archive_id_conflict` |
+| 对非 failed 归档发起重试 | 409 | `archive_bad_state` |
+| 节点选择器缺失/多个、缺幂等键、非法 scope/status | 400 | `bad_request` |
+| 资源无历史 / 凭证不存在 / 节点越界 | 404/416 | 与审计回放一致 |
+
+
 ## 持久性
 
 SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库中包含：
 生效租约、每资源世代号、写入审计、**转移记录（幂等键）**、**限时委托凭证**、
 **统一租约历史（含每条被接受写入当时的资源值，供事件溯源回放）**、
+**审计归档与冻结事件副本（归档进度、内容校验值与核验标记）**、
 逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
 正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放，
 **审计回放、节点比较与一致性诊断对同一份历史给出逐字节一致的结果**；
-启动时即按墙钟收割已到期的委托。旧版本数据库会在启动时自动补列迁移。
+启动时即按墙钟收割已到期的委托，并自动续跑未完成的归档生成。
+旧版本数据库会在启动时自动补列迁移。
 逻辑钟由后台 ticker 每秒 +1（每次推进都 fsync 落库）。
 
 ## API
@@ -280,6 +360,12 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 | GET | `/resources/<r>/audit/diagnose` | 单资源一致性诊断：缺号/重号/乱序/状态矛盾/跨表勾稽 |
 | GET | `/delegations/<id>/audit/diagnose` | 单凭证一致性诊断 |
 | GET | `/audit/diagnose` | 全局一致性诊断（含全局 seq 缺号检查） |
+| POST | `/audit/archives` | **创建只读审计归档**：`{scope, resource?/credential_id?, at_seq?/at_wall_ms?/head?, idempotency_key}`；同对象+同节点+同键返回同一份（200 回放），同键不同节点 409 |
+| GET | `/audit/archives` | 列归档（`?scope=&resource=&credential_id=&status=&limit=`） |
+| GET | `/audit/archives/<id>` | **查归档进度**：状态、已冻结/总事件数、内容校验值、核验标记 |
+| GET | `/audit/archives/<id>/download` | **下载归档文档**（事件范围+回放状态+诊断+SHA-256 校验值；未完成 409） |
+| POST | `/audit/archives/<id>/verify` | **独立核验**：通过标记 `verified`，失败标记 `verify_failed` 并给出首个差异位置 |
+| POST | `/audit/archives/<id>/retry` | 手动复位 `failed` 归档，从已保存进度继续（非 failed 409） |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
 | GET | `/debug/now` | 两种时钟当前读数 |
@@ -338,6 +424,8 @@ curl -s localhost:8080/writes/1
 | `DELEGATION_TTL_MS` | 15000 | 委托凭证缺省有效期（委托只信墙钟、不可续约） |
 | `DELEGATION_MAX_TTL_MS` | 60000 | 委托凭证可请求有效期的上限（且永远短于授权租约的硬上限） |
 | `LOGICAL_TICK_INTERVAL_S` | 1 | 后台逻辑钟 tick 间隔 |
+| `ARCHIVE_CHUNK_SIZE` | 100 | 归档后台生成时每块冻结的事件条数（每块提交一次、进度落库） |
+| `ARCHIVE_WORKER_INTERVAL_S` | 0.2 | 后台归档 worker 的轮询间隔（秒） |
 | `ENABLE_DEBUG_API` | 1 | 是否开放 `/debug/*` 故障演练接口 |
 
 ## 测试
@@ -367,3 +455,11 @@ PYTHONPATH=. pytest tests/ -q
 缺号（删事件后全局诊断）、重号、逻辑钟回退、不可能的成功事件等状态矛盾、
 凭证维度诊断、历史不存在 404/节点越界 416/过滤窗口空 404/参数错误 400、
 审计只读不收割不改变运行态、重启后回放与诊断结果一致。
+审计归档覆盖：资源/凭证归档的创建-生成-下载-校验值闭环、
+同对象同节点同幂等键重复创建返回同一份（含 8 线程并发同键创建）、
+同键不同节点 409、换键同节点内容一致、
+生成期间新写入不混入归档（事件上界创建时钉死）、
+分块进度逐块可见、重启后从已保存进度续跑、
+finalize 失败重试不重复写入冻结事件、
+核验通过与三类篡改（删原始事件/改归档文档/改冻结副本）的首个差异位置、
+归档全流程不修改租约/委托/原始历史、重启后归档文档与核验标记逐字节一致。

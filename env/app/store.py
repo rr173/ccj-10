@@ -183,6 +183,46 @@ CREATE TABLE IF NOT EXISTS lease_events (
 CREATE INDEX IF NOT EXISTS idx_events_resource ON lease_events(resource, seq);
 -- idx_events_credential 与新列一起在 _migrate_columns 中创建，
 -- 以兼容没有 credential_id 列的旧库
+-- 可验证审计归档：把某个资源/委托凭证在某个稳定历史节点上的事件范围、
+-- 回放状态、诊断结果与内容校验值冻结成一份只读归档。
+-- 归档只写本表与 archive_events，绝不触碰租约/委托/原始审计历史。
+-- (scope, resource, credential_id, idempotency_key) 唯一：同一对象、同一
+-- 幂等键重复创建只会得到同一份归档；同键配不同节点在代码里判 409。
+CREATE TABLE IF NOT EXISTS archives (
+    archive_id        TEXT PRIMARY KEY,
+    scope             TEXT NOT NULL,            -- resource / credential
+    resource          TEXT NOT NULL,
+    credential_id     TEXT NOT NULL DEFAULT '', -- 资源作用域为空串
+    node_seq          INTEGER NOT NULL,         -- 固定的历史节点（事件上界）
+    snapshot_seq      INTEGER NOT NULL,         -- 创建时的稳定视图上界
+    idempotency_key   TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending',
+                      -- pending / building / completed / failed
+    total_events      INTEGER NOT NULL DEFAULT 0,
+    processed_events  INTEGER NOT NULL DEFAULT 0,
+    last_frozen_seq   INTEGER NOT NULL DEFAULT 0, -- 续跑游标：已冻结到哪个 seq
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    error             TEXT,
+    content           TEXT,                     -- 冻结的归档文档（JSON）
+    content_sha256    TEXT,                     -- 内容校验值
+    verify_status     TEXT NOT NULL DEFAULT 'unverified',
+                      -- unverified / verified / verify_failed
+    verify_detail     TEXT,                     -- JSON：核验失败的首个差异位置
+    verified_at_ms    INTEGER,
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL,
+    completed_at_ms   INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_archives_idem
+    ON archives(scope, resource, credential_id, idempotency_key);
+-- 归档冻结的事件副本：主键 (archive_id, seq) + INSERT OR IGNORE，
+-- 后台失败重试/重启续跑都不会重复写入或写出矛盾内容
+CREATE TABLE IF NOT EXISTS archive_events (
+    archive_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    payload    TEXT NOT NULL,                   -- event_dict 的规范化 JSON
+    PRIMARY KEY (archive_id, seq)
+);
 """
 
 
