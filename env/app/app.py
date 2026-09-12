@@ -6,11 +6,19 @@
   POST   /leases/release       释放
   POST   /leases/transfer      安全转移（原子交接：旧持有者即刻失效，
                                新持有者拿更大世代号；transfer_id 幂等）
-  POST   /resources/<r>/writes 受租约保护的写入（栅栏校验点）
+  POST   /resources/<r>/writes 受租约保护的写入（栅栏校验点）；
+                               请求体带 credential_id 即走限时委托路径
+委托语义速览：
+  POST   /leases/delegations    持有者向指定协作者发放针对某资源的短期凭证
+  POST   /leases/delegations/revoke  授权者提前撤销
+  GET    /delegations/<id>      按凭证号查授权者/协作者/有效期/世代号/状态
+  GET    /resources/<r>/delegations  列某资源的全部委托
+  GET    /resources/<r>/history?credential_id=<id>
+                               按凭证号过滤：发放/每次使用结果/撤销/过期/失效
   GET    /resources/<r>        查资源当前世代/值
   GET    /resources/<r>/leases 查当前租约
   GET    /resources/<r>/writes 查某次/每次写入是哪一代租约放行的
-  GET    /resources/<r>/history 完整租约历史（获取/续约/释放/转移/写入，
+  GET    /resources/<r>/history 完整租约历史（获取/续约/释放/转移/写入/委托，
                                含被拒绝的操作，按审计顺序排列）
   GET    /writes/<id>          按写入 ID 反查放行世代
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
@@ -29,6 +37,8 @@ from flask import Flask, jsonify, request
 
 from .store import (
     Conflict,
+    DelegationNotFound,
+    DelegationRejected,
     GenerationTooSmall,
     LeaseGone,
     Store,
@@ -55,6 +65,8 @@ def create_app(
         max_ttl_ms=_env_int("LEASE_MAX_TTL_MS", 60_000),
         hard_ttl_ms=_env_int("LEASE_HARD_TTL_MS", 60_000),
         logical_grace=_env_int("LOGICAL_GRACE_TICKS", 3),
+        delegation_ttl_ms=_env_int("DELEGATION_TTL_MS", 15_000),
+        delegation_max_ttl_ms=_env_int("DELEGATION_MAX_TTL_MS", 60_000),
     )
     app.extensions["store"] = store
     if enable_debug_api is None:
@@ -121,15 +133,54 @@ def create_app(
         return jsonify(result), 200 if result["replayed"] else 201
 
     # ------------------------------------------------------------------
+    # 限时委托
+    # ------------------------------------------------------------------
+    @app.post("/leases/delegations")
+    def grant_delegation():
+        data = body()
+        resource = require(data, "resource")
+        holder = require(data, "holder")
+        generation = int(require(data, "generation"))
+        # collaborator 的资格校验放在 store 层，不合格也会记入历史
+        result = store.grant_delegation(
+            resource, holder, generation,
+            collaborator=data.get("collaborator"),
+            ttl_ms=data.get("ttl_ms"),
+            credential_id=data.get("credential_id"),
+        )
+        return jsonify({"delegation": result}), 201
+
+    @app.post("/leases/delegations/revoke")
+    def revoke_delegation():
+        data = body()
+        resource = require(data, "resource")
+        holder = require(data, "holder")
+        generation = int(require(data, "generation"))
+        credential_id = require(data, "credential_id")
+        result = store.revoke_delegation(
+            resource, holder, generation, credential_id
+        )
+        return jsonify({"delegation": result, "revoked": True})
+
+    # ------------------------------------------------------------------
     # 受保护写入
     # ------------------------------------------------------------------
     @app.post("/resources/<resource>/writes")
     def write(resource):
         data = body()
         holder = require(data, "holder")
-        generation = int(require(data, "generation"))
+        credential_id = data.get("credential_id")
+        # 持有者直写必须出示世代号；委托写入世代号由凭证锚定，可省
+        if credential_id:
+            raw_gen = data.get("generation")
+            generation = int(raw_gen) if raw_gen not in (None, "") else None
+        else:
+            generation = int(require(data, "generation"))
         value = data.get("value")
-        result = store.write(resource, holder, generation, value)
+        result = store.write(
+            resource, holder, generation, value,
+            credential_id=credential_id,
+        )
         return jsonify(result), 201
 
     # ------------------------------------------------------------------
@@ -156,12 +207,34 @@ def create_app(
             {"resource": resource, "writes": store.list_writes(resource, limit)}
         )
 
+    @app.get("/resources/<resource>/delegations")
+    def list_delegations(resource):
+        limit = min(int(request.args.get("limit", 100)), 1000)
+        return jsonify(
+            {"resource": resource,
+             "delegations": store.list_delegations(resource, limit)}
+        )
+
     @app.get("/resources/<resource>/history")
     def get_history(resource):
         limit = min(int(request.args.get("limit", 200)), 1000)
+        # ?credential_id=<id>：只看这张凭证的授权者/协作者/有效期/世代号
+        # 与每次使用结果
+        credential_id = request.args.get("credential_id")
         return jsonify(
-            {"resource": resource, "events": store.list_history(resource, limit)}
+            {"resource": resource,
+             "events": store.list_history(
+                 resource, limit, credential_id=credential_id)}
         )
+
+    @app.get("/delegations/<credential_id>")
+    def get_delegation(credential_id):
+        d = store.get_delegation(credential_id)
+        if d is None:
+            return jsonify(
+                {"error": "not_found", "credential_id": credential_id}
+            ), 404
+        return jsonify(d)
 
     @app.get("/writes/<int:write_id>")
     def get_write(write_id):
@@ -204,6 +277,16 @@ def create_app(
     @app.errorhandler(GenerationTooSmall)
     def _gen_conflict(exc):
         return jsonify({"error": "generation_fence", "message": str(exc)}), 409
+
+    @app.errorhandler(DelegationRejected)
+    def _delegation_rejected(exc):
+        # 409：凭证已撤销/过期/随租约失效，或协作者不符
+        return jsonify({"error": "delegation_rejected",
+                        "message": str(exc)}), 409
+
+    @app.errorhandler(DelegationNotFound)
+    def _delegation_not_found(exc):
+        return jsonify({"error": "not_found", "message": str(exc)}), 404
 
     @app.errorhandler(LeaseGone)
     def _gone(exc):

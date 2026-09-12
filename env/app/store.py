@@ -30,6 +30,26 @@ STATE_EXPIRED = "expired"
 STATE_RELEASED = "released"
 STATE_TRANSFERRED = "transferred"   # 已转移：旧持有者即刻失去一切权限
 
+# 委托终态
+DEL_STATE_ACTIVE = "active"
+DEL_STATE_REVOKED = "revoked"       # 授权者提前撤销
+DEL_STATE_EXPIRED = "expired"       # 到达委托自身的墙钟到期
+DEL_STATE_FENCED = "fenced"         # 原租约释放/转移/过期：委托连带失效
+
+# 委托被栅栏掉的原因（delegations.end_reason，state=fenced 时）
+FENCE_LEASE_RELEASED = "source_lease_released"
+FENCE_LEASE_TRANSFERRED = "source_lease_transferred"
+FENCE_LEASE_EXPIRED = "source_lease_expired"
+# state=expired / revoked 时的 end_reason
+END_DELEGATION_EXPIRED = "delegation_expired"
+END_DELEGATION_REVOKED = "revoked"
+
+# 委托写入被拒原因（同时写入 writes.reject_reason 与历史 detail）
+REJECT_DELEGATION_REVOKED = "delegation_revoked"
+REJECT_DELEGATION_EXPIRED = "delegation_expired"
+REJECT_COLLABORATOR_MISMATCH = "collaborator_mismatch"
+REJECT_UNKNOWN_CREDENTIAL = "unknown_credential"
+
 # 过期原因（state=expired 时）
 REASON_HARD_WALL = "hard_wall_deadline_reached"       # 逻辑钟卡死也救不了：到硬上限
 REASON_SOFT_WALL_AND_LOGICAL_STALL = "wall_ttl_passed_and_logical_stalled"  # 双重沉默
@@ -39,6 +59,8 @@ DEFAULT_TTL_MS = 15_000
 DEFAULT_MAX_TTL_MS = 60_000
 DEFAULT_HARD_TTL_MS = 60_000    # 硬上限相对发放时刻；必须大于环境中最大时钟跳变
 DEFAULT_LOGICAL_GRACE = 3       # 续约后逻辑钟最多容忍落后多少 tick
+DEFAULT_DELEGATION_TTL_MS = 15_000
+DEFAULT_DELEGATION_MAX_TTL_MS = 60_000
 
 
 class Conflict(Exception):
@@ -51,6 +73,14 @@ class LeaseGone(Conflict):
 
 class GenerationTooSmall(Conflict):
     """写入携带的世代号 <= 资源已放行的最大世代号（HTTP 409）。"""
+
+
+class DelegationRejected(Conflict):
+    """委托凭证写入被拒绝：已撤销/已过期/原租约已结束/协作者不符（HTTP 409）。"""
+
+
+class DelegationNotFound(LookupError):
+    """委托凭证不存在或不属于该资源（HTTP 404）。"""
 
 
 SCHEMA = """
@@ -89,9 +119,30 @@ CREATE TABLE IF NOT EXISTS writes (
     holder             TEXT NOT NULL,
     accepted           INTEGER NOT NULL,        -- 1 放行 / 0 拒绝
     reject_reason      TEXT,
-    created_at_ms      INTEGER NOT NULL
+    created_at_ms      INTEGER NOT NULL,
+    credential_id      TEXT                     -- 仅委托写入：用的哪张凭证
 );
 CREATE INDEX IF NOT EXISTS idx_writes_resource ON writes(resource, id);
+-- 限时委托：当前持有者（授权者）针对某个资源向指定协作者发放的短期凭证。
+-- 委托只授予"写"这一个动作：不能续约、释放、转移或再次转委托（这些入口
+-- 只认生效租约的 holder+generation，协作者天然进不来）。
+-- 委托的世代号栅栏锚定在授权租约上：lease_id 一旦不再是当前生效租约
+-- （释放/转移/过期），本委托即被连带置为 fenced，迟到写入必拒。
+CREATE TABLE IF NOT EXISTS delegations (
+    credential_id     TEXT PRIMARY KEY,
+    resource          TEXT NOT NULL,
+    lease_id          TEXT NOT NULL,           -- 发放时绑定的授权者租约
+    authorizer        TEXT NOT NULL,           -- 授权者（= 租约持有者）
+    collaborator      TEXT NOT NULL,           -- 被授权的协作者
+    generation        INTEGER NOT NULL,        -- 发放时授权租约的世代号
+    granted_wall_ms   INTEGER NOT NULL,
+    expires_wall_ms   INTEGER NOT NULL,        -- 硬墙钟到期：只信墙钟，不可续
+    state             TEXT NOT NULL DEFAULT 'active',
+    end_reason        TEXT,                    -- revoked/expired/fenced 细分原因
+    created_at_ms     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_delegations_lease ON delegations(lease_id);
+CREATE INDEX IF NOT EXISTS idx_delegations_resource ON delegations(resource, credential_id);
 -- 转移记录：transfer_id 是幂等键，重复提交同一笔转移直接回放首次结果
 CREATE TABLE IF NOT EXISTS transfers (
     transfer_id     TEXT PRIMARY KEY,
@@ -104,26 +155,33 @@ CREATE TABLE IF NOT EXISTS transfers (
     new_generation  INTEGER NOT NULL,
     created_at_ms   INTEGER NOT NULL
 );
--- 统一租约历史：每次获取/续约/释放/转移/写入（含被拒绝的）都留一条，
+-- 统一租约历史：每次获取/续约/释放/转移/写入（含被拒绝的）以及委托的
+-- 发放/使用/撤销/过期/连带失效（含被拒绝的）都留一条，
 -- seq 全局单调递增即审计顺序，落库后重启不丢。
 -- lease_id 记录操作发生时生效的租约（被拒绝的操作也一样），
 -- 仅当当时没有生效租约时才为 NULL；generation 是请求携带的世代号。
+-- credential_id 非空即说明该事件属于某张委托凭证，可按凭证过滤出
+-- 授权者/协作者/有效期/世代号与每次使用结果。
 CREATE TABLE IF NOT EXISTS lease_events (
     seq           INTEGER PRIMARY KEY AUTOINCREMENT,
     resource      TEXT NOT NULL,
-    event         TEXT NOT NULL,        -- acquire/renew/release/transfer/write
+    event         TEXT NOT NULL,        -- acquire/renew/release/transfer/write/
+                                        -- delegate/delegate_write/delegate_revoke
     outcome       TEXT NOT NULL,        -- ok / rejected
     holder        TEXT NOT NULL,        -- 操作发起者
-    peer          TEXT,                 -- 另一方：transfer 的接收者 / acquire 冲突时的持有者
+    peer          TEXT,                 -- 另一方：transfer 接收者 / delegate 协作者 / ...
     lease_id      TEXT,
     generation    INTEGER,
     to_lease_id   TEXT,                 -- 仅 transfer：产生的新租约
     to_generation INTEGER,
+    credential_id TEXT,                 -- 委托事件：涉及的凭证
     detail        TEXT,                 -- 拒绝原因 / write_id 等补充
     wall_ms       INTEGER NOT NULL,
     logical       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_resource ON lease_events(resource, seq);
+-- idx_events_credential 与新列一起在 _migrate_columns 中创建，
+-- 以兼容没有 credential_id 列的旧库
 """
 
 
@@ -136,6 +194,8 @@ class Store:
         max_ttl_ms: int = DEFAULT_MAX_TTL_MS,
         hard_ttl_ms: int = DEFAULT_HARD_TTL_MS,
         logical_grace: int = DEFAULT_LOGICAL_GRACE,
+        delegation_ttl_ms: int = DEFAULT_DELEGATION_TTL_MS,
+        delegation_max_ttl_ms: int = DEFAULT_DELEGATION_MAX_TTL_MS,
     ):
         self._lock = threading.RLock()
         # check_same_thread=False + 全局互斥锁保证多线程访问安全
@@ -146,15 +206,41 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(SCHEMA)
+        self._migrate_columns()
         self._conn.commit()
 
         self.default_ttl_ms = ttl_ms
         self.max_ttl_ms = max_ttl_ms
         self.hard_ttl_ms = hard_ttl_ms
         self.logical_grace = logical_grace
+        self.default_delegation_ttl_ms = delegation_ttl_ms
+        self.delegation_max_ttl_ms = delegation_max_ttl_ms
 
         self.clock = Clock(lambda: self._get_meta("wall_offset_ms", 0))
         self.clock.set_logical(self._get_meta("logical_clock", 0))
+        # 重启即按持久化状态收割：已到期的委托与已连带失效的委托在此收敛，
+        # 之后任何写入都会在同一把锁里重新判定，不会放行迟到凭证。
+        self._reap_locked()
+
+    def _migrate_columns(self) -> None:
+        """给早于委托特性的旧库补列（CREATE TABLE IF NOT EXISTS 不会改已有表）。"""
+        def columns(table: str) -> set[str]:
+            return {r["name"] for r in self._conn.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()}
+
+        if "credential_id" not in columns("writes"):
+            self._conn.execute("ALTER TABLE writes ADD COLUMN credential_id TEXT")
+        events_cols = columns("lease_events")
+        if "credential_id" not in events_cols:
+            self._conn.execute(
+                "ALTER TABLE lease_events ADD COLUMN credential_id TEXT"
+            )
+        # 新库旧库都走这里：列已存在时 IF NOT EXISTS 是空操作
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_credential "
+            "ON lease_events(credential_id, seq)"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -187,16 +273,17 @@ class Store:
         generation: int | None = None,
         to_lease_id: str | None = None,
         to_generation: int | None = None,
+        credential_id: str | None = None,
         detail: str | None = None,
         now: int | None = None,
     ) -> None:
         self._conn.execute(
             "INSERT INTO lease_events(resource, event, outcome, holder, peer, "
-            "lease_id, generation, to_lease_id, to_generation, detail, "
-            "wall_ms, logical) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "lease_id, generation, to_lease_id, to_generation, credential_id, "
+            "detail, wall_ms, logical) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 resource, event, outcome, holder, peer, lease_id, generation,
-                to_lease_id, to_generation, detail,
+                to_lease_id, to_generation, credential_id, detail,
                 now if now is not None else self.clock.wall_ms(),
                 self.clock.logical(),
             ),
@@ -257,14 +344,62 @@ class Store:
         return row
 
     def _expire_locked(self, row, reason: str) -> None:
+        """把租约置为过期；其名下生效委托在同一事务内连带栅栏，不单独提交，
+        由调用方与其余状态变更一起 commit（要么全成要么全不成）。"""
+        self._fence_delegations_locked(row["id"], FENCE_LEASE_EXPIRED)
         self._conn.execute(
             "UPDATE leases SET state=?, expire_reason=? WHERE id=?",
             (STATE_EXPIRED, reason, row["id"]),
         )
-        self._conn.commit()
+
+    def _fence_delegations_locked(self, lease_id: str, reason: str) -> None:
+        """租约释放/转移/过期时，把它名下仍生效的委托连带置为 fenced。
+
+        与租约状态变更在同一事务：外部绝不会观察到"租约已结束但委托还能写"，
+        也不会观察到"委托已栅栏但租约还活着"。每个被栅栏的委托各落一条
+        delegate_fence 历史事件，审计可按 credential_id 追到失效时刻与原因。
+        """
+        cur = self._conn.execute(
+            "UPDATE delegations SET state=?, end_reason=? "
+            "WHERE lease_id=? AND state=?",
+            (DEL_STATE_FENCED, reason, lease_id, DEL_STATE_ACTIVE),
+        )
+        if cur.rowcount:
+            now = self.clock.wall_ms()
+            logical = self.clock.logical()
+            self._conn.execute(
+                "INSERT INTO lease_events(resource, event, outcome, holder, "
+                "peer, lease_id, generation, credential_id, detail, "
+                "wall_ms, logical) "
+                "SELECT resource, 'delegate_fence', 'ok', authorizer, "
+                "collaborator, lease_id, generation, credential_id, ?, ?, ? "
+                "FROM delegations WHERE lease_id=? AND state=? AND end_reason=?",
+                (reason, now, logical, lease_id, DEL_STATE_FENCED, reason),
+            )
+
+    def _reap_delegations_locked(self) -> int:
+        """墙钟到期的委托收尾（委托只信墙钟，不可续约、不看逻辑钟）。"""
+        now = self.clock.wall_ms()
+        rows = self._conn.execute(
+            "SELECT * FROM delegations WHERE state=? AND expires_wall_ms <= ?",
+            (DEL_STATE_ACTIVE, now),
+        ).fetchall()
+        for d in rows:
+            self._conn.execute(
+                "UPDATE delegations SET state=?, end_reason=? "
+                "WHERE credential_id=?",
+                (DEL_STATE_EXPIRED, END_DELEGATION_EXPIRED, d["credential_id"]),
+            )
+            self._record_event_locked(
+                d["resource"], "delegate_expire", "ok", d["authorizer"],
+                peer=d["collaborator"], lease_id=d["lease_id"],
+                generation=d["generation"], credential_id=d["credential_id"],
+                detail=END_DELEGATION_EXPIRED, now=now,
+            )
+        return len(rows)
 
     def _reap_locked(self) -> int:
-        """扫描所有 active 租约，按双时钟规则收尾，返回收割数量。"""
+        """按双时钟规则收割过期租约、再按墙钟收割到期委托，返回收割的租约数。"""
         rows = self._conn.execute(
             "SELECT * FROM leases WHERE state='active'"
         ).fetchall()
@@ -274,7 +409,8 @@ class Store:
             if status["state"] != STATE_ACTIVE:
                 self._expire_locked(row, status["expire_reason"])
                 n += 1
-        if n:
+        nd = self._reap_delegations_locked()
+        if n or nd:
             self._conn.commit()
         return n
 
@@ -412,6 +548,7 @@ class Store:
                 )
                 self._conn.commit()
                 raise Conflict("持有者或世代号与当前生效租约不符")
+            self._fence_delegations_locked(row["id"], FENCE_LEASE_RELEASED)
             self._conn.execute(
                 "UPDATE leases SET state=? WHERE id=?",
                 (STATE_RELEASED, row["id"]),
@@ -530,6 +667,8 @@ class Store:
             new_lease_id = str(uuid.uuid4())
             ttl = self._clamp_ttl(ttl_ms)
             logical = self.clock.logical()
+            # 原租约名下委托连带失效：转移完成的同一刻，迟到委托写必被拒
+            self._fence_delegations_locked(row["id"], FENCE_LEASE_TRANSFERRED)
             self._conn.execute(
                 "UPDATE leases SET state=? WHERE id=?",
                 (STATE_TRANSFERRED, row["id"]),
@@ -596,23 +735,221 @@ class Store:
             "created_at_ms": t["created_at_ms"],
         }
 
-    # ---- 受租约保护的写入（栅栏点） -------------------------------------
-    def write(
-        self, resource: str, holder: str, generation: int, value: str
+    # ---- 限时委托：发放 -------------------------------------------------
+    def grant_delegation(
+        self,
+        resource: str,
+        holder: str,
+        generation: int,
+        collaborator: Any,
+        ttl_ms: int | None = None,
+        credential_id: str | None = None,
     ) -> dict[str, Any]:
+        """当前持有者为指定协作者发放只针对该资源的短期委托凭证。
+
+        委托锚定在发放时的生效租约（lease_id + generation）上：
+        - 协作者可凭凭证连续写入，世代号沿用授权租约那一代；
+        - 不能续约/释放/转移/再次转委托：这些入口只认生效租约的
+          holder+generation，协作者天然无法通过；
+        - 有效期只信墙钟且不可延长；租约释放/转移/过期时委托在同一事务
+          连带失效，撤销与到期同样立即生效。
+        """
         with self._lock:
             self._reap_locked()
-            row = self._get_active_locked(resource)
             now = self.clock.wall_ms()
+            row = self._get_active_locked(resource)
+
+            def reject(detail: str, *, lease_row=row, gen=generation,
+                       peer=None) -> None:
+                self._record_event_locked(
+                    resource, "delegate_grant", "rejected", holder,
+                    peer=peer,
+                    lease_id=lease_row["id"] if lease_row else None,
+                    generation=gen, detail=detail, now=now,
+                )
+                self._conn.commit()
+
+            # 客户端可自带幂等凭证号；撞号（任何参数不同）都拒绝
+            if credential_id is not None:
+                credential_id = str(credential_id)
+                prev = self._conn.execute(
+                    "SELECT * FROM delegations WHERE credential_id=?",
+                    (credential_id,),
+                ).fetchone()
+                if prev is not None:
+                    reject(
+                        "credential_id_conflict",
+                        lease_row=row, gen=generation,
+                        peer=prev["collaborator"],
+                    )
+                    raise Conflict(
+                        f"凭证号 {credential_id} 已存在，发放被拒绝"
+                    )
+
+            # 协作者资格：非空字符串，不能委托给自己
+            if not isinstance(collaborator, str) or not collaborator.strip():
+                reject("ineligible_collaborator")
+                raise Conflict("协作者不符合条件：collaborator 必须是非空字符串")
+            if collaborator == holder:
+                reject("ineligible_collaborator:self", peer=collaborator)
+                raise Conflict("协作者不符合条件：不能委托给当前持有者自己")
+
+            # 必须是当前生效租约的持有者与世代号
+            if row is None:
+                reject("no_active_lease", lease_row=None)
+                raise LeaseGone(
+                    f"资源 {resource} 没有生效中的租约，委托发放被拒绝"
+                )
+            if row["holder"] != holder or row["generation"] != generation:
+                reject("holder_or_generation_mismatch", peer=collaborator)
+                raise Conflict(
+                    "持有者或世代号与当前生效租约不符，委托发放被拒绝"
+                )
+
+            ttl = self._clamp_delegation_ttl(ttl_ms)
+            # 委托不能活过授权租约的硬墙钟上限：上限前租约必结束，
+            # 那时委托必被连带栅栏；剩余时间不足以容纳最小 TTL 则拒绝发放
+            max_ms = row["hard_wall_deadline_ms"] - now
+            if max_ms < MIN_TTL_MS:
+                reject("lease_ends_too_soon", peer=collaborator)
+                raise Conflict(
+                    f"授权租约将在 {max_ms}ms 内到硬上限，不足以发放委托"
+                )
+            ttl = min(ttl, max_ms)
+
+            credential_id = credential_id or uuid.uuid4().hex
+            expires = now + ttl
+            self._conn.execute(
+                "INSERT INTO delegations(credential_id, resource, lease_id, "
+                "authorizer, collaborator, generation, granted_wall_ms, "
+                "expires_wall_ms, state, created_at_ms) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    credential_id, resource, row["id"], holder, collaborator,
+                    row["generation"], now, expires, DEL_STATE_ACTIVE, now,
+                ),
+            )
+            self._record_event_locked(
+                resource, "delegate_grant", "ok", holder,
+                peer=collaborator, lease_id=row["id"],
+                generation=row["generation"], credential_id=credential_id,
+                detail=f"expires_wall_ms={expires}", now=now,
+            )
+            self._conn.commit()
+            d = self._conn.execute(
+                "SELECT * FROM delegations WHERE credential_id=?",
+                (credential_id,),
+            ).fetchone()
+            return self._delegation_view_locked(d)
+
+    def _clamp_delegation_ttl(self, ttl_ms: int | None) -> int:
+        ttl = (int(ttl_ms) if ttl_ms is not None
+               else self.default_delegation_ttl_ms)
+        return max(MIN_TTL_MS, min(ttl, self.delegation_max_ttl_ms))
+
+    # ---- 限时委托：提前撤销 ---------------------------------------------
+    def revoke_delegation(
+        self,
+        resource: str,
+        holder: str,
+        generation: int,
+        credential_id: Any,
+    ) -> dict[str, Any]:
+        """授权者提前撤销委托。撤销与状态变更同事务落库并留历史，
+        撤销返回后任何迟到的凭证写入必然被拒。"""
+        with self._lock:
+            self._reap_locked()
+            now = self.clock.wall_ms()
+
+            if credential_id in (None, ""):
+                self._record_event_locked(
+                    resource, "delegate_revoke", "rejected", holder,
+                    generation=generation, detail="missing_credential_id",
+                    now=now,
+                )
+                self._conn.commit()
+                raise Conflict("缺少必填参数: credential_id")
+            credential_id = str(credential_id)
+
+            d = self._conn.execute(
+                "SELECT * FROM delegations WHERE credential_id=?",
+                (credential_id,),
+            ).fetchone()
+            if d is None or d["resource"] != resource:
+                # 无可归属凭证：不制造针对别的资源的事件
+                raise DelegationNotFound(
+                    f"委托凭证 {credential_id} 不存在或不属于资源 {resource}"
+                )
+
+            def reject(detail: str) -> None:
+                self._record_event_locked(
+                    resource, "delegate_revoke", "rejected", holder,
+                    peer=d["collaborator"], lease_id=d["lease_id"],
+                    generation=generation, credential_id=credential_id,
+                    detail=detail, now=now,
+                )
+                self._conn.commit()
+
+            if d["authorizer"] != holder or d["generation"] != generation:
+                reject("holder_or_generation_mismatch")
+                raise Conflict(
+                    "只有发放该委托的授权者且出示其当时的世代号才能撤销"
+                )
+            if d["state"] != DEL_STATE_ACTIVE:
+                reject(f"already_{d['state']}")
+                raise Conflict(
+                    f"委托凭证 {credential_id} 已处于 {d['state']} 状态，"
+                    "无需也不能再次撤销"
+                )
+
+            self._conn.execute(
+                "UPDATE delegations SET state=?, end_reason=? "
+                "WHERE credential_id=?",
+                (DEL_STATE_REVOKED, END_DELEGATION_REVOKED, credential_id),
+            )
+            self._record_event_locked(
+                resource, "delegate_revoke", "ok", holder,
+                peer=d["collaborator"], lease_id=d["lease_id"],
+                generation=d["generation"], credential_id=credential_id,
+                detail=END_DELEGATION_REVOKED, now=now,
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM delegations WHERE credential_id=?",
+                (credential_id,),
+            ).fetchone()
+            return self._delegation_view_locked(row)
+
+    # ---- 受租约保护的写入（栅栏点） -------------------------------------
+    def write(
+        self,
+        resource: str,
+        holder: str,
+        generation: int | None,
+        value: str,
+        *,
+        credential_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            # 收割在锁内先跑：撤销已落库或委托已到期，本次调用必然看到，
+            # 杜绝"既能写又已撤销/已过期"的中间态
+            self._reap_locked()
+            now = self.clock.wall_ms()
+            if credential_id is not None:
+                return self._write_with_delegation_locked(
+                    resource, holder, credential_id, generation, value, now=now
+                )
+
+            row = self._get_active_locked(resource)
 
             def record(accepted: bool, reason: str | None) -> dict[str, Any]:
                 cur = self._conn.execute(
                     "INSERT INTO writes(resource, generation, lease_id, "
-                    "holder, accepted, reject_reason, created_at_ms) "
-                    "VALUES(?,?,?,?,?,?,?)",
+                    "holder, accepted, reject_reason, created_at_ms, "
+                    "credential_id) VALUES(?,?,?,?,?,?,?,?)",
                     (
                         resource, generation, row["id"] if row else "",
-                        holder, 1 if accepted else 0, reason, now,
+                        holder, 1 if accepted else 0, reason, now, None,
                     ),
                 )
                 self._record_event_locked(
@@ -654,6 +991,189 @@ class Store:
             out = record(True, None)
             out["value"] = value
             return out
+
+    # ---- 凭委托凭证的写入（委托只授予写，且与授权租约共用世代栅栏） ------
+    def _write_with_delegation_locked(
+        self,
+        resource: str,
+        holder: str,
+        credential_id: str,
+        claimed_generation: int | None,
+        value: str,
+        *,
+        now: int,
+    ) -> dict[str, Any]:
+        d = self._conn.execute(
+            "SELECT * FROM delegations WHERE credential_id=?", (credential_id,)
+        ).fetchone()
+        # 伪造的凭证，或拿 A 资源的凭证写 B 资源：不存在可挂载的租约/世代，
+        # writes 表里没有对应行，只在统一历史留一条拒绝事件
+        if d is None or d["resource"] != resource:
+            self._record_event_locked(
+                resource, "delegate_write", "rejected", holder,
+                generation=claimed_generation, credential_id=credential_id,
+                detail=REJECT_UNKNOWN_CREDENTIAL, now=now,
+            )
+            self._conn.commit()
+            raise DelegationNotFound(
+                f"委托凭证 {credential_id} 不存在或不属于资源 {resource}，"
+                "写入被拒绝"
+            )
+
+        # 取生效租约；若授权租约恰在此时被判定过期，这里会在同一事务里
+        # 连带把该凭证置为 fenced（_expire_locked -> _fence_delegations_locked）
+        row = self._get_active_locked(resource)
+        d = self._conn.execute(
+            "SELECT * FROM delegations WHERE credential_id=?", (credential_id,)
+        ).fetchone()
+
+        def record(accepted: bool, reason: str | None) -> dict[str, Any]:
+            cur = self._conn.execute(
+                "INSERT INTO writes(resource, generation, lease_id, holder, "
+                "accepted, reject_reason, created_at_ms, credential_id) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    resource, d["generation"], d["lease_id"], holder,
+                    1 if accepted else 0, reason, now, credential_id,
+                ),
+            )
+            self._record_event_locked(
+                resource, "delegate_write",
+                "ok" if accepted else "rejected", holder,
+                peer=d["authorizer"], lease_id=d["lease_id"],
+                generation=d["generation"], credential_id=credential_id,
+                detail=f"write_id={cur.lastrowid}" if accepted else reason,
+                now=now,
+            )
+            self._conn.commit()
+            return {
+                "write_id": cur.lastrowid, "resource": resource,
+                "holder": holder, "generation": d["generation"],
+                "accepted": accepted, "reject_reason": reason,
+                "credential_id": credential_id,
+                "authorizer": d["authorizer"],
+                "collaborator": d["collaborator"],
+            }
+
+        # 防御性到期（正常情况下锁内 _reap_locked 已先处理过）
+        if d["state"] == DEL_STATE_ACTIVE and now >= d["expires_wall_ms"]:
+            self._conn.execute(
+                "UPDATE delegations SET state=?, end_reason=? "
+                "WHERE credential_id=?",
+                (DEL_STATE_EXPIRED, END_DELEGATION_EXPIRED, credential_id),
+            )
+            self._record_event_locked(
+                resource, "delegate_expire", "ok", d["authorizer"],
+                peer=d["collaborator"], lease_id=d["lease_id"],
+                generation=d["generation"], credential_id=credential_id,
+                detail=END_DELEGATION_EXPIRED, now=now,
+            )
+            d = self._conn.execute(
+                "SELECT * FROM delegations WHERE credential_id=?",
+                (credential_id,),
+            ).fetchone()
+
+        # 1) 凭证必须仍生效：撤销/过期/原租约结束一律拒绝迟到写入
+        if d["state"] != DEL_STATE_ACTIVE:
+            reason = self._delegation_reject_reason_locked(d)
+            record(False, reason)
+            raise DelegationRejected(
+                f"委托凭证 {credential_id} 已{self._delegation_state_cn(d)}"
+                f"（{reason}），写入被拒绝"
+            )
+
+        # 2) 只有凭证指定的协作者本人能用
+        if holder != d["collaborator"]:
+            record(False, REJECT_COLLABORATOR_MISMATCH)
+            raise DelegationRejected(
+                f"凭证 {credential_id} 只授权给协作者 {d['collaborator']}，"
+                f"{holder} 的写入被拒绝"
+            )
+
+        # 3) 客户端若带了世代号，必须与凭证锚定的那一代一致
+        if (
+            claimed_generation is not None
+            and int(claimed_generation) != d["generation"]
+        ):
+            record(False, "generation_fence")
+            raise DelegationRejected(
+                f"凭证 {credential_id} 锚定世代 {d['generation']}，"
+                f"请求携带 {claimed_generation}，写入被拒绝"
+            )
+
+        # 4) 栅栏核心：原租约必须仍是发放时那一代的生效租约。
+        #    释放/转移/过期的同事务栅栏已覆盖所有正常路径，这里是最终防线。
+        if (
+            row is None
+            or row["id"] != d["lease_id"]
+            or row["generation"] != d["generation"]
+        ):
+            reason = self._fence_by_lease_state_locked(d)
+            record(False, reason)
+            raise DelegationRejected(
+                f"授权租约已结束（{reason}），委托凭证 {credential_id} "
+                "的迟到写入被拒绝"
+            )
+
+        res = self._conn.execute(
+            "SELECT * FROM resources WHERE resource=?", (resource,)
+        ).fetchone()
+        # 与持有者直写共用同一道栅栏：委托世代不落后于已放行号
+        assert d["generation"] >= res["last_passed_gen"]
+        self._conn.execute(
+            "UPDATE resources SET value=?, updated_by_gen=?, updated_at_ms=?, "
+            "last_passed_gen=? WHERE resource=?",
+            (value, d["generation"], now, d["generation"], resource),
+        )
+        out = record(True, None)
+        out["value"] = value
+        return out
+
+    @staticmethod
+    def _delegation_state_cn(d) -> str:
+        return {
+            DEL_STATE_REVOKED: "撤销",
+            DEL_STATE_EXPIRED: "过期",
+            DEL_STATE_FENCED: "随原租约结束而失效",
+        }.get(d["state"], "失效")
+
+    @staticmethod
+    def _delegation_reject_reason_locked(d) -> str:
+        if d["state"] == DEL_STATE_REVOKED:
+            return REJECT_DELEGATION_REVOKED
+        if d["state"] == DEL_STATE_EXPIRED:
+            return REJECT_DELEGATION_EXPIRED
+        if d["state"] == DEL_STATE_FENCED:
+            return d["end_reason"] or FENCE_LEASE_EXPIRED
+        return "delegation_not_active"
+
+    def _fence_by_lease_state_locked(self, d) -> str:
+        """最终防线：凭证仍 active 但绑定租约已不是当前生效租约。
+        按租约终态补上 fenced 状态与历史事件，返回对应拒绝原因。"""
+        lease = self._conn.execute(
+            "SELECT * FROM leases WHERE id=?", (d["lease_id"],)
+        ).fetchone()
+        if lease is None or lease["state"] == STATE_EXPIRED:
+            reason = FENCE_LEASE_EXPIRED
+        elif lease["state"] == STATE_RELEASED:
+            reason = FENCE_LEASE_RELEASED
+        elif lease["state"] == STATE_TRANSFERRED:
+            reason = FENCE_LEASE_TRANSFERRED
+        else:
+            reason = FENCE_LEASE_EXPIRED
+        cur = self._conn.execute(
+            "UPDATE delegations SET state=?, end_reason=? "
+            "WHERE credential_id=? AND state=?",
+            (DEL_STATE_FENCED, reason, d["credential_id"], DEL_STATE_ACTIVE),
+        )
+        if cur.rowcount:
+            self._record_event_locked(
+                d["resource"], "delegate_fence", "ok", d["authorizer"],
+                peer=d["collaborator"], lease_id=d["lease_id"],
+                generation=d["generation"], credential_id=d["credential_id"],
+                detail=reason,
+            )
+        return reason
 
     # ---- 查询 -----------------------------------------------------------
     def get_lease(self, resource: str) -> dict[str, Any] | None:
@@ -703,6 +1223,7 @@ class Store:
                     "holder": r["holder"], "accepted": bool(r["accepted"]),
                     "reject_reason": r["reject_reason"],
                     "created_at_ms": r["created_at_ms"],
+                    "credential_id": r["credential_id"],
                 }
                 for r in rows
             ]
@@ -720,16 +1241,33 @@ class Store:
                 "holder": r["holder"], "accepted": bool(r["accepted"]),
                 "reject_reason": r["reject_reason"],
                 "created_at_ms": r["created_at_ms"],
+                "credential_id": r["credential_id"],
             }
 
-    def list_history(self, resource: str, limit: int = 200) -> list[dict[str, Any]]:
-        """按资源返回统一租约历史，按审计顺序（seq）从旧到新排列。"""
+    def list_history(
+        self,
+        resource: str,
+        limit: int = 200,
+        credential_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """按资源返回统一租约历史，按审计顺序（seq）从旧到新排列。
+
+        可传 credential_id 只看某张委托凭证的完整轨迹：发放、每次使用
+        （含被拒绝）、撤销/过期/连带失效，以及它锚定的授权者与世代号。
+        """
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM lease_events WHERE resource=? "
-                "ORDER BY seq DESC LIMIT ?",
-                (resource, int(limit)),
-            ).fetchall()
+            if credential_id is not None:
+                rows = self._conn.execute(
+                    "SELECT * FROM lease_events WHERE resource=? "
+                    "AND credential_id=? ORDER BY seq DESC LIMIT ?",
+                    (resource, str(credential_id), int(limit)),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM lease_events WHERE resource=? "
+                    "ORDER BY seq DESC LIMIT ?",
+                    (resource, int(limit)),
+                ).fetchall()
             return [
                 {
                     "seq": r["seq"], "resource": r["resource"],
@@ -738,11 +1276,105 @@ class Store:
                     "lease_id": r["lease_id"], "generation": r["generation"],
                     "to_lease_id": r["to_lease_id"],
                     "to_generation": r["to_generation"],
+                    "credential_id": r["credential_id"],
                     "detail": r["detail"],
                     "wall_ms": r["wall_ms"], "logical": r["logical"],
                 }
                 for r in reversed(rows)
             ]
+
+    # ---- 委托查询 -------------------------------------------------------
+    def get_delegation(self, credential_id: str) -> dict[str, Any] | None:
+        """按凭证号查委托全文：授权者、协作者、有效期、锚定世代号与状态。"""
+        with self._lock:
+            # 顺带把已到期/租约已结束的状态收敛，查询即看到真实终态
+            self._reap_locked()
+            d = self._conn.execute(
+                "SELECT * FROM delegations WHERE credential_id=?",
+                (str(credential_id),),
+            ).fetchone()
+            if d is None:
+                return None
+            d = self._refresh_delegation_locked(d)
+            return self._delegation_view_locked(d)
+
+    def list_delegations(
+        self, resource: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            self._reap_locked()
+            rows = self._conn.execute(
+                "SELECT * FROM delegations WHERE resource=? "
+                "ORDER BY granted_wall_ms DESC, credential_id DESC LIMIT ?",
+                (resource, int(limit)),
+            ).fetchall()
+            return [
+                self._delegation_view_locked(self._refresh_delegation_locked(d))
+                for d in rows
+            ]
+
+    def _refresh_delegation_locked(self, d):
+        """查询时的惰性收敛：已过墙钟 -> expired；仍 active 但绑定租约
+        已非当前生效租约 -> 按租约终态补 fenced（与写入路径同一套规则）。"""
+        if d["state"] != DEL_STATE_ACTIVE:
+            return d
+        now = self.clock.wall_ms()
+        if now >= d["expires_wall_ms"]:
+            self._conn.execute(
+                "UPDATE delegations SET state=?, end_reason=? "
+                "WHERE credential_id=?",
+                (DEL_STATE_EXPIRED, END_DELEGATION_EXPIRED,
+                 d["credential_id"]),
+            )
+            self._record_event_locked(
+                d["resource"], "delegate_expire", "ok", d["authorizer"],
+                peer=d["collaborator"], lease_id=d["lease_id"],
+                generation=d["generation"], credential_id=d["credential_id"],
+                detail=END_DELEGATION_EXPIRED, now=now,
+            )
+            self._conn.commit()
+            return self._conn.execute(
+                "SELECT * FROM delegations WHERE credential_id=?",
+                (d["credential_id"],),
+            ).fetchone()
+        lease = self._conn.execute(
+            "SELECT * FROM leases WHERE id=?", (d["lease_id"],)
+        ).fetchone()
+        if lease is not None and lease["state"] == STATE_ACTIVE:
+            status = self._classify_locked(lease)
+            if status["state"] != STATE_ACTIVE:
+                # _expire_locked 已在同一事务连带 fence 并落事件
+                self._expire_locked(lease, status["expire_reason"])
+                self._conn.commit()
+                return self._conn.execute(
+                    "SELECT * FROM delegations WHERE credential_id=?",
+                    (d["credential_id"],),
+                ).fetchone()
+            return d
+        if lease is None or lease["state"] != STATE_ACTIVE:
+            self._fence_by_lease_state_locked(d)
+            self._conn.commit()
+            return self._conn.execute(
+                "SELECT * FROM delegations WHERE credential_id=?",
+                (d["credential_id"],),
+            ).fetchone()
+        return d
+
+    def _delegation_view_locked(self, d) -> dict[str, Any]:
+        return {
+            "credential_id": d["credential_id"],
+            "resource": d["resource"],
+            "authorizer": d["authorizer"],
+            "collaborator": d["collaborator"],
+            "lease_id": d["lease_id"],
+            "generation": d["generation"],
+            "state": d["state"],
+            "end_reason": d["end_reason"],
+            "granted_wall_ms": d["granted_wall_ms"],
+            "expires_wall_ms": d["expires_wall_ms"],
+            "ttl_ms": d["expires_wall_ms"] - d["granted_wall_ms"],
+            "created_at_ms": d["created_at_ms"],
+        }
 
     def _lease_view_locked(self, row, state: str = STATE_ACTIVE) -> dict[str, Any]:
         logical = self.clock.logical()

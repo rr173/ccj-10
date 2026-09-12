@@ -101,3 +101,46 @@ curl -s "$BASE/resources/$R" | python3 -m json.tool
 echo
 echo "== 12. 完整租约历史（获取/续约/释放/转移/写入，成功与拒绝都在） =="
 curl -s "$BASE/resources/$R/history" | python3 -m json.tool
+
+echo
+echo "== 13. 限时委托：node-3 给协作者 worker-1 发放 5s 短期凭证 =="
+GEN_CUR=$(curl -s "$BASE/resources/$R/leases" | j "['generation']")
+DEL=$(curl -s -X POST "$BASE/leases/delegations" -H 'Content-Type: application/json' \
+  -d "{\"resource\":\"$R\",\"holder\":\"node-3\",\"generation\":$GEN_CUR,\"collaborator\":\"worker-1\",\"ttl_ms\":5000}")
+echo "$DEL" | python3 -m json.tool
+CID=$(echo "$DEL" | j "['delegation']['credential_id']")
+echo "   credential_id=$CID（锚定世代 $GEN_CUR）"
+
+echo
+echo "== 14. 协作者凭凭证连续写入（不用持有租约，世代号可省略） =="
+for v in d1 d2 d3; do
+  curl -s -o /dev/null -w "   协作者写 $v: HTTP %{http_code}\n" -X POST \
+    "$BASE/resources/$R/writes" -H 'Content-Type: application/json' \
+    -d "{\"holder\":\"worker-1\",\"credential_id\":\"$CID\",\"value\":\"$v\"}"
+done
+echo "   别人冒用该凭证："
+curl -s -o /dev/null -w "   HTTP %{http_code}\n" -X POST \
+  "$BASE/resources/$R/writes" -H 'Content-Type: application/json' \
+  -d "{\"holder\":\"mallory\",\"credential_id\":\"$CID\",\"value\":\"hack\"}"
+echo "   协作者试图续约（必须 409，委托只授写）："
+curl -s -o /dev/null -w "   HTTP %{http_code}\n" -X POST "$BASE/leases/renew" \
+  -H 'Content-Type: application/json' \
+  -d "{\"resource\":\"$R\",\"holder\":\"worker-1\",\"generation\":$GEN_CUR}"
+
+echo
+echo "== 15. 授权者提前撤销凭证 =="
+curl -s -X POST "$BASE/leases/delegations/revoke" -H 'Content-Type: application/json' \
+  -d "{\"resource\":\"$R\",\"holder\":\"node-3\",\"generation\":$GEN_CUR,\"credential_id\":\"$CID\"}" \
+  | j "['delegation']['state']"
+
+echo
+echo "== 16. 撤销后的迟到委托写入 —— 必须 409 delegation_rejected =="
+curl -s -o /tmp/del.json -w "   HTTP %{http_code}\n" -X POST \
+  "$BASE/resources/$R/writes" -H 'Content-Type: application/json' \
+  -d "{\"holder\":\"worker-1\",\"credential_id\":\"$CID\",\"value\":\"late\"}"
+cat /tmp/del.json | python3 -m json.tool
+
+echo
+echo "== 17. 按凭证号查委托与其完整历史（授权者/协作者/有效期/世代号/每次结果） =="
+curl -s "$BASE/delegations/$CID" | python3 -m json.tool
+curl -s "$BASE/resources/$R/history?credential_id=$CID" | python3 -m json.tool
