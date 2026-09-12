@@ -1,0 +1,19 @@
+services:
+  lease-service:
+    build: .
+    image: lease-service:latest
+    container_name: lease-service
+    ports:
+      - "8080:8080"
+    volumes:
+      - lease-data:/data
+    environment:
+      # 演示/测试环境保留拨表与手动 tick 接口；生产应设为 0
+      ENABLE_DEBUG_API: "1"
+      LEASE_TTL_MS: "15000"
+      LEASE_HARD_TTL_MS: "60000"
+      LOGICAL_GRACE_TICKS: "3"
+    restart: unless-stopped
+
+volumes:
+  lease-data:
