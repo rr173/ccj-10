@@ -223,6 +223,64 @@ CREATE TABLE IF NOT EXISTS archive_events (
     payload    TEXT NOT NULL,                   -- event_dict 的规范化 JSON
     PRIMARY KEY (archive_id, seq)
 );
+-- 审计证据包：把多份**已完成**的资源归档/委托凭证归档按给定组合顺序冻结成
+-- 一份只读证据包。创建时即冻结清单（evidence_entries：顺序、每份归档的
+-- 内容校验值、收录方式）与生成元数据；证据包操作只写本表与
+-- evidence_entries / evidence_entry_contents，绝不修改租约、委托、原始
+-- 审计历史，甚至不写源归档行（源归档对证据包只读）。
+-- idempotency_key 全局唯一：同键不同清单 -> 409；
+-- manifest_fingerprint 全局唯一：同清单（同归档、同顺序、同收录方式）不同
+-- 键 -> 409。系统里绝不会出现两份互相矛盾或重复的证据包。
+CREATE TABLE IF NOT EXISTS evidence_packages (
+    package_id             TEXT PRIMARY KEY,
+    idempotency_key        TEXT NOT NULL,
+    manifest_fingerprint   TEXT NOT NULL,       -- 对有序归档清单（id+收录方式）的 SHA-256
+    status                 TEXT NOT NULL DEFAULT 'pending',
+                           -- pending / building / completed / failed
+    total_entries          INTEGER NOT NULL DEFAULT 0,
+    processed_entries      INTEGER NOT NULL DEFAULT 0,
+    last_frozen_position   INTEGER NOT NULL DEFAULT -1, -- 续跑游标：已冻结到的清单位置
+    attempts               INTEGER NOT NULL DEFAULT 0,
+    error                  TEXT,
+    error_detail           TEXT,                -- JSON：失败的首个归档标识/字段/双方值
+    metadata_json          TEXT,                -- 创建时冻结的元数据（规范化 JSON）
+    snapshot_seq           INTEGER NOT NULL,     -- 创建时的稳定视图上界
+    created_logical        INTEGER NOT NULL,     -- 创建时逻辑钟读数（生成元数据）
+    content                TEXT,                -- 冻结的证据包文档（JSON）
+    content_sha256         TEXT,                -- 总校验值
+    combination_digest     TEXT,                -- 组合摘要（顺序敏感的链式哈希）
+    verify_status          TEXT NOT NULL DEFAULT 'unverified',
+                           -- unverified / verified / verify_failed
+    verify_detail          TEXT,                -- JSON：核验失败的首个差异位置
+    verified_at_ms         INTEGER,
+    created_at_ms          INTEGER NOT NULL,
+    updated_at_ms          INTEGER NOT NULL,
+    completed_at_ms        INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_evidence_idem
+    ON evidence_packages(idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_evidence_manifest
+    ON evidence_packages(manifest_fingerprint);
+-- 冻结的清单：证据包创建时一次性写入（顺序 + 每份归档的内容校验值 + 收录
+-- 方式），之后只读；源归档之后被再次核验或产生新归档都改不动它。
+CREATE TABLE IF NOT EXISTS evidence_entries (
+    package_id        TEXT NOT NULL,
+    position          INTEGER NOT NULL,         -- 0 起的组合顺序
+    archive_id        TEXT NOT NULL,
+    include_mode      TEXT NOT NULL,            -- content（原文）/ reference（稳定引用）
+    source_sha256     TEXT NOT NULL,            -- 创建时钉死的源归档内容校验值
+    status            TEXT NOT NULL DEFAULT 'pending',  -- pending / frozen
+    frozen_sha256     TEXT,                     -- 冻结载荷自身的 SHA-256
+    PRIMARY KEY (package_id, position)
+);
+-- 分块冻结的归档载荷：主键 (package_id, position) + INSERT OR IGNORE，
+-- 分块处理、服务重启续跑、失败重试都不会重复写入或写出矛盾内容。
+CREATE TABLE IF NOT EXISTS evidence_entry_contents (
+    package_id TEXT NOT NULL,
+    position   INTEGER NOT NULL,
+    payload    TEXT NOT NULL,                   -- 收录条目的规范化 JSON（原文或稳定引用）
+    PRIMARY KEY (package_id, position)
+);
 """
 
 

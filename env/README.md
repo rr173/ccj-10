@@ -319,6 +319,111 @@ POST /audit/archives
 | 节点选择器缺失/多个、缺幂等键、非法 scope/status | 400 | `bad_request` |
 | 资源无历史 / 凭证不存在 / 节点越界 | 404/416 | 与审计回放一致 |
 
+## 审计证据包（audit evidence package）
+
+管理员可以把多份**已完成**的资源归档或委托凭证归档（允许混合、允许重复、
+也允许空组合）按给定的组合顺序组合成一份只读证据包。证据包在**创建时**
+即冻结四样东西，之后任何操作都改不动它：
+
+1. **归档清单**：每份源归档的标识、0 起的组合顺序、收录方式
+   （`content` 收录原文 / `reference` 只收录稳定引用）；
+2. **每份归档的内容校验值**：清单记录创建时源归档的 `content_sha256`
+   （`source_sha256`）；
+3. **组合顺序**：顺序是清单指纹的一部分，换顺序就是另一份证据包；
+4. **生成时元数据**：创建墙钟、逻辑钟读数、稳定视图上界 `snapshot_seq`
+   与可选 `metadata`（规范化 JSON 后冻结）。
+
+### 创建（幂等 + 冲突显式化）
+
+```
+POST /audit/evidence
+{"archives":["<archive_id>",
+             {"archive_id":"<archive_id>", "include":"reference"}],
+ "idempotency_key":"bundle-2026-Q3",
+ "metadata":{"case":"incident-42", "operator":"admin"}}
+```
+
+- 清单条目可写裸字符串（默认 `include:"content"`）或对象；**同一组归档、
+  同一组合顺序（含收录方式）、同一幂等键**重复创建只返回同一份证据包
+  （HTTP 200 + `"replayed": true`）；
+- **同键但换归档 / 换顺序 / 换收录方式** → 409 `evidence_id_conflict`，
+  响应 `first_difference` 给出首个差异位置（如 `archives[1].archive_id`）、
+  字段名与双方值；
+- **不同键但清单完全相同** → 409 `evidence_manifest_conflict`，指向已存在
+  的证据包与其幂等键——同一套证据不允许生成两份互相独立的"原件"；
+- 源归档必须存在且已完成：不存在 → 404 `evidence_source_not_found`
+  （附 `position`），未完成 → 409 `evidence_source_not_ready`；
+- 创建返回 201 与证据包视图（含 `package_id`、进度、`manifest_fingerprint`），
+  生成由后台按条目分块进行。
+
+### 生成进度与断点续跑
+
+- 后台 worker 按块（`EVIDENCE_CHUNK_SIZE`，默认每块 1 个条目）把源归档
+  载荷冻结进 `evidence_entry_contents`，每块提交后进度落库
+  （`GET /audit/evidence/<id>` 可见
+  `processed_entries / total_entries / percent`）；
+- **服务重启或后台失败**：`pending/building/failed` 的证据包从已保存的
+  `last_frozen_position` 继续，启动即自动续跑；只对仍为 `pending` 的条目
+  推进，冻结表主键 `(package_id, position)` + `INSERT OR IGNORE` 保证
+  **失败重试不会重复写入**；
+- 自动重试有上限（5 次），`POST /audit/evidence/<id>/retry` 可手动复位
+  `failed` 证据包（进度保留，只重置尝试计数）；
+- 冻结时会重新比对源归档当前内容哈希与创建时钉死的 `source_sha256`，
+  不一致（源归档在生成期间被掉包）立即 `failed`，
+  `error_detail` 给出归档标识、位置、字段路径与双方值，绝不静默收录。
+
+### 冻结性
+
+证据包一旦创建，**源归档被再次核验（verify 标记变化）或产生新的归档**
+都不会改变证据包内容：清单、源哈希、内嵌原文在创建/冻结时就固定，
+新归档不会混入，源归档节点之后的历史也进不来。证据包的全部操作只写
+`evidence_packages` / `evidence_entries` / `evidence_entry_contents`
+三张自有表，**绝不修改租约、委托、原始审计历史，甚至不写源归档行**
+（`archives` / `archive_events` 对证据包只读）；证据包完成后当前租约
+照常可写。
+
+### 证据包文档（只读下载）
+
+`GET /audit/evidence/<id>/download` 在完成后返回落库原文（字节稳定，
+响应头带 `X-Evidence-SHA256`），文档包含：
+
+| 字段 | 含义 |
+|---|---|
+| `manifest` | **可独立解析的清单**：每项含 `position`、`archive_id`、`include_mode`、创建时冻结的 `source_sha256`、冻结载荷哈希 `frozen_sha256` 与源归档的**稳定引用**（scope/resource/credential_id/node_seq/snapshot_seq/下载位置） |
+| `sources[]` | 每份归档的收录载荷：`include:"content"` 内嵌**归档文档原文**（独立可解析 JSON，含其自身的校验值）；`include:"reference"` 只含归档标识与源哈希 |
+| `combination.digest` | **组合摘要**：顺序敏感的链式哈希（`sha256-chain-v1`，从固定初值起，逐步混入 archive_id 与该位置冻结载荷哈希）；换顺序/换归档/改内容都会改变摘要，并附 `ordered_archive_ids` |
+| `content_sha256` | **总校验值**：对除本字段外的规范化 JSON（键排序）计算的 SHA-256，下载者可独立复算 |
+| `metadata` / `created_at_ms` / `created_logical` / `snapshot_seq` | 创建时冻结的生成元数据 |
+
+### 独立核验（标记 verified / verify_failed）
+
+`POST /audit/evidence/<id>/verify` 对已完成的证据包做独立核验，结果标记
+在证据包上（`verify_status`，重启不丢）。核验**逐份**检查：
+
+1. 证据包文档与保存的总校验值一致（文档未被改动）；
+2. 组合摘要可由各收录载荷按组合顺序独立重算得到，且顺序与清单一致；
+3. 清单完整：位置是连续的 0..N-1，文档条目与冻结载荷表逐条一致；
+4. 每个位置的**源归档存在**、源归档当前**内容哈希**与冻结的
+   `source_sha256` 一致、内嵌原文与源当前内容逐字段一致（reference 模式
+   则核对稳定引用的定位信息）、内嵌原文自身的内容校验值可独立复算。
+
+任一失败即标记 `verify_failed`，`verify_detail` / 响应的
+`first_divergence` 给出**首个差异的归档标识**（`archive_id`）、
+**字段路径**（如 `sources[1].source_sha256`）、位置与**双方值**
+（`archived` / `recomputed`，缺失显示 `<missing>`），例如源归档被删除、
+源内容哈希被改、下载文档被篡改、冻结载荷被伪造、组合顺序被重排。
+全部通过则标记 `verified`。
+
+| 场景 | 状态码 | error |
+|---|---|---|
+| 证据包不存在 | 404 | `evidence_not_found` |
+| 源归档不存在 / 未完成 | 404 / 409 | `evidence_source_not_found` / `evidence_source_not_ready` |
+| 未完成就下载/核验 | 409 | `evidence_not_ready` |
+| 同键不同清单（换归档/顺序/收录方式） | 409 | `evidence_id_conflict`（附首个差异） |
+| 不同键但清单相同 | 409 | `evidence_manifest_conflict` |
+| 对非 failed 证据包发起重试 | 409 | `evidence_bad_state` |
+| archives 非数组、条目非法、缺幂等键、非法 include/metadata/status | 400 | `bad_request` |
+
 
 ## 持久性
 
@@ -326,10 +431,12 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 生效租约、每资源世代号、写入审计、**转移记录（幂等键）**、**限时委托凭证**、
 **统一租约历史（含每条被接受写入当时的资源值，供事件溯源回放）**、
 **审计归档与冻结事件副本（归档进度、内容校验值与核验标记）**、
+**审计证据包与冻结清单/收录载荷（组合顺序、每份源归档内容哈希、
+组合摘要、总校验值与核验标记）**、
 逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
 正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放，
 **审计回放、节点比较与一致性诊断对同一份历史给出逐字节一致的结果**；
-启动时即按墙钟收割已到期的委托，并自动续跑未完成的归档生成。
+启动时即按墙钟收割已到期的委托，并自动续跑未完成的归档与证据包生成。
 旧版本数据库会在启动时自动补列迁移。
 逻辑钟由后台 ticker 每秒 +1（每次推进都 fsync 落库）。
 
@@ -366,6 +473,12 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 | GET | `/audit/archives/<id>/download` | **下载归档文档**（事件范围+回放状态+诊断+SHA-256 校验值；未完成 409） |
 | POST | `/audit/archives/<id>/verify` | **独立核验**：通过标记 `verified`，失败标记 `verify_failed` 并给出首个差异位置 |
 | POST | `/audit/archives/<id>/retry` | 手动复位 `failed` 归档，从已保存进度继续（非 failed 409） |
+| POST | `/audit/evidence` | **创建审计证据包**：`{archives:[id|{archive_id,include}], idempotency_key, metadata?}`；同归档+同顺序+同键返回同一份（200 回放），同键不同清单/不同键同清单 409 |
+| GET | `/audit/evidence` | 列证据包（`?status=&archive_id=&limit=`） |
+| GET | `/audit/evidence/<id>` | **查证据包进度**：状态、已冻结/总条目数、组合摘要、总校验值、核验标记 |
+| GET | `/audit/evidence/<id>/download` | **下载证据包文档**（清单+原文/稳定引用+组合摘要+总校验值；未完成 409） |
+| POST | `/audit/evidence/<id>/verify` | **独立核验**：逐份检查源归档存在性/内容哈希/原文与组合顺序完整性，失败给出首个差异的归档标识、字段路径与双方值 |
+| POST | `/audit/evidence/<id>/retry` | 手动复位 `failed` 证据包，从已保存进度继续（非 failed 409） |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
 | GET | `/debug/now` | 两种时钟当前读数 |
@@ -425,7 +538,8 @@ curl -s localhost:8080/writes/1
 | `DELEGATION_MAX_TTL_MS` | 60000 | 委托凭证可请求有效期的上限（且永远短于授权租约的硬上限） |
 | `LOGICAL_TICK_INTERVAL_S` | 1 | 后台逻辑钟 tick 间隔 |
 | `ARCHIVE_CHUNK_SIZE` | 100 | 归档后台生成时每块冻结的事件条数（每块提交一次、进度落库） |
-| `ARCHIVE_WORKER_INTERVAL_S` | 0.2 | 后台归档 worker 的轮询间隔（秒） |
+| `ARCHIVE_WORKER_INTERVAL_S` | 0.2 | 后台归档 worker 的轮询间隔（秒；归档与证据包共用） |
+| `EVIDENCE_CHUNK_SIZE` | 1 | 证据包后台生成时每块冻结的归档条目数（每块提交一次、进度落库） |
 | `ENABLE_DEBUG_API` | 1 | 是否开放 `/debug/*` 故障演练接口 |
 
 ## 测试
@@ -463,3 +577,14 @@ PYTHONPATH=. pytest tests/ -q
 finalize 失败重试不重复写入冻结事件、
 核验通过与三类篡改（删原始事件/改归档文档/改冻结副本）的首个差异位置、
 归档全流程不修改租约/委托/原始历史、重启后归档文档与核验标记逐字节一致。
+审计证据包覆盖：资源+凭证归档混合组合的创建-分块生成-下载-组合摘要-
+总校验值-核验闭环、reference/content 两种收录方式、
+空组合（含确定摘要与校验值、空转非空冲突）、重复归档（不同位置/不同收录方式）、
+同组归档同顺序同键重放、换归档/换顺序/换收录方式的同键冲突（首个差异路径与双方值）、
+不同键同清单冲突、
+生成期间源归档被再次核验与产生新归档均不改变冻结内容、生成期间源哈希被掉包即失败、
+分块进度逐块可见、finalize/冻结阶段失败后自动与手动续跑且不重复写入、
+服务重启后从已保存进度续跑且文档逐字节一致、
+核验通过与六类失败（源归档删除、源内容哈希变化、下载文档篡改、
+组合顺序重排、冻结载荷伪造、内嵌原文漂移）的首个差异归档标识/字段路径/双方值、
+证据包全流程不修改租约/委托/原始历史/源归档、未完成/不存在/源未就绪等显式错误。

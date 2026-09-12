@@ -47,6 +47,20 @@
   POST   /audit/archives/<id>/verify            独立核验：标记 verified / verify_failed
                                                 （失败给出首个差异位置）
   POST   /audit/archives/<id>/retry             失败的归档复位重试（从已存进度继续）
+审计证据包（只写 evidence_* 自有表，绝不修改租约/委托/原始历史/源归档）：
+  POST   /audit/evidence                        组合多份已完成归档为只读证据包
+                                                {archives:[id|{archive_id,include}],
+                                                 idempotency_key, metadata?}
+                                                同归档+同顺序+同键 → 同一份（200 回放）；
+                                                同键不同清单/不同键同清单 → 409
+  GET    /audit/evidence                        列证据包（?status&archive_id&limit）
+  GET    /audit/evidence/<id>                   查生成进度/状态/组合摘要/核验标记
+  GET    /audit/evidence/<id>/download          下载证据包文档（清单+原文/引用+
+                                                组合摘要+总校验值；未完成 409）
+  POST   /audit/evidence/<id>/verify            独立核验：逐份检查源归档存在性/
+                                                内容哈希/原文与组合顺序完整性，
+                                                失败给出首个差异位置
+  POST   /audit/evidence/<id>/retry             失败的证据包复位重试（从已存进度继续）
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
   POST   /debug/tick           手动推进逻辑钟
   POST   /debug/wall-shift     拨墙钟（可正可负）
@@ -68,6 +82,17 @@ from .archive import (
     ArchiveManager,
     ArchiveNotFound,
     ArchiveNotReady,
+)
+from .evidence import (
+    EvidenceBadState,
+    EvidenceError,
+    EvidenceIdConflict,
+    EvidenceManifestConflict,
+    EvidenceNotFound,
+    EvidenceNotReady,
+    EvidencePackageManager,
+    EvidenceSourceNotFound,
+    EvidenceSourceNotReady,
 )
 from .audit import (
     AuditBadRequest,
@@ -120,6 +145,10 @@ def create_app(
     archive = ArchiveManager(
         store, audit, chunk_size=_env_int("ARCHIVE_CHUNK_SIZE", 100))
     app.extensions["archive"] = archive
+    # 审计证据包：组合多份已完成归档，只写 evidence_* 自有表
+    evidence = EvidencePackageManager(
+        store, chunk_size=_env_int("EVIDENCE_CHUNK_SIZE", 1))
+    app.extensions["evidence"] = evidence
     if enable_debug_api is None:
         enable_debug_api = os.environ.get("ENABLE_DEBUG_API", "1") == "1"
 
@@ -455,6 +484,62 @@ def create_app(
         return jsonify(archive.retry(archive_id))
 
     # ------------------------------------------------------------------
+    # 审计证据包
+    #
+    # 把多份已完成的资源/凭证归档按给定组合顺序冻结成一份只读证据包。
+    # 创建时冻结清单、每份归档的内容校验值、组合顺序与生成时元数据；
+    # 后台按条目分块生成，进度落库，重启/失败后从已保存进度继续，
+    # 重试不重复写入。证据包操作只写 evidence_* 自有表，绝不修改租约、
+    # 委托、原始审计历史与源归档。
+    # ------------------------------------------------------------------
+    @app.post("/audit/evidence")
+    def evidence_create():
+        data = body()
+        view, created = evidence.create_package(
+            archives=data.get("archives"),
+            idempotency_key=data.get("idempotency_key"),
+            metadata=data.get("metadata"),
+        )
+        # 同组归档+同顺序+同键重复创建：200 回放同一份证据包
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/evidence")
+    def evidence_list():
+        return jsonify(evidence.list_packages(
+            status=request.args.get("status"),
+            archive_id=request.args.get("archive_id"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/evidence/<package_id>")
+    def evidence_status(package_id):
+        return jsonify(evidence.get_package(package_id))
+
+    @app.get("/audit/evidence/<package_id>/download")
+    def evidence_download(package_id):
+        text, view = evidence.download(package_id)
+        # 落库原文逐字节返回：下载者可用 content_sha256 独立复算
+        return Response(
+            text, mimetype="application/json",
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="audit-evidence-{package_id}.json"',
+                "X-Evidence-SHA256": view["content_sha256"] or "",
+            },
+        )
+
+    @app.post("/audit/evidence/<package_id>/verify")
+    def evidence_verify(package_id):
+        # 独立核验：逐份检查源归档存在性/内容哈希/原文与组合顺序完整性，
+        # 通过标记 verified，失败标记 verify_failed 并给出首个差异位置
+        return jsonify(evidence.verify(package_id))
+
+    @app.post("/audit/evidence/<package_id>/retry")
+    def evidence_retry(package_id):
+        return jsonify(evidence.retry(package_id))
+
+    # ------------------------------------------------------------------
     # 调试：手动驱动两种时钟，演练"拨表/逻辑卡死"故障
     # ------------------------------------------------------------------
     @app.post("/debug/tick")
@@ -502,6 +587,18 @@ def create_app(
     def _archive_error(exc: ArchiveError):
         # 归档的显式错误：不存在 404 / 未完成 409 / 幂等键冲突 409 /
         # 状态不允许 409
+        return jsonify(exc.to_response()), exc.status
+
+    @app.errorhandler(EvidenceNotFound)
+    @app.errorhandler(EvidenceSourceNotFound)
+    @app.errorhandler(EvidenceNotReady)
+    @app.errorhandler(EvidenceSourceNotReady)
+    @app.errorhandler(EvidenceIdConflict)
+    @app.errorhandler(EvidenceManifestConflict)
+    @app.errorhandler(EvidenceBadState)
+    def _evidence_error(exc: EvidenceError):
+        # 证据包显式错误：不存在/源归档不存在 404、未完成/源归档未完成 409、
+        # 幂等键/清单冲突 409、状态不允许 409
         return jsonify(exc.to_response()), exc.status
 
     @app.errorhandler(GenerationTooSmall)
@@ -552,7 +649,7 @@ def create_app(
         t.start()
 
     # ------------------------------------------------------------------
-    # 后台归档生成：分块冻结事件、进度落库；启动即续跑未完成的归档，
+    # 后台归档/证据包生成：分块冻结、进度落库；启动即续跑未完成的任务，
     # 进程重启或上次后台失败都能从已保存的进度继续
     # ------------------------------------------------------------------
     archive_interval = float(os.environ.get("ARCHIVE_WORKER_INTERVAL_S", "0.2"))
@@ -563,9 +660,14 @@ def create_app(
                 archive.process_pending()
             except Exception:  # noqa: BLE001 - 后台线程不能因单次异常退出
                 app.logger.exception("归档后台处理失败")
+            try:
+                evidence.process_pending()
+            except Exception:  # noqa: BLE001
+                app.logger.exception("证据包后台处理失败")
 
     if start_archive_worker:
         archive.process_pending()  # 启动即续跑重启前未完成的归档
+        evidence.process_pending()  # 同步续跑未完成的证据包
         t = threading.Thread(target=_run_archive_worker,
                              name="archive-worker", daemon=True)
         t.start()
