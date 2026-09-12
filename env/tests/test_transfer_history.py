@@ -159,6 +159,48 @@ def test_ineligible_recipient_rejected_without_side_effects(client):
     assert all(e["detail"].startswith("ineligible_recipient") for e in bad)
 
 
+def test_rejected_transfer_events_carry_lease_and_generation(client):
+    old = acquire(client, "cfg-rej", "node-1")
+
+    # 三种拒绝：转给自己 / 空接收者 / 世代号与生效租约不符
+    assert transfer(client, old, to_holder="node-1").status_code == 409
+    assert transfer(client, old, to_holder="").status_code == 409
+    assert transfer(client, old, to_holder="node-2",
+                    generation=old["generation"] + 1).status_code == 409
+
+    events = history(client, "cfg-rej")
+    bad = [e for e in events
+           if e["event"] == "transfer" and e["outcome"] == "rejected"]
+    assert len(bad) == 3
+    # 每条拒绝事件都能关联到当时的租约与请求携带的世代号
+    for e in bad:
+        assert e["lease_id"] == old["lease_id"]
+        assert isinstance(e["generation"], int)
+    mismatch = [e for e in bad
+                if e["detail"] == "holder_or_generation_mismatch"][0]
+    assert mismatch["generation"] == old["generation"] + 1
+
+
+def test_transfer_id_conflict_event_carries_current_lease(client):
+    old = acquire(client, "cfg-idc2", "node-1")
+    rv = transfer(client, old, to_holder="node-2", transfer_id="xfer-c")
+    assert rv.status_code == 201
+    new_lease_id = rv.get_json()["to"]["lease_id"]
+
+    # 同一 transfer_id 换个接收者：拒绝
+    rv = transfer(client, old, to_holder="node-3", transfer_id="xfer-c")
+    assert rv.status_code == 409
+
+    events = history(client, "cfg-idc2")
+    bad = [e for e in events
+           if e["event"] == "transfer" and e["outcome"] == "rejected"]
+    assert len(bad) == 1
+    assert bad[0]["detail"] == "transfer_id_conflict"
+    # 当时生效的是首笔转移产生的新租约
+    assert bad[0]["lease_id"] == new_lease_id
+    assert bad[0]["generation"] == old["generation"]
+
+
 def test_history_covers_all_ops_with_time_holder_lease_generation(client):
     lease = acquire(client, "cfg-hist", "node-1")
     renew(client, lease)

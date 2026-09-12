@@ -105,7 +105,9 @@ CREATE TABLE IF NOT EXISTS transfers (
     created_at_ms   INTEGER NOT NULL
 );
 -- 统一租约历史：每次获取/续约/释放/转移/写入（含被拒绝的）都留一条，
--- seq 全局单调递增即审计顺序，落库后重启不丢
+-- seq 全局单调递增即审计顺序，落库后重启不丢。
+-- lease_id 记录操作发生时生效的租约（被拒绝的操作也一样），
+-- 仅当当时没有生效租约时才为 NULL；generation 是请求携带的世代号。
 CREATE TABLE IF NOT EXISTS lease_events (
     seq           INTEGER PRIMARY KEY AUTOINCREMENT,
     resource      TEXT NOT NULL,
@@ -445,6 +447,11 @@ class Store:
             if transfer_id is not None:
                 transfer_id = str(transfer_id)
 
+            # 当时的生效租约（无则 None）：无论转移成败，历史事件都要能
+            # 关联到它；下面的凭证校验也复用这一行，不再重复查询
+            row = self._get_active_locked(resource)
+            active_lease_id = row["id"] if row else None
+
             # 1) 幂等键先行：已执行过的转移，参数一致 -> 回放首次结果
             if transfer_id:
                 prev = self._conn.execute(
@@ -463,6 +470,7 @@ class Store:
                             resource, "transfer", "rejected", holder,
                             peer=to_holder if isinstance(to_holder, str)
                             else None,
+                            lease_id=active_lease_id,
                             generation=generation,
                             detail="transfer_id_conflict", now=now,
                         )
@@ -482,6 +490,7 @@ class Store:
             if not isinstance(to_holder, str) or not to_holder.strip():
                 self._record_event_locked(
                     resource, "transfer", "rejected", holder,
+                    lease_id=active_lease_id,
                     generation=generation, detail="ineligible_recipient",
                     now=now,
                 )
@@ -490,14 +499,14 @@ class Store:
             if to_holder == holder:
                 self._record_event_locked(
                     resource, "transfer", "rejected", holder,
-                    peer=to_holder, generation=generation,
+                    peer=to_holder, lease_id=active_lease_id,
+                    generation=generation,
                     detail="ineligible_recipient:self", now=now,
                 )
                 self._conn.commit()
                 raise Conflict("接收者不符合条件：不能转移给当前持有者自己")
 
             # 3) 旧凭证校验：必须是当前生效租约的持有者与世代号
-            row = self._get_active_locked(resource)
             if row is None:
                 self._record_event_locked(
                     resource, "transfer", "rejected", holder,
