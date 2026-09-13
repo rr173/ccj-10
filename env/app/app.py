@@ -144,6 +144,45 @@
                                                 版本固化的单个冻结节点
   GET    /audit/index-versions/<version>/download
                                                 版本固化的链文档（字节稳定）
+审计变更订阅与可靠通知（只写 audit_subscription* 自有表，绝不修改源审计
+历史、租约、委托、因果索引、归档、证据包或发布计划；对它们只做 SELECT）：
+  POST   /audit/subscriptions                   创建订阅
+                                                {scope: resource|credential|
+                                                 causal_index|release,
+                                                 resource?|credential_id?|
+                                                 index_id?|release_id?,
+                                                 callback_url, start_seq?,
+                                                 filters?, idempotency_key,
+                                                 max_attempts?}
+                                                同幂等键重复提交 → 同一订阅
+                                                （200 回放）；换过滤/回调/
+                                                起始序号 409；起始序号越过
+                                                当前稳定视图上界 416
+  GET    /audit/subscriptions                   列订阅（?scope=&status=）
+  GET    /audit/subscriptions/<id>              查状态/位置/过滤/投递计数
+  POST   /audit/subscriptions/<id>/pause        暂停（幂等）
+  POST   /audit/subscriptions/<id>/resume       恢复（幂等）
+  POST   /audit/subscriptions/<id>/cancel       取消（幂等；迟到通知被忽略）
+  POST   /audit/subscriptions/<id>/restart-from {from_seq}
+                                                从指定序号重新开始（保留
+                                                全部历史投递记录）
+  GET    /audit/subscriptions/<id>/deliveries    分页投递历史
+                                                （?after=&status=&limit=）
+  GET    /audit/subscriptions/<id>/deliveries/<event_seq>
+                                                单条投递（尝试次数/退避/
+                                                失败原因/死信原因/签名）
+  POST   /audit/subscriptions/<id>/deliveries/<event_seq>/ack
+                                                显式签名确认（回调 202 时；
+                                                X-Signature 或 body.signature；
+                                                重复确认不推进两次，
+                                                坏签名 401 不改状态）
+  POST   /audit/subscriptions/<id>/deliveries/<event_seq>/retry
+                                                忽略退避立即重试一条投递
+  GET    /audit/subscriptions/dead-letters      列死信（?subscription_id=）
+  POST   /audit/subscriptions/<id>/dead-letters/<event_seq>/requeue
+                                                死信重新放回队列（清空
+                                                尝试次数，立即重试）
+  POST   /audit/subscriptions/process           管理/演练：扫描入队+投递一轮
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
   POST   /debug/tick           手动推进逻辑钟
   POST   /debug/wall-shift     拨墙钟（可正可负）
@@ -210,6 +249,16 @@ from .release import (
     ReleaseNotFound,
     ReleaseNotReady,
     ReleaseVersionConflict,
+)
+from .subscription import (
+    DeliveryBadState,
+    DeliveryNotFound,
+    InvalidSignature,
+    SubscriptionBadState,
+    SubscriptionIdConflict,
+    SubscriptionManager,
+    SubscriptionNotFound,
+    SubscriptionRangeError,
 )
 from .audit import (
     AuditBadRequest,
@@ -281,6 +330,15 @@ def create_app(
     # index_releases 自有表，绝不修改原索引/派生/租约/委托/历史/归档/证据包
     releases = IndexReleaseManager(store, causal, derivation)
     app.extensions["releases"] = releases
+    # 审计变更订阅与可靠通知：只写 audit_subscription* 自有表，绝不修改
+    # 租约/委托/原始历史/归档/证据包/因果索引/发布计划（对它们只做 SELECT）
+    subscriptions = SubscriptionManager(
+        store,
+        base_backoff_ms=_env_int("SUBSCRIPTION_BACKOFF_BASE_MS", 1_000),
+        max_backoff_ms=_env_int("SUBSCRIPTION_BACKOFF_MAX_MS", 300_000),
+        claim_lease_ms=_env_int("SUBSCRIPTION_CLAIM_LEASE_MS", 60_000),
+    )
+    app.extensions["subscriptions"] = subscriptions
     if enable_debug_api is None:
         enable_debug_api = os.environ.get("ENABLE_DEBUG_API", "1") == "1"
 
@@ -929,6 +987,115 @@ def create_app(
         )
 
     # ------------------------------------------------------------------
+    # 审计变更订阅与可靠通知
+    #
+    # 为资源、委托凭证、因果索引或发布版本创建订阅：创建时冻结事件范围
+    # （filters）、起始历史序号与回调地址，按全局历史序号为每个订阅严格
+    # 顺序投递；通知带事件序号/对象标识/事件类型/内容摘要/订阅序号与
+    # HMAC-SHA256 签名。回调失败按指数退避重试，超过上限进入死信并挡住
+    # 后续投递，可查看失败原因并重新放回队列。订阅流程只写
+    # audit_subscription* 自有表，绝不修改源审计历史、租约、委托、索引、
+    # 归档、证据包或发布计划。
+    # ------------------------------------------------------------------
+    @app.post("/audit/subscriptions")
+    def subscription_create():
+        data = body()
+        view, created = subscriptions.create_subscription(
+            scope=data.get("scope"),
+            resource=data.get("resource"),
+            credential_id=data.get("credential_id"),
+            index_id=data.get("index_id"),
+            release_id=data.get("release_id"),
+            callback_url=data.get("callback_url"),
+            start_seq=data.get("start_seq", 0),
+            filters=data.get("filters"),
+            idempotency_key=data.get("idempotency_key"),
+            max_attempts=data.get("max_attempts"),
+        )
+        # 同一幂等键重复提交：200 回放同一订阅；换过滤/回调/起始序号 409
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/subscriptions")
+    def subscription_list():
+        return jsonify(subscriptions.list_subscriptions(
+            scope=request.args.get("scope"),
+            status=request.args.get("status"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/subscriptions/<subscription_id>")
+    def subscription_status(subscription_id):
+        return jsonify(subscriptions.get_subscription(subscription_id))
+
+    @app.post("/audit/subscriptions/<subscription_id>/pause")
+    def subscription_pause(subscription_id):
+        return jsonify(subscriptions.pause(subscription_id))
+
+    @app.post("/audit/subscriptions/<subscription_id>/resume")
+    def subscription_resume(subscription_id):
+        return jsonify(subscriptions.resume(subscription_id))
+
+    @app.post("/audit/subscriptions/<subscription_id>/cancel")
+    def subscription_cancel(subscription_id):
+        return jsonify(subscriptions.cancel(subscription_id))
+
+    @app.post("/audit/subscriptions/<subscription_id>/restart-from")
+    def subscription_restart(subscription_id):
+        data = body()
+        return jsonify(subscriptions.restart_from(
+            subscription_id, require(data, "from_seq")))
+
+    @app.get("/audit/subscriptions/<subscription_id>/deliveries")
+    def subscription_deliveries(subscription_id):
+        # 分页读取投递历史（按事件序号升序；?after=&status=&limit=）
+        return jsonify(subscriptions.list_deliveries(
+            subscription_id,
+            after_seq=request.args.get("after"),
+            status=request.args.get("status"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/subscriptions/<subscription_id>/deliveries/<int:event_seq>")
+    def subscription_delivery(subscription_id, event_seq):
+        return jsonify(subscriptions.get_delivery(subscription_id, event_seq))
+
+    @app.post("/audit/subscriptions/<subscription_id>/deliveries/<int:event_seq>/ack")
+    def subscription_ack(subscription_id, event_seq):
+        # 显式签名确认（回调返回 202 的场景）：
+        # 签名取 X-Signature 头或请求体 signature 字段
+        data = body()
+        signature = request.headers.get("X-Signature") or data.get("signature")
+        return jsonify(subscriptions.confirm_delivery(
+            subscription_id, event_seq, signature))
+
+    @app.post("/audit/subscriptions/<subscription_id>/deliveries/<int:event_seq>/retry")
+    def subscription_delivery_retry(subscription_id, event_seq):
+        # 手动重试：忽略退避等待，立即重新进入待投递队列
+        return jsonify(
+            subscriptions.retry_delivery(subscription_id, event_seq))
+
+    @app.get("/audit/subscriptions/dead-letters")
+    def subscription_dead_letters():
+        return jsonify(subscriptions.list_dead_letters(
+            subscription_id=request.args.get("subscription_id"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.post("/audit/subscriptions/<subscription_id>/dead-letters/<int:event_seq>/requeue")
+    def subscription_dead_letter_requeue(subscription_id, event_seq):
+        # 死信重新放回队列：清空尝试次数，立即重试（严格顺序仍受队首约束）
+        return jsonify(subscriptions.requeue_dead_letter(
+            subscription_id, event_seq=event_seq))
+
+    @app.post("/audit/subscriptions/process")
+    def subscription_process():
+        # 管理/演练入口：先扫描入队再投递到点通知
+        enqueued = subscriptions.scan_and_enqueue()
+        delivered = subscriptions.process_due()
+        return jsonify({"enqueued": enqueued, "delivered": delivered})
+
+    # ------------------------------------------------------------------
     # 调试：手动驱动两种时钟，演练"拨表/逻辑卡死"故障
     # ------------------------------------------------------------------
     @app.post("/debug/tick")
@@ -1031,6 +1198,22 @@ def create_app(
         # 409、比较对象未完成/比较结果漂移 409
         return jsonify(exc.to_response()), exc.status
 
+    @app.errorhandler(InvalidSignature)
+    def _invalid_signature(exc):
+        # 401：确认签名校验失败，不改变任何状态
+        return jsonify(exc.to_response()), exc.status
+
+    @app.errorhandler(SubscriptionNotFound)
+    @app.errorhandler(DeliveryNotFound)
+    @app.errorhandler(SubscriptionIdConflict)
+    @app.errorhandler(SubscriptionBadState)
+    @app.errorhandler(DeliveryBadState)
+    @app.errorhandler(SubscriptionRangeError)
+    def _subscription_error(exc):
+        # 订阅显式错误：订阅/投递不存在 404、幂等冲突/状态前提 409、
+        # 起始序号越过稳定视图上界 416
+        return jsonify(exc.to_response()), exc.status
+
     @app.errorhandler(GenerationTooSmall)
     def _gen_conflict(exc):
         return jsonify({"error": "generation_fence", "message": str(exc)}), 409
@@ -1106,6 +1289,13 @@ def create_app(
                 releases.process_due()  # 到点发布计划（延迟生效）
             except Exception:  # noqa: BLE001
                 app.logger.exception("索引版本发布后台处理失败")
+            try:
+                # 订阅：先把新历史事件入队，再投递到点通知
+                # （回调在数据库事务之外执行，失败退避/死信均落库）
+                subscriptions.scan_and_enqueue()
+                subscriptions.process_due()
+            except Exception:  # noqa: BLE001
+                app.logger.exception("审计订阅后台处理失败")
 
     if start_archive_worker:
         archive.process_pending()  # 启动即续跑重启前未完成的归档
@@ -1113,6 +1303,11 @@ def create_app(
         causal.process_pending()  # 同步续跑未完成的因果索引
         derivation.process_pending()  # 同步续跑未完成的增量派生
         releases.process_due()  # 中断恢复：错过生效时间的计划立即发布
+        try:
+            subscriptions.scan_and_enqueue()
+            subscriptions.process_due()
+        except Exception:  # noqa: BLE001
+            app.logger.exception("审计订阅启动恢复失败")
         t = threading.Thread(target=_run_archive_worker,
                              name="archive-worker", daemon=True)
         t.start()

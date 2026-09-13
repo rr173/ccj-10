@@ -759,6 +759,109 @@ POST /audit/index-releases
 | 版本链/节点/下载：原索引被删除/节点缺失 | 404 | `release_index_deleted` |
 | 缺 version/index_id/幂等键/生效时间、时间非整数 | 400 | `bad_request` |
 
+## 审计变更订阅与可靠通知（audit subscription）
+
+管理员可以为**资源**、**委托凭证**、**因果索引**或**发布版本**创建订阅：
+指定事件范围（过滤条件）、起始历史序号与回调地址。系统保存订阅状态、
+过滤条件与当前位置，按全局历史序号为每个订阅**严格顺序**投递通知。
+
+### 创建（幂等 + 冲突显式化）
+
+`POST /audit/subscriptions`，请求体：
+
+```json
+{
+  "scope": "resource",
+  "resource": "vol-7",
+  "callback_url": "https://ops.example/hook",
+  "start_seq": 0,
+  "filters": {"event_types": ["write", "transfer"], "outcomes": ["ok"]},
+  "idempotency_key": "sub-2026-09-13-1",
+  "max_attempts": 5
+}
+```
+
+- 作用域对象：`resource`（`resource`）、`credential`（`credential_id`）、
+  `causal_index`（`index_id`，投递其冻结成员锚定的审计事件；冻结之后的
+  新事件不进入订阅范围）、`release`（`release_id`，锚定发布计划指向的
+  索引）；目标不存在 → 404。
+- `start_seq` 含起始，**不能越过创建时刻的稳定视图上界**（否则 416
+  `subscription_seq_out_of_range` 并返回 `available_max_seq`）；创建期间
+  落库的新事件序号必大于快照，只会随后按顺序入队，不会被塞入更早快照。
+- 同一 `idempotency_key` 重复提交只返回同一订阅（200 + `replayed`）；
+  同键换作用域/对象、**过滤条件、回调地址或起始序号** → 409
+  `subscription_id_conflict`，响应 `first_difference` 给出首个差异字段。
+- 密钥由服务端生成（32 字节随机值），只保存在订阅表，不通过 API 返回。
+
+### 严格顺序与一次确认
+
+- 扫描只从只增的 `lease_events` 稳定历史读取（按全局 seq 分窗口，稀疏交错
+  的作用域事件也不会被跳过），未匹配过滤条件的事件只推进游标、不产生投递；
+- 每个事件对每个订阅只有一行投递记录
+  （`(subscription_id, event_seq)` 唯一 + `INSERT OR IGNORE`）；
+- 投递器只认领每个订阅**最小 event_seq 的非终态行**：前面有
+  `inflight` / `awaiting_confirm` / `dead_letter` 或退避未到点的行时，
+  后来事件绝不提前发送，不跳号、不乱序；
+- 认领是带唯一 `dispatch_token` 的条件 UPDATE，回调在数据库事务之外
+  执行；并发投递/并发确认不可能把同一行处理两次；
+- 回调返回 2xx（200/201/204）即隐式确认；返回 **202** 表示"先收下，稍后
+  显式确认"，投递停在 `awaiting_confirm`；对同一行重复确认是幂等回放，
+  **不会推进两次**（`replayed: true`）。
+
+### 通知载荷与签名
+
+每次通知为 POST JSON，并附带签名头：
+
+| 头 | 内容 |
+|---|---|
+| `X-Signature` | 通知体规范化 JSON（排序键、紧凑分隔）的 HMAC-SHA256（订阅密钥）十六进制 |
+| `X-Signature-Algorithm` | `HMAC-SHA256` |
+| `X-Subscription-Id` / `X-Subscription-Seq` / `X-Event-Seq` | 订阅号、订阅序号、历史序号 |
+
+载荷含 `event_seq`（历史序号）、`subscription_seq`（该订阅第几条通知，
+从 1 连续）、`event_type`、`object_id`（`lease_event:<seq>`）、`object`
+（作用域与对象标识）与 `summary`（对象标识/事件类型/内容摘要：操作方、
+对方、世代、凭证与 `digest_sha256`）。显式确认
+（`POST .../deliveries/<event_seq>/ack`，签名取 `X-Signature` 头或
+请求体 `signature`）必须使用通知载荷的正确签名；**签名错误返回 401
+`invalid_signature`，不改变任何状态**。
+
+### 失败重试与死信
+
+- 连接失败、超时、非 2xx 响应都记录 `attempts`、`last_error` 与
+  `next_retry_at_ms`；退避为 `base * 2^(n-1)`（默认 1s 起、5min 封顶，
+  可用 `SUBSCRIPTION_BACKOFF_BASE_MS` / `SUBSCRIPTION_BACKOFF_MAX_MS`
+  配置）；
+- 410 Gone 视为永久拒收，直接死信；其余失败超过 `max_attempts` 进入
+  `dead_letter` 并**挡住后续投递**（订阅 `blocked: true`，绝不跳过）；
+- `GET /audit/subscriptions/dead-letters`（可按订阅过滤）查看失败原因；
+  `POST /audit/subscriptions/<id>/dead-letters/<event_seq>/requeue`
+  清空尝试次数、立即重新放回队列（严格顺序仍受队首约束）；
+- `POST .../deliveries/<event_seq>/retry` 可忽略退避立即重试一条等待中的投递。
+
+### 暂停、恢复、取消与重新开始
+
+| 接口 | 语义 |
+|---|---|
+| `POST /audit/subscriptions/<id>/pause` | 暂停扫描与新投递（幂等）；已取消的订阅 409 |
+| `POST /audit/subscriptions/<id>/resume` | 恢复（幂等） |
+| `POST /audit/subscriptions/<id>/cancel` | 取消（幂等）：未终态投递置 `discarded` 但保留历史；取消后迟到的回调响应被令牌/状态检查忽略，**不会再发送任何通知** |
+| `POST /audit/subscriptions/<id>/restart-from` `{"from_seq": N}` | 从指定序号重新开始：**已有投递记录全部保留**，已确认行不重置（同一事件不重复确认），其余非终态/死信行复位为 pending 并立即补齐区间；已取消 409、越界 416 |
+| `GET /audit/subscriptions/<id>/deliveries?after=&status=&limit=` | 分页读取投递历史（游标为 event_seq，升序） |
+| `POST /audit/subscriptions/process` | 管理/演练入口：扫描入队 + 到点投递各跑一轮 |
+
+### 并发、重启与只读边界
+
+- 后台 worker 与归档/发布 worker 同一轮询循环：先扫描入队再投递；
+  `inflight`/`awaiting_confirm` 的认领行带租约（默认 60s，
+  `SUBSCRIPTION_CLAIM_LEASE_MS`），超时回收为 pending（不增加尝试次数）；
+  **进程重启时无条件回收所有认领中状态的行**，随后从游标与退避时刻继续；
+- 并发创建（同幂等键）由唯一索引收敛为一个订阅；并发投递由条件认领
+  UPDATE 收敛为一次回调；并发确认由条件状态 UPDATE 收敛为一次确认；
+- 订阅流程只写 `audit_subscriptions` /
+  `audit_subscription_deliveries` 两张自有表，对租约、委托、原始审计
+  历史、因果索引、归档、证据包与发布计划**只读 SELECT，绝不改写**。
+
 ## 持久性
 
 SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库中包含：
@@ -775,12 +878,17 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 **索引版本发布计划（版本别名与幂等键、发布对象、生效时间、登记时冻结的
 索引摘要/快照/可选比较结果、发布时再次冻结的摘要与重算链摘要、
 scheduled/active/cancelled/failed 状态机与可解释失败原因）**、
+**审计变更订阅与投递记录（过滤条件、起始/当前序号、订阅序号、HMAC 密钥、
+pending/inflight/awaiting_confirm/confirmed/dead_letter/discarded 状态机、
+尝试次数与退避时刻、失败与死信原因、认领令牌、冻结通知载荷与签名）**、
 逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
 正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放，
 **审计回放、节点比较与一致性诊断对同一份历史给出逐字节一致的结果**；
 启动时即按墙钟收割已到期的委托，并自动续跑未完成的归档、证据包、因果索引与
 增量派生生成（暂停中的派生任务不会被自动续跑），
-**错过生效时间的版本发布计划在启动时立即发布（失败保留原因，可 retry）**。
+**错过生效时间的版本发布计划在启动时立即发布（失败保留原因，可 retry）**，
+**订阅在启动时回收崩溃残留的认领行并从已保存游标与退避时刻继续，
+不丢事件、不重复确认**。
 旧版本数据库会在启动时自动补列迁移。
 逻辑钟由后台 ticker 每秒 +1（每次推进都 fsync 落库）。
 
@@ -852,6 +960,18 @@ scheduled/active/cancelled/failed 状态机与可解释失败原因）**、
 | GET | `/audit/index-versions/<version>/chain` | 版本固化的因果链分页（服务前复核原索引链摘要：被篡改 409、被删除 404） |
 | GET | `/audit/index-versions/<version>/nodes/<node_id>` | 版本固化的单个冻结节点（同样的篡改/删除闸门） |
 | GET | `/audit/index-versions/<version>/download` | 版本固化的链文档（字节稳定，`X-Index-Version` / `X-Causal-SHA256` / `X-Causal-Chain-Digest`） |
+| POST | `/audit/subscriptions` | **创建审计变更订阅**：`{scope: resource/credential/causal_index/release, resource?/credential_id?/index_id?/release_id?, callback_url, start_seq?, filters?, idempotency_key, max_attempts?}`；同幂等键返回同一订阅（200 回放），换过滤/回调/起始序号 409，起始序号越过稳定视图上界 416，目标不存在 404 |
+| GET | `/audit/subscriptions` | 列订阅（`?scope=&status=active/paused/cancelled&limit=`） |
+| GET | `/audit/subscriptions/<id>` | 查订阅：状态、过滤、起始/当前位置、已确认序号、退避/死信计数 |
+| POST | `/audit/subscriptions/<id>/pause` / `/resume` / `/cancel` | 暂停 / 恢复 / 取消（均幂等；取消后迟到通知不再发送；已取消再暂停/恢复 409） |
+| POST | `/audit/subscriptions/<id>/restart-from` | 从指定序号重新开始 `{from_seq}`：保留全部投递历史，已确认不重复确认，非终态/死信行复位重试（已取消 409、越界 416） |
+| GET | `/audit/subscriptions/<id>/deliveries` | 分页投递历史（`?after=<event_seq>&status=&limit=`，按历史序号升序） |
+| GET | `/audit/subscriptions/<id>/deliveries/<event_seq>` | 单条投递：状态、尝试次数、下次重试时间、失败/死信原因、通知摘要与签名 |
+| POST | `/audit/subscriptions/<id>/deliveries/<event_seq>/ack` | 回调 202 后的显式签名确认（`X-Signature` 头或 `{signature}`；重复确认幂等不推进两次，坏签名 401 不改状态） |
+| POST | `/audit/subscriptions/<id>/deliveries/<event_seq>/retry` | 忽略退避立即重试一条等待中的投递（非等待/待确认状态 409） |
+| GET | `/audit/subscriptions/dead-letters` | 列死信（`?subscription_id=&limit=`，含 `dead_letter_reason` 与 `last_error`） |
+| POST | `/audit/subscriptions/<id>/dead-letters/<event_seq>/requeue` | 死信重新放回队列（清空尝试次数立即重试；非 dead_letter 409） |
+| POST | `/audit/subscriptions/process` | 管理/演练：扫描入队 + 到点投递各跑一轮，返回 `{enqueued, delivered}` |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
 | GET | `/debug/now` | 两种时钟当前读数 |
@@ -915,6 +1035,9 @@ curl -s localhost:8080/writes/1
 | `EVIDENCE_CHUNK_SIZE` | 1 | 证据包后台生成时每块冻结的归档条目数（每块提交一次、进度落库） |
 | `CAUSAL_CHUNK_SIZE` | 100 | 因果索引后台生成时每块还原的成员节点数（每块提交一次、进度落库） |
 | `CAUSAL_DERIVATION_CHUNK_SIZE` | 100 | 增量派生后台生成时每块还原的成员节点数（复用节点复制基线载荷、新增节点从冻结源重建） |
+| `SUBSCRIPTION_BACKOFF_BASE_MS` | 1000 | 回调失败指数退避的基础等待（第 n 次失败后 `base*2^(n-1)`） |
+| `SUBSCRIPTION_BACKOFF_MAX_MS` | 300000 | 回调失败退避上限 |
+| `SUBSCRIPTION_CLAIM_LEASE_MS` | 60000 | 投递认领租约：超过此时长的 inflight/awaiting 行视为投递器崩溃，回收重试（启动时无条件回收） |
 | `ENABLE_DEBUG_API` | 1 | 是否开放 `/debug/*` 故障演练接口 |
 
 ## 测试
@@ -1007,3 +1130,23 @@ retry 成功、worker 批量发布时单计划失败不影响其它、
 旧版本仍按原索引标识查询、计划/版本不存在与未生效/已取消/已失败的显式错误、
 登记/发布/取消/重试/查询全流程不修改原索引（含核验标记）、派生任务、租约、
 委托、审计历史、源归档或证据包（只写 index_releases）。
+审计变更订阅与可靠通知覆盖：正常投递（事件序号/对象标识/事件类型/内容摘要/
+订阅序号字段齐全、HMAC-SHA256 签名可由密钥复算、严格按历史序号投递）、
+空结果（起始位置之后无作用域事件、过滤零匹配）、过滤（只有匹配事件入队、
+订阅序号连续、未匹配事件只推进游标）、重复确认幂等不推进两次、坏签名确认
+401 且状态不变、202 待确认 + 显式签名确认（X-Signature 头）、
+多线程并发投递恰好一次、8 线程同幂等键并发创建只产生一个订阅、
+多线程并发确认只确认一次、回调 5xx/超时的尝试次数与退避重试（拨表驱动）、
+退避未到点不重发、队首失败挡住后来事件（不跳过、不乱序）、
+超上限死信挡队/410 直接死信/死信列表与原因查看/重新放回后续传、
+非死信重新放回 409、暂停后不投递与恢复后顺序续传、
+取消幂等与取消后进行中回调的迟到成功被丢弃（discarded 不变 confirmed）、
+服务重启后 inflight 回收（不增加尝试次数）/已确认与暂停位置持久化、
+起始序号越界 416 与负数 400、目标不存在 404、
+同幂等键回放与换过滤/回调/起始序号的显式 409（首个差异字段）、
+创建期间新事件不混入更早快照、从指定序号重新开始保留全部历史投递记录且
+已确认事件不重复确认、投递历史分页与状态过滤、
+凭证/因果索引（冻结边界）/发布版本三种额外作用域、
+稀疏交错事件分窗口扫描不跳事件、真实 HTTP 回调（本地服务器校验签名头）、
+订阅全生命周期不改写租约/委托/历史/归档/证据包/因果索引/发布计划
+（表内容逐行相等、全局诊断一致）。

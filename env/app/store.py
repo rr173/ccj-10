@@ -476,6 +476,76 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_release_idem
     ON index_releases(idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_release_due
     ON index_releases(status, effective_at_ms);
+-- 审计变更订阅：管理员针对资源、委托凭证、因果索引或发布版本登记一个
+-- 回调地址、事件范围（filters_json，创建时冻结）、起始历史序号与密钥。
+-- 订阅处理只写本表与 audit_subscription_deliveries 两张自有表，绝不修改
+-- 租约、委托、原始审计历史、源归档、证据包、因果索引或发布计划。
+-- position_seq 是"下一个要检视的全局历史序号"游标；sub_seq 是该订阅
+-- 已入队（匹配过滤条件）的通知计数，即下一次通知使用的订阅序号。
+-- status: active / paused / cancelled；blocked=1 表示存在 dead_letter
+-- 投递挡住了严格序号队列，重新放回队列后清除。
+CREATE TABLE IF NOT EXISTS audit_subscriptions (
+    subscription_id   TEXT PRIMARY KEY,
+    idempotency_key   TEXT NOT NULL,
+    scope             TEXT NOT NULL,    -- resource / credential / causal_index / release
+    resource          TEXT NOT NULL DEFAULT '',
+    credential_id     TEXT NOT NULL DEFAULT '',
+    index_id          TEXT NOT NULL DEFAULT '',
+    release_id        TEXT NOT NULL DEFAULT '',
+    callback_url      TEXT NOT NULL,
+    secret            TEXT NOT NULL,                  -- HMAC-SHA256 签名密钥（只在服务端保存）
+    filters_json      TEXT NOT NULL,                  -- 创建时冻结的规范化过滤条件
+    start_seq         INTEGER NOT NULL,               -- 登记的起始历史序号（含）
+    position_seq      INTEGER NOT NULL,               -- 扫描游标：下一个待检视 seq
+    sub_seq           INTEGER NOT NULL DEFAULT 0,     -- 已入队通知数（订阅序号）
+    snapshot_seq      INTEGER NOT NULL,               -- 创建时钉死的稳定视图上界
+    status            TEXT NOT NULL DEFAULT 'active',
+    blocked           INTEGER NOT NULL DEFAULT 0,     -- 有 dead_letter 挡队
+    max_attempts      INTEGER NOT NULL DEFAULT 5,
+    ack_required      INTEGER NOT NULL DEFAULT 0,     -- 回调返回 202 时是否等待显式签名确认
+    error             TEXT,
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL,
+    cancelled_at_ms   INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subscription_idem
+    ON audit_subscriptions(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_subscription_status
+    ON audit_subscriptions(status, position_seq);
+-- 每个订阅的每条匹配事件至多一行投递记录：(subscription_id, event_seq)
+-- 唯一 + INSERT OR IGNORE，并发入队/重新开始/服务重启都不会产生两条通知。
+-- status: pending（待投递/退避等待）/ inflight（已认领，回调进行中）/
+--         awaiting_confirm（回调 202，等待签名确认）/ confirmed（已确认）/
+--         dead_letter（超过尝试上限或永久拒收）/ discarded（取消/重新开始弃置）。
+-- attempts 记录已尝试次数；next_retry_at_ms 存退避**时长**，到点判定
+-- 用 updated_at_ms + next_retry_at_ms（同一偏移墙钟，正拨不会让退避
+-- 永远不到点），last_error 记录最近一次失败原因（HTTP 状态/超时/异常），
+-- dead_letter 额外保留 dead_letter_reason。dispatch_token 是每次认领
+-- 的唯一令牌，迟到的回调响应只能作用于本次认领。
+CREATE TABLE IF NOT EXISTS audit_subscription_deliveries (
+    delivery_id        TEXT PRIMARY KEY,
+    subscription_id    TEXT NOT NULL,
+    event_seq          INTEGER NOT NULL,
+    subscription_seq   INTEGER NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'pending',
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    next_retry_at_ms   INTEGER NOT NULL DEFAULT 0,
+    claimed_at_ms      INTEGER,
+    dispatch_token     TEXT,
+    last_error         TEXT,
+    dead_letter_reason TEXT,
+    payload_json       TEXT NOT NULL,         -- 冻结的通知载荷（规范化签名输入）
+    signature          TEXT,                  -- 最近一次投递使用的签名
+    confirmed_at_ms    INTEGER,
+    created_at_ms      INTEGER NOT NULL,
+    updated_at_ms      INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_sub_event
+    ON audit_subscription_deliveries(subscription_id, event_seq);
+CREATE INDEX IF NOT EXISTS idx_delivery_due
+    ON audit_subscription_deliveries(status, next_retry_at_ms);
+CREATE INDEX IF NOT EXISTS idx_delivery_sub_order
+    ON audit_subscription_deliveries(subscription_id, event_seq);
 """
 
 

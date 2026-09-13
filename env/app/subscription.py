@@ -1,0 +1,1580 @@
+"""审计变更订阅与可靠通知（audit change subscription & reliable notification）。
+
+在租约、审计事件、因果索引、归档、证据包与版本发布能力之上，管理员可以
+为**资源**、**委托凭证**、**因果索引**或**发布版本**创建订阅：指定事件
+范围（过滤条件）、起始历史序号与回调地址。系统保存订阅状态、过滤条件与
+当前位置，按全局历史序号为每个订阅**严格顺序**地投递通知。
+
+可靠性不变量
+============
+1. **稳定历史视图**：入队只从只增的 ``lease_events`` 历史读取（SELECT），
+   绝不修改源审计历史、租约、委托、索引、归档、证据包或发布计划。订阅
+   处理只写 ``audit_subscriptions`` / ``audit_subscription_deliveries``
+   两张自有表。
+2. **严格顺序、不跳号**：每个订阅的游标 ``position_seq`` 单调推进；
+   队首存在 ``inflight`` / ``awaiting_confirm`` / ``dead_letter`` /
+   ``pending（退避未到点）`` 的投递时，后面的事件一律不投递。匹配事件
+   才生成通知（未匹配事件只推进游标，不产生投递记录）。
+3. **一次确认**：同一事件对同一订阅只有一行投递记录
+   （``(subscription_id, event_seq)`` 唯一 + INSERT OR IGNORE）。确认
+   是条件 UPDATE（只有非终态行才会变成 confirmed），重复确认幂等回放
+   但绝不推进两次。
+4. **签名**：每次通知携带事件序号、对象标识、事件类型、内容摘要与订阅
+   序号，载荷经规范化 JSON 后用订阅密钥做 HMAC-SHA256 签名；显式确认
+   必须携带正确签名，签名错误的确认不能改变任何状态。
+5. **失败重试与死信**：回调连接失败、超时或返回非成功状态都记录尝试
+   次数、失败原因与下次重试时间，按指数退避重试；超过上限进入
+   ``dead_letter`` 并挡住后续投递（不跳过）。管理员可以查看失败原因并
+   重新放回队列（复位尝试次数，立即重试）。
+6. **取消与迟到响应**：取消后不会再投递新通知；进行中回调的迟到响应被
+   忽略（按订阅当前状态判定），回调方即便返回成功也不会再发后续通知。
+7. **并发与重启**：认领是带唯一 ``dispatch_token`` 的条件 UPDATE，同一
+   行投递不可能被两个投递器同时认领；服务重启把残留的 ``inflight`` /
+   ``awaiting_confirm`` 行回收为 pending（不增加尝试次数），崩溃不会
+   造成重复确认、乱序或丢失。
+
+幂等创建
+========
+``idempotency_key`` 全局唯一：同键重复提交返回同一订阅（200 +
+``replayed``）；同键换作用域/对象/过滤条件/回调地址/起始序号 → 409
+``subscription_id_conflict``，响应给出首个差异字段与双方值。
+
+重新开始
+========
+``restart-from`` 把游标重置到指定序号：已有投递记录全部保留作为历史，
+未确认的旧行复位为 pending（不重置已确认行，已确认事件不会重复确认），
+并立即重新扫描入队。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import secrets
+import sqlite3
+import threading
+import urllib.error
+import urllib.request
+import uuid
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
+
+from .archive import ArchiveError, canonical_json
+from .audit import AuditBadRequest, event_dict
+from .causal import event_passes_filters, normalize_filters
+
+# ---------------------------------------------------------------------------
+# 错误
+# ---------------------------------------------------------------------------
+
+
+class SubscriptionError(ArchiveError):
+    code = "subscription_error"
+
+
+class SubscriptionNotFound(SubscriptionError):
+    code = "subscription_not_found"
+    status = 404
+
+
+class DeliveryNotFound(SubscriptionError):
+    code = "delivery_not_found"
+    status = 404
+
+
+class SubscriptionIdConflict(SubscriptionError):
+    """同一幂等键被作用域/对象/过滤/回调/起始序号不同的请求占用（409）。"""
+
+    code = "subscription_id_conflict"
+    status = 409
+
+
+class SubscriptionBadState(SubscriptionError):
+    """当前订阅状态不允许该操作（暂停/恢复/取消/重新开始的前提，409）。"""
+
+    code = "subscription_bad_state"
+    status = 409
+
+
+class DeliveryBadState(SubscriptionError):
+    """投递行当前状态不允许该操作（确认/重新放回的前提，409）。"""
+
+    code = "delivery_bad_state"
+    status = 409
+
+
+class SubscriptionRangeError(SubscriptionError):
+    """起始序号越过创建时刻的稳定视图上界（416）。"""
+
+    code = "subscription_seq_out_of_range"
+    status = 416
+
+
+class InvalidSignature(SubscriptionError):
+    """确认携带的签名与服务端重算值不一致（401），不改变任何状态。"""
+
+    code = "invalid_signature"
+    status = 401
+
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+
+SCOPE_RESOURCE = "resource"
+SCOPE_CREDENTIAL = "credential"
+SCOPE_CAUSAL_INDEX = "causal_index"
+SCOPE_RELEASE = "release"
+SCOPES = (SCOPE_RESOURCE, SCOPE_CREDENTIAL,
+          SCOPE_CAUSAL_INDEX, SCOPE_RELEASE)
+
+SUB_ACTIVE = "active"
+SUB_PAUSED = "paused"
+SUB_CANCELLED = "cancelled"
+SUB_STATUSES = (SUB_ACTIVE, SUB_PAUSED, SUB_CANCELLED)
+
+D_PENDING = "pending"
+D_INFLIGHT = "inflight"
+D_AWAITING = "awaiting_confirm"
+D_CONFIRMED = "confirmed"
+D_DEAD = "dead_letter"
+D_DISCARDED = "discarded"
+# 非终态：还需要（或可能需要）投递/确认
+D_OPEN = (D_PENDING, D_INFLIGHT, D_AWAITING)
+D_TERMINAL = (D_CONFIRMED, D_DEAD, D_DISCARDED)
+
+# 回调 2xx 中，只有 202 表示"先收下，稍后显式签名确认"
+ACK_PENDING_STATUS = 202
+# 回调 410 Gone：接收方永久拒收，直接死信，不再退避重试
+PERMANENT_REJECT_STATUS = 410
+
+DEFAULT_MAX_ATTEMPTS = 5
+DEFAULT_BASE_BACKOFF_MS = 1_000
+DEFAULT_MAX_BACKOFF_MS = 300_000
+# inflight/awaiting 认领租约：超过此时长视为投递器崩溃，回收为 pending
+DEFAULT_CLAIM_LEASE_MS = 60_000
+
+SCAN_BATCH = 500
+
+SIGNATURE_VERSION = "v1"
+SIGNATURE_ALGORITHM = "HMAC-SHA256"
+
+
+def new_secret() -> str:
+    """生成订阅签名密钥：32 字节随机值的十六进制表示。"""
+    return secrets.token_hex(32)
+
+
+def sign_payload(secret: str, payload: dict[str, Any]) -> str:
+    """对规范化通知载荷做 HMAC-SHA256，返回十六进制签名。"""
+    body = canonical_json(payload).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+
+
+def verify_signature(secret: str, payload: dict[str, Any],
+                     signature: str | None) -> bool:
+    if not isinstance(signature, str) or not signature:
+        return False
+    expected = sign_payload(secret, payload)
+    return hmac.compare_digest(expected, signature.strip())
+
+
+def backoff_delay_ms(attempts: int, *, base_ms: int,
+                     max_ms: int) -> int:
+    """指数退避：第 n 次失败后等待 base * 2^(n-1)，封顶 max。"""
+    n = max(1, int(attempts))
+    delay = int(base_ms) * (2 ** (n - 1))
+    return min(delay, int(max_ms))
+
+
+# ---------------------------------------------------------------------------
+# 默认 HTTP 投递器（urllib，无第三方依赖）
+# ---------------------------------------------------------------------------
+
+
+class HttpDeliveryResult:
+    def __init__(self, *, status: int | None = None,
+                 ok: bool = False, ack_pending: bool = False,
+                 permanent_reject: bool = False,
+                 error: str | None = None):
+        self.status = status
+        self.ok = ok
+        self.ack_pending = ack_pending
+        self.permanent_reject = permanent_reject
+        self.error = error
+
+
+# 可注入的投递器：(callback_url, payload, signature) -> HttpDeliveryResult
+DeliveryCallable = Callable[[str, dict[str, Any], str], HttpDeliveryResult]
+
+
+def default_http_delivery(url: str, payload: dict[str, Any],
+                          signature: str, *, timeout_s: float = 5.0
+                          ) -> HttpDeliveryResult:
+    """同步 POST JSON 通知。
+
+    200/201/204 视为成功确认；202 视为待显式确认；410 永久拒收（直接
+    死信）；其余 4xx/5xx 与连接失败/超时一样按退避重试。
+    """
+    body = canonical_json(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Subscription-Id": payload["subscription_id"],
+            "X-Subscription-Seq": str(payload["subscription_seq"]),
+            "X-Event-Seq": str(payload["event_seq"]),
+            "X-Signature-Algorithm": SIGNATURE_ALGORITHM,
+            "X-Signature": signature,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            status = int(resp.status)
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        kind = ("timeout" if "timed out" in str(reason)
+                else "connection_error")
+        return HttpDeliveryResult(
+            error=f"{kind}: {type(exc).__name__}: {reason}")
+    if status == ACK_PENDING_STATUS:
+        return HttpDeliveryResult(status=status, ack_pending=True)
+    if status == PERMANENT_REJECT_STATUS:
+        return HttpDeliveryResult(status=status, permanent_reject=True)
+    if 200 <= status < 300:
+        return HttpDeliveryResult(status=status, ok=True)
+    return HttpDeliveryResult(status=status,
+                              error=f"http_status_{status}")
+
+
+# ---------------------------------------------------------------------------
+# 通知摘要
+# ---------------------------------------------------------------------------
+
+
+def event_summary(ev_row) -> dict[str, Any]:
+    """从历史事件行生成通知中的对象标识、事件类型与内容摘要。"""
+    kind = ev_row["event"]
+    detail = ev_row["detail"]
+    return {
+        "event_type": kind,
+        "outcome": ev_row["outcome"],
+        "holder": ev_row["holder"],
+        "peer": ev_row["peer"],
+        "resource": ev_row["resource"],
+        "generation": ev_row["generation"],
+        "credential_id": ev_row["credential_id"],
+        "lease_id": ev_row["lease_id"],
+        "detail": detail,
+        "text": _summary_text(kind, ev_row["outcome"], ev_row["holder"],
+                              ev_row["peer"], detail),
+        "digest_sha256": hashlib.sha256(
+            canonical_json({
+                "seq": ev_row["seq"], "event": kind,
+                "outcome": ev_row["outcome"],
+                "holder": ev_row["holder"], "peer": ev_row["peer"],
+                "resource": ev_row["resource"],
+                "generation": ev_row["generation"],
+                "credential_id": ev_row["credential_id"],
+                "lease_id": ev_row["lease_id"], "detail": detail,
+                "value": ev_row["value"] if "value" in ev_row.keys()
+                else None,
+            }).encode("utf-8")).hexdigest(),
+    }
+
+
+def _summary_text(kind: str, outcome: str, holder: str, peer,
+                  detail: str | None) -> str:
+    verdict = "成功" if outcome == "ok" else "被拒绝"
+    who = f"（对方 {peer}）" if peer else ""
+    return f"{holder} 的 {kind} 事件{verdict}{who}：{detail or '无补充信息'}"
+
+
+# ---------------------------------------------------------------------------
+# 订阅管理器
+# ---------------------------------------------------------------------------
+
+
+class SubscriptionManager:
+    """订阅的创建、扫描入队、投递、确认、重试、死信管理与历史查询。
+
+    拥有独立 SQLite 连接与进程锁（与 Store 的连接共享同一 WAL 数据库，
+    只 SELECT 租约侧的表），因此回调等慢 IO 不会阻塞租约写入。回调执行
+    在数据库事务之外；认领/记录结果都是短事务，且全部以
+    ``dispatch_token`` / 订阅状态为条件，迟到响应不会改错状态。
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        *,
+        deliver: DeliveryCallable | None = None,
+        base_backoff_ms: int = DEFAULT_BASE_BACKOFF_MS,
+        max_backoff_ms: int = DEFAULT_MAX_BACKOFF_MS,
+        claim_lease_ms: int = DEFAULT_CLAIM_LEASE_MS,
+    ):
+        self._store = store
+        import sqlite3 as _sqlite3
+
+        self._lock = threading.RLock()
+        # autocommit 模式（isolation_level=None）：只读 SELECT 不会开启
+        # 长事务，长连接不会停在旧 WAL 快照而看不到别的连接（写入事务在
+        # Store 连接上提交）的新数据；所有写操作显式 BEGIN IMMEDIATE。
+        self._conn = _sqlite3.connect(store_db_path(store),
+                                      check_same_thread=False,
+                                      isolation_level=None)
+        self._conn.row_factory = _sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        # 表结构通常由 Store 初始化时创建；此处幂等兜底，保证订阅管理器
+        # 独立连接场景也可用（IF NOT EXISTS 不影响既有表）
+        self._ensure_schema()
+
+        self.base_backoff_ms = int(base_backoff_ms)
+        self.max_backoff_ms = int(max_backoff_ms)
+        self.claim_lease_ms = int(claim_lease_ms)
+        if deliver is None:
+            self._deliver_cb = self._default_deliver
+        else:
+            self._deliver_cb = deliver
+        # 构造即恢复：上一个进程崩溃时残留的 inflight/awaiting 行立即回收
+        # （INSERT/UPDATE 幂等，与是否启动后台 worker 无关）
+        self.recover_stale_claims(lease_ms=0)
+
+    def _ensure_schema(self) -> None:
+        """幂等创建订阅自有表（与 Store.SCHEMA 中定义保持一致）。"""
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS audit_subscriptions (
+                subscription_id   TEXT PRIMARY KEY,
+                idempotency_key   TEXT NOT NULL,
+                scope             TEXT NOT NULL,
+                resource          TEXT NOT NULL DEFAULT '',
+                credential_id     TEXT NOT NULL DEFAULT '',
+                index_id          TEXT NOT NULL DEFAULT '',
+                release_id        TEXT NOT NULL DEFAULT '',
+                callback_url      TEXT NOT NULL,
+                secret            TEXT NOT NULL,
+                filters_json      TEXT NOT NULL,
+                start_seq         INTEGER NOT NULL,
+                position_seq      INTEGER NOT NULL,
+                sub_seq           INTEGER NOT NULL DEFAULT 0,
+                snapshot_seq      INTEGER NOT NULL,
+                status            TEXT NOT NULL DEFAULT 'active',
+                blocked           INTEGER NOT NULL DEFAULT 0,
+                max_attempts      INTEGER NOT NULL DEFAULT 5,
+                ack_required      INTEGER NOT NULL DEFAULT 0,
+                error             TEXT,
+                created_at_ms     INTEGER NOT NULL,
+                updated_at_ms     INTEGER NOT NULL,
+                cancelled_at_ms   INTEGER
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_subscription_idem
+                ON audit_subscriptions(idempotency_key);
+            CREATE INDEX IF NOT EXISTS idx_subscription_status
+                ON audit_subscriptions(status, position_seq);
+            CREATE TABLE IF NOT EXISTS audit_subscription_deliveries (
+                delivery_id        TEXT PRIMARY KEY,
+                subscription_id    TEXT NOT NULL,
+                event_seq          INTEGER NOT NULL,
+                subscription_seq   INTEGER NOT NULL,
+                status             TEXT NOT NULL DEFAULT 'pending',
+                attempts           INTEGER NOT NULL DEFAULT 0,
+                next_retry_at_ms   INTEGER NOT NULL DEFAULT 0,
+                claimed_at_ms      INTEGER,
+                dispatch_token     TEXT,
+                last_error         TEXT,
+                dead_letter_reason TEXT,
+                payload_json       TEXT NOT NULL,
+                signature          TEXT,
+                confirmed_at_ms    INTEGER,
+                created_at_ms      INTEGER NOT NULL,
+                updated_at_ms      INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_sub_event
+                ON audit_subscription_deliveries(subscription_id, event_seq);
+            CREATE INDEX IF NOT EXISTS idx_delivery_due
+                ON audit_subscription_deliveries(status, next_retry_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_delivery_sub_order
+                ON audit_subscription_deliveries(subscription_id, event_seq);
+            """)
+
+    # ---- 时钟 / 默认投递 ------------------------------------------------
+    def _now(self) -> int:
+        return self._store.clock.wall_ms()
+
+    @contextmanager
+    def _tx(self) -> Iterator[Any]:
+        """显式写事务（autocommit 连接下用 BEGIN IMMEDIATE 立即拿写锁）。
+
+        与 Store 连接共享同一 WAL 库：写事务串行化，busy_timeout 等待
+        Store 写提交；异常回滚。调用方必须已持有 self._lock。
+        """
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _default_deliver(self, url, payload, signature) -> HttpDeliveryResult:
+        return default_http_delivery(url, payload, signature)
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    # ======================================================================
+    # 创建（幂等 + 冲突显式化）
+    # ======================================================================
+    def create_subscription(
+        self,
+        *,
+        scope: Any,
+        resource: Any = None,
+        credential_id: Any = None,
+        index_id: Any = None,
+        release_id: Any = None,
+        callback_url: Any = None,
+        start_seq: Any = 0,
+        filters: Any = None,
+        idempotency_key: Any = None,
+        max_attempts: Any = None,
+    ) -> tuple[dict[str, Any], bool]:
+        if scope not in SCOPES:
+            raise AuditBadRequest(
+                "scope 只能取 resource / credential / causal_index / release",
+                scope=scope)
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise AuditBadRequest(
+                "idempotency_key 必填：同一幂等键重复提交只会得到同一订阅")
+        if not isinstance(callback_url, str) or not callback_url.strip() \
+                or not callback_url.strip().lower().startswith(
+                    ("http://", "https://")):
+            raise AuditBadRequest(
+                "callback_url 必填且必须是 http(s) 地址")
+        url = callback_url.strip()
+        key = idempotency_key.strip()
+        filt = normalize_filters(filters)
+        start = _as_int(start_seq, "start_seq", default=0)
+        if start < 0:
+            raise AuditBadRequest("start_seq 不能为负数", start_seq=start)
+        # max_attempts 省略时不在幂等规格中比较（与既有订阅保持一致）；
+        # 只有显式给出时才作为创建规格的一部分
+        attempts_given = max_attempts not in (None, "")
+        attempts_val = _as_int(max_attempts, "max_attempts",
+                               default=DEFAULT_MAX_ATTEMPTS)
+        if attempts_val < 1:
+            raise AuditBadRequest("max_attempts 必须 >= 1",
+                                  max_attempts=attempts_val)
+
+        store = self._store
+        with store._lock:  # noqa: SLF001 - 钉死快照与目标存在性须与写入互斥
+            sconn = store._conn  # noqa: SLF001
+            row = sconn.execute(
+                "SELECT MAX(seq) AS m FROM lease_events").fetchone()
+            max_seq = int(row["m"]) if row["m"] is not None else 0
+
+            # 起始序号越过创建时刻的稳定视图上界：明确拒绝。
+            # 创建期间落库的新事件 seq 必 >= 本快照，不会被错误塞入
+            # "更早的起始快照"（游标从 start_seq 开始只向前扫描）。
+            if start > max_seq:
+                raise SubscriptionRangeError(
+                    f"start_seq={start} 越过当前稳定视图上界 {max_seq}，"
+                    "该历史位置尚不存在；请先用一次审计查询取得当前最大序号",
+                    start_seq=start, available_max_seq=max_seq)
+
+            target = self._validate_target_locked(sconn, scope, resource,
+                                                  credential_id, index_id,
+                                                  release_id)
+
+        # 幂等键全局唯一：同键即回放或冲突。插入在订阅自有连接上进行，
+        # 目标描述只参与规格比较，不影响租约侧任何数据。
+        with self._lock:
+            conn = self._conn
+            conn.rollback()
+            prev = conn.execute(
+                "SELECT * FROM audit_subscriptions WHERE idempotency_key=?",
+                (key,)).fetchone()
+            spec = self._spec(scope, target, url, start, filt,
+                              attempts_val if attempts_given else None)
+            if prev is not None:
+                diff = self._first_spec_diff(prev, spec)
+                if diff is None:
+                    view = self._view(prev)
+                    conn.rollback()
+                    return view, False
+                raise SubscriptionIdConflict(
+                    f"幂等键 {key} 已用于订阅 {prev['subscription_id']}，"
+                    f"本次请求与首次创建不一致：首个差异位于 {diff['path']}",
+                    subscription_id=prev["subscription_id"],
+                    first_difference=diff)
+
+            subscription_id = uuid.uuid4().hex
+            now = self._now()
+            secret = new_secret()
+            try:
+                with self._tx():
+                    conn.execute(
+                        "INSERT INTO audit_subscriptions(subscription_id, "
+                        "idempotency_key, scope, resource, credential_id, "
+                        "index_id, release_id, callback_url, secret, "
+                        "filters_json, start_seq, position_seq, sub_seq, "
+                        "snapshot_seq, status, max_attempts, ack_required, "
+                        "created_at_ms, updated_at_ms) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (subscription_id, key, scope, target["resource"],
+                         target["credential_id"], target["index_id"],
+                         target["release_id"], url, secret,
+                         canonical_json(filt), start, start, 0, max_seq,
+                         SUB_ACTIVE, attempts_val, 0, now, now))
+            except sqlite3.IntegrityError:
+                # 并发重复提交兜底
+                prev = conn.execute(
+                    "SELECT * FROM audit_subscriptions "
+                    "WHERE idempotency_key=?", (key,)).fetchone()
+                if prev is not None:
+                    diff = self._first_spec_diff(prev, spec)
+                    if diff is None:
+                        view = self._view(prev)
+                        conn.rollback()
+                        return view, False
+                    raise SubscriptionIdConflict(
+                        f"幂等键 {key} 已用于参数不同的订阅",
+                        subscription_id=prev["subscription_id"],
+                        first_difference=diff)
+                raise
+            row = self._get_row(conn, subscription_id)
+            view = self._view(row)
+            conn.rollback()
+            return view, True
+
+    @staticmethod
+    def _spec(scope, target, url, start, filt,
+              max_attempts) -> dict[str, Any]:
+        """冻结的创建规格（幂等比较用；密钥是服务端生成的，不参与比较）。
+
+        max_attempts 为 None 表示请求未显式给出，不参与幂等比较（回放时
+        沿用既有订阅的设置）。
+        """
+        return {
+            "scope": scope,
+            "resource": target["resource"],
+            "credential_id": target["credential_id"],
+            "index_id": target["index_id"],
+            "release_id": target["release_id"],
+            "callback_url": url,
+            "start_seq": start,
+            "filters": filt,
+            "max_attempts": max_attempts,
+        }
+
+    @staticmethod
+    def _first_spec_diff(prev, spec: dict) -> dict | None:
+        """逐个比较创建规格，返回首个差异字段（确定性顺序）。"""
+        fields = [
+            ("scope", prev["scope"], spec["scope"]),
+            ("resource", prev["resource"], spec["resource"]),
+            ("credential_id", prev["credential_id"],
+             spec["credential_id"]),
+            ("index_id", prev["index_id"], spec["index_id"]),
+            ("release_id", prev["release_id"], spec["release_id"]),
+            ("callback_url", prev["callback_url"], spec["callback_url"]),
+            ("start_seq", prev["start_seq"], spec["start_seq"]),
+        ]
+        if spec["max_attempts"] is not None:
+            fields.append(("max_attempts", prev["max_attempts"],
+                           spec["max_attempts"]))
+        for path, old, new in fields:
+            if old != new:
+                return {"path": path, "existing": old, "requested": new}
+        old_filters = json.loads(prev["filters_json"])
+        if old_filters != spec["filters"]:
+            return {"path": "filters", "existing": old_filters,
+                    "requested": spec["filters"]}
+        return None
+
+    def _validate_target_locked(self, conn, scope, resource, credential_id,
+                                index_id, release_id) -> dict[str, str]:
+        """校验订阅目标存在，返回规范化的目标描述。只读。"""
+        target = {"resource": "", "credential_id": "", "index_id": "",
+                  "release_id": ""}
+        if scope == SCOPE_RESOURCE:
+            res = str(require_value(resource, "resource"))
+            row = conn.execute(
+                "SELECT 1 FROM lease_events WHERE resource=? LIMIT 1",
+                (res,)).fetchone()
+            if row is None and conn.execute(
+                    "SELECT 1 FROM resources WHERE resource=?",
+                    (res,)).fetchone() is None:
+                raise SubscriptionNotFound(
+                    f"资源 {res} 不存在且没有任何历史事件，无法订阅",
+                    resource=res)
+            target["resource"] = res
+        elif scope == SCOPE_CREDENTIAL:
+            cid = str(require_value(credential_id, "credential_id"))
+            row = conn.execute(
+                "SELECT 1 FROM delegations WHERE credential_id=?",
+                (cid,)).fetchone()
+            ev = conn.execute(
+                "SELECT 1 FROM lease_events WHERE credential_id=? LIMIT 1",
+                (cid,)).fetchone()
+            if row is None and ev is None:
+                raise SubscriptionNotFound(
+                    f"委托凭证 {cid} 不存在（既无凭证记录也无历史事件）",
+                    credential_id=cid)
+            target["credential_id"] = cid
+        elif scope == SCOPE_CAUSAL_INDEX:
+            iid = str(require_value(index_id, "index_id"))
+            row = conn.execute(
+                "SELECT scope, resource, credential_id, package_id, status "
+                "FROM causal_indexes WHERE index_id=?", (iid,)).fetchone()
+            if row is None:
+                raise SubscriptionNotFound(
+                    f"因果索引 {iid} 不存在，无法订阅", index_id=iid)
+            target["index_id"] = iid
+            # 把索引目标描述一并钉住（仅作为信息，不改变订阅范围：
+            # 范围始终是该索引冻结成员所锚定的审计事件集合）
+            target["_index_scope"] = row["scope"]
+            target["_index_status"] = row["status"]
+        else:  # SCOPE_RELEASE
+            rid = str(require_value(release_id, "release_id"))
+            row = conn.execute(
+                "SELECT index_id, version FROM index_releases "
+                "WHERE release_id=?", (rid,)).fetchone()
+            if row is None:
+                raise SubscriptionNotFound(
+                    f"发布版本计划 {rid} 不存在，无法订阅",
+                    release_id=rid)
+            target["release_id"] = rid
+            target["index_id"] = row["index_id"]
+        return target
+
+    # ======================================================================
+    # 扫描历史 → 入队（稳定历史视图、严格顺序、不重复）
+    # ======================================================================
+    def scan_and_enqueue(self, *, now_ms: int | None = None,
+                         max_events: int = SCAN_BATCH) -> int:
+        """扫描各 active 订阅游标之后的历史事件，把匹配事件入队。
+
+        事件来自只增的 ``lease_events``（与审计回放同一稳定历史），扫描
+        时一次性把 ``position_seq..MAX(seq)`` 区间内属于该订阅目标的事件
+        取出按 seq 升序处理；订阅处理只 SELECT 租约侧表，绝不改写。
+
+        每个订阅独立事务：未匹配事件只推进游标；匹配事件插入投递行
+        （``(subscription_id, event_seq)`` 唯一 + INSERT OR IGNORE 兜底），
+        订阅序号在同一事务内单调递增。返回新入队的投递行数。
+        """
+        now = now_ms if now_ms is not None else self._now()
+        # 全局稳定视图上界：在租约锁内取一次 MAX(seq)，与写入互斥
+        with self._store._lock:  # noqa: SLF001
+            sconn = self._store._conn  # noqa: SLF001
+            max_row = sconn.execute(
+                "SELECT MAX(seq) AS m FROM lease_events").fetchone()
+            max_seq = int(max_row["m"]) if max_row["m"] is not None else 0
+
+        enqueued = 0
+        with self._lock:
+            conn = self._conn
+            subs_rows = conn.execute(
+                "SELECT * FROM audit_subscriptions WHERE status=? "
+                "AND position_seq<=?", (SUB_ACTIVE, max_seq),
+            ).fetchall()
+            conn.rollback()
+        for s in subs_rows:
+            # 每个订阅分窗口扫描直到追上视图上界；每个窗口独立事务，
+            # 长历史不会长时间占锁
+            while True:
+                n = self._enqueue_subscription(s["subscription_id"],
+                                               max_seq, now,
+                                               max_events=max_events)
+                enqueued += n
+                with self._lock:
+                    cur = self._get_row(conn, s["subscription_id"])
+                    caught_up = cur is None or cur["status"] != SUB_ACTIVE \
+                        or int(cur["position_seq"]) > max_seq
+                if caught_up:
+                    break
+        return enqueued
+
+    def _enqueue_subscription(self, subscription_id: str, max_seq: int,
+                              now: int, *, max_events: int) -> int:
+        with self._lock:
+            conn = self._conn
+            sub = self._get_row(conn, subscription_id)
+            if sub is None or sub["status"] != SUB_ACTIVE:
+                return 0
+            pos = int(sub["position_seq"])
+            if pos > max_seq:
+                return 0
+            filt = json.loads(sub["filters_json"])
+            rows = self._scope_event_rows(conn, sub, pos, max_seq,
+                                          limit=max_events)
+            window = min(max_seq, pos + max(1, max_events) - 1)
+            with self._tx():
+                if not rows:
+                    # 本窗口没有属于该作用域的事件：游标越过整个窗口。
+                    # 不能直接跳到 max_seq+1——后续窗口里可能还有属于
+                    # 该作用域的事件（其它资源的事件在全局序号上交错）。
+                    conn.execute(
+                        "UPDATE audit_subscriptions SET position_seq=?, "
+                        "updated_at_ms=? WHERE subscription_id=? AND status=?",
+                        (window + 1, now, subscription_id, SUB_ACTIVE))
+                    return 0
+
+                sub_seq = int(sub["sub_seq"])
+                inserted = 0
+                for r in rows:
+                    ev = event_dict(r)
+                    if not event_passes_filters(ev, filt):
+                        continue
+                    payload = self._build_payload(sub, r)
+                    # 订阅序号在同一事务内预先占位：严格按事件 seq 升序
+                    sub_seq += 1
+                    payload["subscription_seq"] = sub_seq
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO audit_subscription_deliveries"
+                        "(delivery_id, subscription_id, event_seq, "
+                        "subscription_seq, status, attempts, "
+                        "next_retry_at_ms, payload_json, signature, "
+                        "created_at_ms, updated_at_ms) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (uuid.uuid4().hex, subscription_id, r["seq"],
+                         sub_seq, D_PENDING, 0, 0,
+                         canonical_json(payload), None, now, now))
+                    if cur.rowcount:
+                        inserted += 1
+                    else:
+                        # 重新开始/并发扫描导致的重复行：以既有行已落库的
+                        # 订阅序号为准（绝不复用同一序号给两个不同事件），
+                        # 本次预占的序号让回
+                        prev = conn.execute(
+                            "SELECT subscription_seq FROM "
+                            "audit_subscription_deliveries "
+                            "WHERE subscription_id=? AND event_seq=?",
+                            (subscription_id, r["seq"])).fetchone()
+                        sub_seq = (int(prev["subscription_seq"])
+                                   if prev is not None else sub_seq - 1)
+                # 游标推进到本窗口末端（不是最后一条匹配事件：窗口内未匹配
+                # 或不属于本作用域的序号同样已经检视，不能再回头生成投递）
+                conn.execute(
+                    "UPDATE audit_subscriptions SET position_seq=?, "
+                    "sub_seq=?, updated_at_ms=? "
+                    "WHERE subscription_id=? AND status=?",
+                    (window + 1, sub_seq, now, subscription_id,
+                     SUB_ACTIVE))
+                return inserted
+
+    def _scope_event_rows(self, conn, sub, seq_from: int, seq_to: int,
+                          *, limit: int):
+        """取全局序号区间 [seq_from, seq_to] 内属于本订阅目标的事件。
+
+        窗口上界 min(seq_to, seq_from+limit-1) 按**全局**序号取，因此
+        作用域事件即便在全局序列上稀疏交错，每个 seq 也都会被检视到，
+        不会因 per-scope LIMIT 跳过事件。调用方按最后检视到的全局 seq
+        推进游标。
+        """
+        window = min(seq_to, seq_from + max(1, limit) - 1)
+        scope = sub["scope"]
+        if scope == SCOPE_RESOURCE:
+            return conn.execute(
+                "SELECT * FROM lease_events WHERE resource=? AND seq>=? "
+                "AND seq<=? ORDER BY seq ASC",
+                (sub["resource"], seq_from, window)).fetchall()
+        if scope == SCOPE_CREDENTIAL:
+            return conn.execute(
+                "SELECT * FROM lease_events WHERE credential_id=? AND seq>=? "
+                "AND seq<=? ORDER BY seq ASC",
+                (sub["credential_id"], seq_from, window)).fetchall()
+        # causal_index / release：事件集合 = 该索引冻结成员中锚定的
+        # lease_event 节点（release 锚定其发布的索引）。成员集合创建时
+        # 冻结，因此"后来事件插到前面"在结构上不可能发生。
+        index_id = sub["index_id"]
+        return conn.execute(
+            "SELECT e.* FROM causal_index_members m "
+            "JOIN lease_events e ON e.seq=m.anchor_seq "
+            "WHERE m.index_id=? AND m.node_type='lease_event' "
+            "AND e.seq>=? AND e.seq<=? ORDER BY e.seq ASC",
+            (index_id, seq_from, window)).fetchall()
+
+    def _build_payload(self, sub, ev_row) -> dict[str, Any]:
+        summary = event_summary(ev_row)
+        return {
+            "schema_version": 1,
+            "subscription_id": sub["subscription_id"],
+            "scope": sub["scope"],
+            "object": self._object_ref(sub),
+            "event_seq": int(ev_row["seq"]),
+            "subscription_seq": 0,  # 由调用方在入队事务内赋值
+            "event_type": summary["event_type"],
+            "object_id": f"lease_event:{ev_row['seq']}",
+            "summary": summary,
+            "wall_ms": int(ev_row["wall_ms"]),
+            "logical": int(ev_row["logical"]),
+        }
+
+    @staticmethod
+    def _object_ref(sub) -> dict[str, str]:
+        return {
+            "scope": sub["scope"],
+            "resource": sub["resource"],
+            "credential_id": sub["credential_id"],
+            "index_id": sub["index_id"],
+            "release_id": sub["release_id"],
+        }
+
+    # ======================================================================
+    # 投递：认领（带令牌的条件 UPDATE）→ 锁外回调 → 条件记录结果
+    # ======================================================================
+    def process_due(self, *, now_ms: int | None = None,
+                    max_deliveries: int | None = None) -> int:
+        """回收崩溃认领行、认领所有到点且位于队首的待投递通知并执行回调。
+
+        返回本轮处理的投递数。严格顺序由队首检查保证：每个订阅只取最早
+        的一行非终态投递，只有它是 pending 且退避到点时才投递；它处于
+        inflight / awaiting_confirm / dead_letter / 退避等待时，后续事件
+        全部等待。
+        """
+        now = now_ms if now_ms is not None else self._now()
+        self.recover_stale_claims(now_ms=now)
+
+        # 到点判定 = updated_at_ms（失败时刻）+ backoff_ms：两者来自同一
+        # 偏移墙钟，墙钟被正拨只会让重试更早到点，绝不会出现"退避永远不
+        # 到点"；新认领/复位行 updated_at_ms=建行时刻且 backoff=0。
+        # SQL: d.next_retry_at_ms 存退避时长，到点比较 updated_at_ms + 值。
+        with self._lock:
+            conn = self._conn
+            # 每个订阅的队首行 = 最小 event_seq 的**非终态**投递：
+            # 已确认/已弃置的行不再占队，而 dead_letter / inflight /
+            # awaiting_confirm / 退避等待中的行必须挡住后续事件，绝不跳过。
+            heads = conn.execute(
+                "SELECT d.* FROM audit_subscription_deliveries d "
+                "JOIN (SELECT subscription_id, MIN(event_seq) AS min_seq "
+                "FROM audit_subscription_deliveries "
+                "WHERE status IN (?,?,?,?) GROUP BY subscription_id) h "
+                "ON h.subscription_id=d.subscription_id "
+                "AND h.min_seq=d.event_seq "
+                "JOIN audit_subscriptions s ON s.subscription_id=d.subscription_id "
+                "WHERE d.status=? AND (d.updated_at_ms + d.next_retry_at_ms)<=? "
+                "AND s.status=? ORDER BY d.event_seq ASC",
+                (D_DEAD, D_INFLIGHT, D_AWAITING, D_PENDING,
+                 D_PENDING, now, SUB_ACTIVE)).fetchall()
+            conn.rollback()
+        if max_deliveries is not None:
+            heads = heads[:max_deliveries]
+
+        n = 0
+        for head in heads:
+            if self._claim_and_deliver(head["delivery_id"], now):
+                n += 1
+        return n
+
+    def recover_stale_claims(self, *, now_ms: int | None = None,
+                             lease_ms: int | None = None) -> int:
+        """把超时的 inflight/awaiting_confirm 行回收为 pending。
+
+        投递器崩溃/重启时认领行会残留；超过认领租约（以认领时刻
+        ``claimed_at_ms`` 计）即回收（不增加 ``attempts``，退避清零
+        立即重试）。``lease_ms=0`` 表示无条件回收（启动恢复用）。
+        """
+        now = now_ms if now_ms is not None else self._now()
+        lease = self.claim_lease_ms if lease_ms is None else lease_ms
+        cutoff = 0 if lease == 0 else now - lease
+        with self._lock:
+            conn = self._conn
+            # lease_ms=0（启动恢复）：无条件回收所有认领中状态的行；
+            # 周期性回收：只回收认领时刻早于 cutoff 的行。
+            # 认领 UPDATE 总会写入 claimed_at_ms，故正常投递中的行
+            # （claimed_at_ms≈now）不会被误回收。回收即立即重试
+            # （退避清零，attempts 不增加）。
+            if lease == 0:
+                where = "status IN (?,?)"
+                params: tuple = (D_INFLIGHT, D_AWAITING)
+            else:
+                where = "status IN (?,?) AND claimed_at_ms<=?"
+                params = (D_INFLIGHT, D_AWAITING, cutoff)
+            with self._tx():
+                cur = conn.execute(
+                    "UPDATE audit_subscription_deliveries SET status=?, "
+                    "dispatch_token=NULL, claimed_at_ms=NULL, "
+                    "next_retry_at_ms=0, "
+                    "last_error=COALESCE(last_error, "
+                    "'stale_claim_reclaimed'), updated_at_ms=? WHERE "
+                    + where,
+                    (D_PENDING, now, *params))
+                return cur.rowcount
+
+    def _claim_and_deliver(self, delivery_id: str, now: int) -> bool:
+        """认领一行 pending 投递，执行回调并按结果记录。返回是否处理过。"""
+        with self._lock:
+            conn = self._conn
+            row = conn.execute(
+                "SELECT d.*, s.status AS sub_status, s.callback_url AS url, "
+                "s.secret AS secret, s.max_attempts AS max_attempts, "
+                "s.subscription_id AS sid FROM "
+                "audit_subscription_deliveries d JOIN audit_subscriptions s "
+                "ON s.subscription_id=d.subscription_id "
+                "WHERE d.delivery_id=?", (delivery_id,)).fetchone()
+            if row is None:
+                return False
+            # 取消后的迟到通知不能再发送
+            if row["sub_status"] != SUB_ACTIVE:
+                return False
+            if row["status"] != D_PENDING:
+                return False
+            token = uuid.uuid4().hex
+            with self._tx():
+                cur = conn.execute(
+                    "UPDATE audit_subscription_deliveries SET status=?, "
+                    "dispatch_token=?, claimed_at_ms=?, attempts=attempts+1, "
+                    "updated_at_ms=? WHERE delivery_id=? AND status=?",
+                    (D_INFLIGHT, token, now, now, delivery_id, D_PENDING))
+                if cur.rowcount != 1:
+                    return False
+                payload = json.loads(row["payload_json"])
+                signature = sign_payload(row["secret"], payload)
+                conn.execute(
+                    "UPDATE audit_subscription_deliveries SET signature=? "
+                    "WHERE delivery_id=?", (signature, delivery_id))
+            url = row["url"]
+
+        # 回调在数据库事务/锁之外执行，慢回调不阻塞租约与其它订阅
+        try:
+            result = self._deliver_cb(url, payload, signature)
+        except Exception as exc:  # noqa: BLE001 - 回调器自身异常按失败处理
+            result = HttpDeliveryResult(
+                error=f"delivery_exception: {type(exc).__name__}: {exc}")
+        self._record_result(delivery_id, token, result, now)
+        return True
+
+    def _record_result(self, delivery_id: str, token: str,
+                       result: HttpDeliveryResult, now: int) -> None:
+        """按回调结果更新投递行；只接受本次认领令牌的响应。"""
+        with self._lock:
+            conn = self._conn
+            row = conn.execute(
+                "SELECT d.*, s.status AS sub_status, "
+                "s.max_attempts AS max_attempts FROM "
+                "audit_subscription_deliveries d JOIN audit_subscriptions s "
+                "ON s.subscription_id=d.subscription_id "
+                "WHERE d.delivery_id=?", (delivery_id,)).fetchone()
+            if row is None:
+                return
+            # 令牌不匹配（迟到的旧响应）或订阅已取消/暂停：忽略。
+            # 取消后的迟到通知即便成功也不能推进队列。
+            if row["dispatch_token"] != token:
+                return
+            if row["sub_status"] != SUB_ACTIVE:
+                # 订阅已暂停/取消：迟到响应不改变语义终态。
+                # - 取消：开放行已在取消事务置 discarded，这里不动；
+                # - 暂停（投递期间被暂停）：保持 inflight 与认领令牌，
+                #   恢复后由崩溃认领回收机制重新投递（不丢通知）。
+                return
+            attempts = int(row["attempts"])
+            max_attempts = int(row["max_attempts"])
+            error = result.error or f"http_status_{result.status}"
+            with self._tx():
+                if result.ok:
+                    cur = conn.execute(
+                        "UPDATE audit_subscription_deliveries SET status=?, "
+                        "dispatch_token=NULL, confirmed_at_ms=?, "
+                        "last_error=NULL, updated_at_ms=? "
+                        "WHERE delivery_id=? AND status=?",
+                        (D_CONFIRMED, now, now, delivery_id, D_INFLIGHT))
+                    if cur.rowcount:
+                        self._clear_blocked_locked(
+                            conn, row["subscription_id"], now)
+                elif result.ack_pending:
+                    conn.execute(
+                        "UPDATE audit_subscription_deliveries SET status=?, "
+                        "updated_at_ms=? WHERE delivery_id=? AND status=?",
+                        (D_AWAITING, now, delivery_id, D_INFLIGHT))
+                    conn.execute(
+                        "UPDATE audit_subscriptions SET ack_required=1 "
+                        "WHERE subscription_id=?",
+                        (row["subscription_id"],))
+                elif result.permanent_reject or attempts >= max_attempts:
+                    # 永久拒收或超过上限：进入死信并挡住后续事件
+                    reason = ("permanent_reject_410"
+                              if result.permanent_reject
+                              else "max_attempts_exceeded")
+                    conn.execute(
+                        "UPDATE audit_subscription_deliveries SET status=?, "
+                        "dispatch_token=NULL, dead_letter_reason=?, "
+                        "last_error=?, updated_at_ms=? "
+                        "WHERE delivery_id=? AND status=?",
+                        (D_DEAD, reason, error, now, delivery_id,
+                         D_INFLIGHT))
+                    conn.execute(
+                        "UPDATE audit_subscriptions SET blocked=1, "
+                        "error=?, updated_at_ms=? WHERE subscription_id=?",
+                        (f"delivery {delivery_id} 进入死信（{reason}）："
+                         f"{error}", now, row["subscription_id"]))
+                else:
+                    # 失败退避：next_retry_at_ms 存退避时长，到点判定用
+                    # updated_at_ms + next_retry_at_ms（同一偏移墙钟，
+                    # 正拨不会让退避永远不到点）
+                    delay = backoff_delay_ms(
+                        attempts, base_ms=self.base_backoff_ms,
+                        max_ms=self.max_backoff_ms)
+                    conn.execute(
+                        "UPDATE audit_subscription_deliveries SET status=?, "
+                        "dispatch_token=NULL, next_retry_at_ms=?, "
+                        "last_error=?, updated_at_ms=? "
+                        "WHERE delivery_id=? AND status=?",
+                        (D_PENDING, delay, error, now, delivery_id,
+                         D_INFLIGHT))
+
+    # ======================================================================
+    # 显式签名确认
+    # ======================================================================
+    def confirm_delivery(self, subscription_id: str, event_seq: Any,
+                         signature: Any) -> dict[str, Any]:
+        """订阅回调方对 awaiting_confirm（或重发确认）的通知做显式确认。
+
+        必须携带与通知载荷一致的 HMAC 签名。确认是条件 UPDATE：只有
+        inflight/awaiting_confirm 的行才会变成 confirmed；对已确认行
+        重复提交幂等回放（不改变任何状态、不重复推进）；签名错误一律
+        401 且不写库。
+        """
+        seq = _as_int(event_seq, "event_seq")
+        with self._lock:
+            conn = self._conn
+            sub = self._get_row(conn, subscription_id)
+            if sub is None:
+                raise SubscriptionNotFound(
+                    f"订阅 {subscription_id} 不存在",
+                    subscription_id=subscription_id)
+            d = conn.execute(
+                "SELECT * FROM audit_subscription_deliveries "
+                "WHERE subscription_id=? AND event_seq=?",
+                (subscription_id, seq)).fetchone()
+            if d is None:
+                raise DeliveryNotFound(
+                    f"订阅 {subscription_id} 没有事件 seq={seq} 的投递记录",
+                    subscription_id=subscription_id, event_seq=seq)
+
+            payload = json.loads(d["payload_json"])
+            if not verify_signature(sub["secret"], payload, signature):
+                raise InvalidSignature(
+                    "确认签名校验失败：签名与通知载荷的 HMAC-SHA256 不一致，"
+                    "状态未改变",
+                    subscription_id=subscription_id, event_seq=seq)
+
+            if d["status"] == D_CONFIRMED:
+                # 重复确认：幂等回放，绝不推进两次
+                return self._delivery_view(d, replayed=True)
+            if d["status"] not in (D_INFLIGHT, D_AWAITING):
+                raise DeliveryBadState(
+                    f"投递当前状态为 {d['status']}，不能确认；只有待确认"
+                    "的投递可以确认",
+                    subscription_id=subscription_id, event_seq=seq,
+                    status=d["status"])
+            now = self._now()
+            with self._tx():
+                conn.execute(
+                    "UPDATE audit_subscription_deliveries SET status=?, "
+                    "dispatch_token=NULL, confirmed_at_ms=?, updated_at_ms=? "
+                    "WHERE delivery_id=? AND status IN (?,?)",
+                    (D_CONFIRMED, now, now, d["delivery_id"],
+                     D_INFLIGHT, D_AWAITING))
+                self._clear_blocked_locked(conn, subscription_id, now)
+            return self._delivery_view(
+                self._get_delivery_row(conn, d["delivery_id"]))
+
+    # ======================================================================
+    # 暂停 / 恢复 / 取消
+    # ======================================================================
+    def pause(self, subscription_id: str) -> dict[str, Any]:
+        with self._lock:
+            conn = self._conn
+            sub = self._require_sub(conn, subscription_id)
+            if sub["status"] == SUB_CANCELLED:
+                raise SubscriptionBadState(
+                    f"订阅 {subscription_id} 已取消，不能暂停",
+                    subscription_id=subscription_id, status=SUB_CANCELLED)
+            if sub["status"] != SUB_PAUSED:
+                with self._tx():
+                    conn.execute(
+                        "UPDATE audit_subscriptions SET status=?, "
+                        "updated_at_ms=? WHERE subscription_id=?",
+                        (SUB_PAUSED, self._now(), subscription_id))
+            return self._view(
+                self._get_row(conn, subscription_id))
+
+    def resume(self, subscription_id: str) -> dict[str, Any]:
+        with self._lock:
+            conn = self._conn
+            sub = self._require_sub(conn, subscription_id)
+            if sub["status"] == SUB_CANCELLED:
+                raise SubscriptionBadState(
+                    f"订阅 {subscription_id} 已取消，不能恢复",
+                    subscription_id=subscription_id, status=SUB_CANCELLED)
+            if sub["status"] == SUB_PAUSED:
+                # 暂停期间可能有回调中的行停在 inflight：恢复时回收为
+                # pending（不增加尝试次数），确保队首能继续投递
+                with self._tx():
+                    conn.execute(
+                        "UPDATE audit_subscriptions SET status=?, "
+                        "updated_at_ms=? WHERE subscription_id=?",
+                        (SUB_ACTIVE, self._now(), subscription_id))
+                    conn.execute(
+                        "UPDATE audit_subscription_deliveries SET status=?, "
+                        "dispatch_token=NULL, claimed_at_ms=NULL, "
+                        "next_retry_at_ms=0, updated_at_ms=? "
+                        "WHERE subscription_id=? AND status IN (?,?)",
+                        (D_PENDING, self._now(), subscription_id,
+                         D_INFLIGHT, D_AWAITING))
+            return self._view(
+                self._get_row(conn, subscription_id))
+
+    def cancel(self, subscription_id: str) -> dict[str, Any]:
+        """取消订阅：未终态投递全部置 discarded（保留历史），此后不再投递。
+
+        正在回调中的通知其迟到响应会被 _record_result 的订阅状态检查
+        忽略（回收为 pending 后也不会被扫描，因为订阅已 cancelled）。
+        """
+        now = self._now()
+        with self._lock:
+            conn = self._conn
+            sub = self._require_sub(conn, subscription_id)
+            if sub["status"] == SUB_CANCELLED:
+                # 幂等回放
+                return self._view(sub)
+            with self._tx():
+                conn.execute(
+                    "UPDATE audit_subscriptions SET status=?, blocked=0, "
+                    "cancelled_at_ms=?, updated_at_ms=? "
+                    "WHERE subscription_id=?",
+                    (SUB_CANCELLED, now, now, subscription_id))
+                conn.execute(
+                    "UPDATE audit_subscription_deliveries SET status=?, "
+                    "dispatch_token=NULL, updated_at_ms=? "
+                    "WHERE subscription_id=? AND status IN (?,?,?)",
+                    (D_DISCARDED, now, subscription_id, *D_OPEN))
+            return self._view(self._get_row(conn, subscription_id))
+
+    # ======================================================================
+    # 从指定序号重新开始（保留已有投递记录）
+    # ======================================================================
+    def restart_from(self, subscription_id: str,
+                     from_seq: Any) -> dict[str, Any]:
+        """把订阅游标重置到 from_seq 并重新扫描入队。
+
+        - 只允许 active/paused 订阅（已取消 409）；from_seq 不能越过当前
+          稳定视图上界（416）；
+        - **已有投递记录全部保留**：已确认行不动（同一事件不会重复确认）；
+          其余非终态/dead_letter 行复位为 pending、清空尝试与死信原因，
+          严格顺序恢复投递；
+        - 重置后立即扫描 [from_seq, MAX(seq)] 重新补齐缺失的投递行
+          （INSERT OR IGNORE，已有的不重建、订阅序号不重用）。
+        """
+        seq = _as_int(from_seq, "from_seq")
+        if seq < 0:
+            raise AuditBadRequest("from_seq 不能为负数", from_seq=seq)
+        store = self._store
+        with store._lock:  # noqa: SLF001
+            sconn = store._conn  # noqa: SLF001
+            max_row = sconn.execute(
+                "SELECT MAX(seq) AS m FROM lease_events").fetchone()
+            max_seq = int(max_row["m"]) if max_row["m"] is not None else 0
+        if seq > max_seq:
+            raise SubscriptionRangeError(
+                f"from_seq={seq} 越过当前稳定视图上界 {max_seq}",
+                start_seq=seq, available_max_seq=max_seq)
+
+        now = self._now()
+        with self._lock:
+            conn = self._conn
+            sub = self._require_sub(conn, subscription_id)
+            if sub["status"] == SUB_CANCELLED:
+                raise SubscriptionBadState(
+                    f"订阅 {subscription_id} 已取消，不能重新开始",
+                    subscription_id=subscription_id,
+                    status=SUB_CANCELLED)
+            old_status = sub["status"]
+            with self._tx():
+                # 未确认的旧投递（含死信/待确认/投递中/退避等待）复位重试；
+                # 已确认与已弃置（更早一次取消前的记录，正常不会出现）不动。
+                conn.execute(
+                    "UPDATE audit_subscription_deliveries SET status=?, "
+                    "attempts=0, next_retry_at_ms=0, dispatch_token=NULL, "
+                    "claimed_at_ms=NULL, last_error=NULL, "
+                    "dead_letter_reason=NULL, updated_at_ms=? "
+                    "WHERE subscription_id=? AND status IN (?,?,?,?)",
+                    (D_PENDING, now, subscription_id,
+                     D_PENDING, D_INFLIGHT, D_AWAITING, D_DEAD))
+                conn.execute(
+                    "UPDATE audit_subscriptions SET position_seq=?, blocked=0, "
+                    "error=NULL, status=?, updated_at_ms=? "
+                    "WHERE subscription_id=?",
+                    (seq, SUB_ACTIVE, now, subscription_id))
+
+        # 以 active 身份补齐区间内缺失的投递行，然后恢复原状态
+        self.scan_and_enqueue(now_ms=now)
+        with self._lock:
+            conn = self._conn
+            max_row = conn.execute(
+                "SELECT MAX(seq) AS m FROM lease_events").fetchone()
+            current_max = int(max_row["m"]) if max_row["m"] is not None else 0
+            # 重新开始区间内的事件全部补齐后，游标停在视图末端做尾部追平；
+            # 区间内 (subscription_id, event_seq) 唯一行已存在，后续扫描靠
+            # INSERT OR IGNORE 不重建，严格顺序由"只投队首非终态行"保证
+            with self._tx():
+                conn.execute(
+                    "UPDATE audit_subscriptions SET position_seq=?, status=? "
+                    "WHERE subscription_id=?",
+                    (current_max + 1, old_status, subscription_id))
+            return self._view(self._get_row(conn, subscription_id))
+
+    # ======================================================================
+    # 死信：查询 / 查看原因 / 重新放回队列
+    # ======================================================================
+    def list_dead_letters(self, *, subscription_id: Any = None,
+                          limit: Any = 100) -> dict[str, Any]:
+        limit = _bounded_limit(limit)
+        with self._lock:
+            conn = self._conn
+            if subscription_id not in (None, ""):
+                rows = conn.execute(
+                    "SELECT * FROM audit_subscription_deliveries "
+                    "WHERE status=? AND subscription_id=? "
+                    "ORDER BY event_seq ASC LIMIT ?",
+                    (D_DEAD, str(subscription_id), limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM audit_subscription_deliveries "
+                    "WHERE status=? ORDER BY updated_at_ms ASC, event_seq ASC "
+                    "LIMIT ?", (D_DEAD, limit)).fetchall()
+            conn.rollback()
+            return {"dead_letters": [self._delivery_view(r) for r in rows],
+                    "limit": limit}
+
+    def requeue_dead_letter(self, subscription_id: str,
+                            event_seq: Any | None = None,
+                            delivery_id: str | None = None) -> dict[str, Any]:
+        """把死信重新放回队列：复位尝试次数，立即重试，解除挡队。
+
+        重新放回不改变严格顺序：该行仍是其订阅在该 event_seq 上的唯一
+        投递，前面若还有其它未确认行，它仍会等前面完成后才投递。
+        """
+        now = self._now()
+        with self._lock:
+            conn = self._conn
+            self._require_sub(conn, subscription_id)
+            if delivery_id:
+                d = conn.execute(
+                    "SELECT * FROM audit_subscription_deliveries "
+                    "WHERE delivery_id=? AND subscription_id=?",
+                    (str(delivery_id), subscription_id)).fetchone()
+            else:
+                seq = _as_int(event_seq, "event_seq")
+                d = conn.execute(
+                    "SELECT * FROM audit_subscription_deliveries "
+                    "WHERE subscription_id=? AND event_seq=?",
+                    (subscription_id, seq)).fetchone()
+            if d is None:
+                raise DeliveryNotFound(
+                    "指定的死信投递不存在",
+                    subscription_id=subscription_id, event_seq=event_seq)
+            if d["status"] != D_DEAD:
+                raise DeliveryBadState(
+                    f"投递当前状态为 {d['status']}，只有 dead_letter 可以"
+                    "重新放回队列",
+                    subscription_id=subscription_id,
+                    event_seq=d["event_seq"], status=d["status"])
+            with self._tx():
+                conn.execute(
+                    "UPDATE audit_subscription_deliveries SET status=?, "
+                    "attempts=0, next_retry_at_ms=0, dispatch_token=NULL, "
+                    "claimed_at_ms=NULL, last_error=NULL, "
+                    "dead_letter_reason=NULL, updated_at_ms=? "
+                    "WHERE delivery_id=? AND status=?",
+                    (D_PENDING, now, d["delivery_id"], D_DEAD))
+                self._clear_blocked_locked(conn, subscription_id, now)
+            return self._delivery_view(
+                self._get_delivery_row(conn, d["delivery_id"]))
+
+    # ======================================================================
+    # 手动重试单条投递（退避未到点也可立即重试）
+    # ======================================================================
+    def retry_delivery(self, subscription_id: str,
+                       event_seq: Any) -> dict[str, Any]:
+        now = self._now()
+        with self._lock:
+            conn = self._conn
+            conn.rollback()
+            self._require_sub(conn, subscription_id)
+            seq = _as_int(event_seq, "event_seq")
+            d = conn.execute(
+                "SELECT * FROM audit_subscription_deliveries "
+                "WHERE subscription_id=? AND event_seq=?",
+                (subscription_id, seq)).fetchone()
+            if d is None:
+                raise DeliveryNotFound(
+                    f"订阅 {subscription_id} 没有事件 seq={seq} 的投递记录",
+                    subscription_id=subscription_id, event_seq=seq)
+            if d["status"] not in (D_PENDING, D_AWAITING):
+                raise DeliveryBadState(
+                    f"投递当前状态为 {d['status']}，只有退避等待/待确认的"
+                    "投递可以手动重试",
+                    subscription_id=subscription_id, event_seq=seq,
+                    status=d["status"])
+            with self._tx():
+                conn.execute(
+                    "UPDATE audit_subscription_deliveries SET status=?, "
+                    "next_retry_at_ms=0, dispatch_token=NULL, "
+                    "claimed_at_ms=NULL, updated_at_ms=? "
+                    "WHERE delivery_id=?",
+                    (D_PENDING, now, d["delivery_id"]))
+            return self._delivery_view(
+                self._get_delivery_row(conn, d["delivery_id"]))
+
+    # ======================================================================
+    # 查询：订阅 / 投递历史（分页）
+    # ======================================================================
+    def get_subscription(self, subscription_id: str) -> dict[str, Any]:
+        with self._lock:
+            conn = self._conn
+            # 显式结束可能残留的只读事务，确保看到其它连接（写入事务）
+            # 的最新已提交视图（WAL 下长读连接会停在旧快照）
+            conn.rollback()
+            row = self._require_sub(conn, subscription_id)
+            view = self._view(row)
+            conn.rollback()
+            return view
+
+    def list_subscriptions(self, *, scope: Any = None, status: Any = None,
+                           limit: Any = 100) -> dict[str, Any]:
+        limit = _bounded_limit(limit)
+        if scope is not None and scope not in SCOPES:
+            raise AuditBadRequest("scope 取值非法", scope=scope)
+        if status is not None and status not in SUB_STATUSES:
+            raise AuditBadRequest(
+                "status 只能取 active / paused / cancelled", status=status)
+        where, args = [], []
+        if scope:
+            where.append("scope=?")
+            args.append(scope)
+        if status:
+            where.append("status=?")
+            args.append(status)
+        sql = "SELECT * FROM audit_subscriptions"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at_ms ASC, subscription_id ASC LIMIT ?"
+        with self._lock:
+            conn = self._conn
+            conn.rollback()  # 取最新已提交视图（勿停在旧 WAL 快照）
+            rows = conn.execute(sql, (*args, limit)).fetchall()
+            views = [self._view(r) for r in rows]
+            conn.rollback()
+            return {"subscriptions": views, "limit": limit}
+
+    def list_deliveries(self, subscription_id: str, *,
+                        after_seq: Any = None, status: Any = None,
+                        limit: Any = 100) -> dict[str, Any]:
+        """分页读取订阅投递历史（按 event_seq 升序，游标是 event_seq）。"""
+        limit = _bounded_limit(limit)
+        after = _as_int(after_seq, "after", default=0)
+        if after < 0:
+            raise AuditBadRequest("after 不能为负数", after=after)
+        if status is not None and status not in (
+                D_PENDING, D_INFLIGHT, D_AWAITING, D_CONFIRMED, D_DEAD,
+                D_DISCARDED):
+            raise AuditBadRequest("status 过滤值非法", status=status)
+        with self._lock:
+            conn = self._conn
+            conn.rollback()
+            self._require_sub(conn, subscription_id)
+            where = ["subscription_id=?"]
+            args: list[Any] = [subscription_id]
+            if after:
+                where.append("event_seq>?")
+                args.append(after)
+            if status:
+                where.append("status=?")
+                args.append(status)
+            rows = conn.execute(
+                "SELECT * FROM audit_subscription_deliveries WHERE "
+                + " AND ".join(where)
+                + " ORDER BY event_seq ASC LIMIT ?",
+                (*args, limit + 1)).fetchall()
+            conn.rollback()
+        page = rows[:limit]
+        has_more = len(rows) > limit
+        return {
+            "subscription_id": subscription_id,
+            "deliveries": [self._delivery_view(r) for r in page],
+            "limit": limit,
+            "next": page[-1]["event_seq"] if has_more else None,
+            "reached_end": not has_more,
+        }
+
+    def get_delivery(self, subscription_id: str,
+                     event_seq: Any) -> dict[str, Any]:
+        with self._lock:
+            conn = self._conn
+            conn.rollback()
+            self._require_sub(conn, subscription_id)
+            seq = _as_int(event_seq, "event_seq")
+            d = conn.execute(
+                "SELECT * FROM audit_subscription_deliveries "
+                "WHERE subscription_id=? AND event_seq=?",
+                (subscription_id, seq)).fetchone()
+            conn.rollback()
+            if d is None:
+                raise DeliveryNotFound(
+                    f"订阅 {subscription_id} 没有事件 seq={seq} 的投递记录",
+                    subscription_id=subscription_id, event_seq=seq)
+            return self._delivery_view(d)
+
+    # ---- 视图 -----------------------------------------------------------
+    def _require_sub(self, conn, subscription_id: str):
+        row = self._get_row(conn, subscription_id)
+        if row is None:
+            raise SubscriptionNotFound(
+                f"订阅 {subscription_id} 不存在",
+                subscription_id=subscription_id)
+        return row
+
+    @staticmethod
+    def _get_row(conn, subscription_id: str):
+        return conn.execute(
+            "SELECT * FROM audit_subscriptions WHERE subscription_id=?",
+            (subscription_id,)).fetchone()
+
+    @staticmethod
+    def _get_delivery_row(conn, delivery_id: str):
+        return conn.execute(
+            "SELECT * FROM audit_subscription_deliveries WHERE delivery_id=?",
+            (delivery_id,)).fetchone()
+
+    def _clear_blocked_locked(self, conn, subscription_id: str,
+                              now: int) -> None:
+        """该订阅已无 dead_letter 挡队时清除 blocked 标记与错误说明。"""
+        dead = conn.execute(
+            "SELECT COUNT(*) AS c FROM audit_subscription_deliveries "
+            "WHERE subscription_id=? AND status=?",
+            (subscription_id, D_DEAD)).fetchone()["c"]
+        if not dead:
+            conn.execute(
+                "UPDATE audit_subscriptions SET blocked=0, error=NULL, "
+                "updated_at_ms=? WHERE subscription_id=? AND blocked=1",
+                (now, subscription_id))
+
+    def _view(self, row) -> dict[str, Any]:
+        with self._lock:
+            conn = self._conn
+            stats = conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS confirmed, "
+                "SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS dead, "
+                "SUM(CASE WHEN status IN (?,?,?) THEN 1 ELSE 0 END) AS open, "
+                "MAX(CASE WHEN status=? THEN event_seq ELSE NULL END) "
+                "AS last_confirmed_seq "
+                "FROM audit_subscription_deliveries WHERE subscription_id=?",
+                (D_CONFIRMED, D_DEAD, *D_OPEN, D_CONFIRMED,
+                 row["subscription_id"])).fetchone()
+            conn.rollback()
+        return {
+            "subscription_id": row["subscription_id"],
+            "idempotency_key": row["idempotency_key"],
+            "scope": row["scope"],
+            "object": self._object_ref(row),
+            "callback_url": row["callback_url"],
+            "filters": json.loads(row["filters_json"]),
+            "start_seq": row["start_seq"],
+            "position_seq": row["position_seq"],
+            "next_event_seq": row["position_seq"],
+            "delivered_seq": (int(stats["last_confirmed_seq"])
+                              if stats["last_confirmed_seq"] is not None
+                              else None),
+            "subscription_seq_next": row["sub_seq"] + 1,
+            "snapshot_seq": row["snapshot_seq"],
+            "status": row["status"],
+            "blocked": bool(row["blocked"]),
+            "max_attempts": row["max_attempts"],
+            "ack_required": bool(row["ack_required"]),
+            "error": row["error"],
+            "counters": {
+                "confirmed": int(stats["confirmed"] or 0),
+                "dead_letter": int(stats["dead"] or 0),
+                "in_flight_or_pending": int(stats["open"] or 0),
+            },
+            "created_at_ms": row["created_at_ms"],
+            "updated_at_ms": row["updated_at_ms"],
+            "cancelled_at_ms": row["cancelled_at_ms"],
+        }
+
+    def _delivery_view(self, d, *, replayed: bool = False) -> dict[str, Any]:
+        payload = json.loads(d["payload_json"])
+        # next_retry_at_ms 存的是退避时长；退避中的 pending 行换算出
+        # 绝对下次重试时刻，其余状态给 None
+        next_abs = None
+        if d["status"] == D_PENDING and (d["next_retry_at_ms"] or 0) > 0:
+            next_abs = int(d["updated_at_ms"]) + int(d["next_retry_at_ms"])
+        return {
+            "delivery_id": d["delivery_id"],
+            "subscription_id": d["subscription_id"],
+            "event_seq": d["event_seq"],
+            "subscription_seq": d["subscription_seq"],
+            "status": d["status"],
+            "attempts": d["attempts"],
+            "backoff_ms": d["next_retry_at_ms"] or None,
+            "next_retry_at_ms": next_abs,
+            "claimed_at_ms": d["claimed_at_ms"],
+            "last_error": d["last_error"],
+            "dead_letter_reason": d["dead_letter_reason"],
+            "confirmed_at_ms": d["confirmed_at_ms"],
+            "replayed": replayed,
+            "notification": {
+                "event_type": payload["event_type"],
+                "object_id": payload["object_id"],
+                "summary": payload["summary"],
+                "wall_ms": payload["wall_ms"],
+            },
+            "signature": d["signature"],
+            "created_at_ms": d["created_at_ms"],
+            "updated_at_ms": d["updated_at_ms"],
+        }
+
+
+# ---------------------------------------------------------------------------
+# 小工具
+# ---------------------------------------------------------------------------
+
+
+def store_db_path(store: Any) -> str:
+    """从 Store 连接反查数据库文件路径（独立连接复用同一 WAL 库）。"""
+    row = store._conn.execute(  # noqa: SLF001
+        "PRAGMA database_list").fetchone()  # noqa: SLF001
+    return row[2]
+
+
+def require_value(value: Any, name: str) -> str:
+    if value in (None, ""):
+        raise AuditBadRequest(f"缺少必填参数: {name}")
+    return value
+
+
+def _as_int(value, name: str, *, default=None):
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise AuditBadRequest(f"参数 {name} 必须是整数", **{name: value})
+
+
+def _bounded_limit(value) -> int:
+    limit = _as_int(value, "limit", default=100)
+    if limit < 1:
+        raise AuditBadRequest("limit 必须 >= 1", limit=limit)
+    return min(limit, 1000)

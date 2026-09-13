@@ -226,3 +226,81 @@ curl -s -o /tmp/e3.json -w "   空时间窗口:       HTTP %{http_code}\n" \
 cat /tmp/e3.json | python3 -c "import sys,json;print('    ->',json.load(sys.stdin)['error'])"
 echo
 echo "演练完成。所有审计接口均为只读，未改动上面运行中的任何租约与委托。"
+
+# ---------------------------------------------------------------------------
+# 23. 审计变更订阅与可靠通知（失败 -> 退避重试 -> 死信 -> 重新放回）
+# ---------------------------------------------------------------------------
+echo
+echo "== 23. 审计变更订阅 =="
+SUB=$(curl -s -X POST "$BASE/audit/subscriptions" -H 'Content-Type: application/json' \
+  -d "{\"scope\":\"resource\",\"resource\":\"$R\",\"callback_url\":\"http://127.0.0.1:9/never-listens\",\"start_seq\":0,\"idempotency_key\":\"demo-sub-$R\",\"max_attempts\":3}")
+SID=$(echo "$SUB" | j "['subscription_id']")
+echo "   订阅 $SID（回调指向不可达地址，演练失败重试）"
+echo "   同幂等键重复提交 -> 同一订阅："
+curl -s -X POST "$BASE/audit/subscriptions" -H 'Content-Type: application/json' \
+  -d "{\"scope\":\"resource\",\"resource\":\"$R\",\"callback_url\":\"http://127.0.0.1:9/never-listens\",\"start_seq\":0,\"idempotency_key\":\"demo-sub-$R\"}" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('    subscription_id=%s replayed=%s' % (d['subscription_id'], d['replayed']))"
+echo "   换回调地址用同键 -> 409 显式冲突："
+curl -s -o /tmp/subconflict.json -w "    HTTP %{http_code}\n" -X POST \
+  "$BASE/audit/subscriptions" -H 'Content-Type: application/json' \
+  -d "{\"scope\":\"resource\",\"resource\":\"$R\",\"callback_url\":\"http://other/\",\"start_seq\":0,\"idempotency_key\":\"demo-sub-$R\"}"
+python3 -c "import json;d=json.load(open('/tmp/subconflict.json'));print('    ->',d['error'],'首个差异:',d['first_difference']['path'])"
+
+echo "   扫描入队 + 三轮投递（连接失败，尝试次数递增，第三轮达上限进死信）："
+# 先扫描入队，再取队首事件序号；随后用手动重试接口忽略退避推进三轮，
+# 避免拨墙钟影响前面演练产生的短 TTL 租约
+curl -s -X POST "$BASE/audit/subscriptions/process" -d '{}' >/dev/null
+FIRST_SEQ=$(curl -s "$BASE/audit/subscriptions/$SID/deliveries?limit=1" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['deliveries'][0]['event_seq'])")
+# 首轮已在上面投递（attempts=1）；再推进两轮：重试 -> 投递 -> 重试 -> 投递
+curl -s -X POST "$BASE/audit/subscriptions/$SID/deliveries/$FIRST_SEQ/retry" \
+  -d '{}' >/dev/null
+curl -s -X POST "$BASE/audit/subscriptions/process" -d '{}' >/dev/null
+curl -s -X POST "$BASE/audit/subscriptions/$SID/deliveries/$FIRST_SEQ/retry" \
+  -d '{}' >/dev/null
+curl -s -X POST "$BASE/audit/subscriptions/process" -d '{}' >/dev/null
+curl -s "$BASE/audit/subscriptions/$SID/deliveries/$FIRST_SEQ" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('    队首事件 seq=%s 状态=%s 尝试=%s 死信原因=%s' % (
+    d['event_seq'], d['status'], d['attempts'], d['dead_letter_reason']))
+n=d['notification']
+print('    通知字段: event_type=%s object_id=%s 订阅序号=%s' % (
+    n['event_type'], n['object_id'], d['subscription_seq']))
+print('    内容摘要 digest=%s...' % n['summary']['digest_sha256'][:16])
+print('    签名=%s...' % (d['signature'] or '')[:16])
+print('    最近错误:', d['last_error'])
+"
+echo "   死信列表（含失败原因）："
+curl -s "$BASE/audit/subscriptions/dead-letters?subscription_id=$SID" | python3 -c "
+import sys,json
+for d in json.load(sys.stdin)['dead_letters']:
+    print('    seq=%s 原因=%s 最近错误=%s' % (d['event_seq'], d['dead_letter_reason'], d['last_error']))
+"
+echo "   死信挡住后续事件，订阅 blocked=true："
+curl -s "$BASE/audit/subscriptions/$SID" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('    status=%s blocked=%s 计数=%s' % (d['status'], d['blocked'], d['counters']))
+"
+echo "   死信重新放回队列（清空尝试次数；回调仍不可达会再次失败）："
+curl -s -X POST "$BASE/audit/subscriptions/$SID/dead-letters/$FIRST_SEQ/requeue" -d '{}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('    -> status=%s attempts=%s' % (d['status'],d['attempts']))"
+echo "   暂停订阅 -> 处理一轮不投递；恢复："
+curl -s -X POST "$BASE/audit/subscriptions/$SID/pause" -d '{}' \
+  | python3 -c "import sys,json;print('    status =',json.load(sys.stdin)['status'])"
+curl -s -X POST "$BASE/audit/subscriptions/process" -d '{}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('    暂停中处理一轮: enqueued=%s delivered=%s' % (d['enqueued'],d['delivered']))"
+curl -s -X POST "$BASE/audit/subscriptions/$SID/resume" -d '{}' \
+  | python3 -c "import sys,json;print('    status =',json.load(sys.stdin)['status'])"
+echo "   取消订阅（迟到通知不再发送；投递历史保留）："
+curl -s -X POST "$BASE/audit/subscriptions/$SID/cancel" -d '{}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('    status =',d['status'],' 投递计数 =',d['counters'])"
+curl -s "$BASE/audit/subscriptions/$SID/deliveries?limit=1000" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('    投递历史保留 %d 行，状态分布:' % len(d['deliveries']))
+from collections import Counter
+print('   ', dict(Counter(x['status'] for x in d['deliveries'])))
+"
+echo "订阅流程只写自有表：源审计历史、租约、委托、索引、归档、证据包、发布计划均不被改写。"
