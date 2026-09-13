@@ -403,15 +403,19 @@ POST /audit/evidence
 1. 证据包文档与保存的总校验值一致（文档未被改动）；
 2. 组合摘要可由各收录载荷按组合顺序独立重算得到，且顺序与清单一致；
 3. 清单完整：位置是连续的 0..N-1，文档条目与冻结载荷表逐条一致；
-4. 每个位置的**源归档存在**、源归档当前**内容哈希**与冻结的
-   `source_sha256` 一致、内嵌原文与源当前内容逐字段一致（reference 模式
-   则核对稳定引用的定位信息）、内嵌原文自身的内容校验值可独立复算。
+4. 每个位置的**源归档存在**、**源归档自身的独立核验未失败**
+   （源归档处于 `verify_failed` 时其内容已不可信，证据包直接判失败）、
+   源归档当前**内容哈希**与冻结的 `source_sha256` 一致、内嵌原文与源
+   当前内容逐字段一致（reference 模式则核对稳定引用的定位信息）、内嵌
+   原文自身的内容校验值可独立复算。
 
 任一失败即标记 `verify_failed`，`verify_detail` / 响应的
 `first_divergence` 给出**首个差异的归档标识**（`archive_id`）、
 **字段路径**（如 `sources[1].source_sha256`）、位置与**双方值**
 （`archived` / `recomputed`，缺失显示 `<missing>`），例如源归档被删除、
-源内容哈希被改、下载文档被篡改、冻结载荷被伪造、组合顺序被重排。
+源归档自身核验失败（`sources[i].verify_status`，并附
+`source_first_divergence` 指出该归档内的首个差异位置）、源内容哈希被改、
+下载文档被篡改、冻结载荷被伪造、组合顺序被重排。
 全部通过则标记 `verified`。
 
 | 场景 | 状态码 | error |
@@ -477,7 +481,7 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 | GET | `/audit/evidence` | 列证据包（`?status=&archive_id=&limit=`） |
 | GET | `/audit/evidence/<id>` | **查证据包进度**：状态、已冻结/总条目数、组合摘要、总校验值、核验标记 |
 | GET | `/audit/evidence/<id>/download` | **下载证据包文档**（清单+原文/稳定引用+组合摘要+总校验值；未完成 409） |
-| POST | `/audit/evidence/<id>/verify` | **独立核验**：逐份检查源归档存在性/内容哈希/原文与组合顺序完整性，失败给出首个差异的归档标识、字段路径与双方值 |
+| POST | `/audit/evidence/<id>/verify` | **独立核验**：逐份检查源归档存在性/自身核验可信/内容哈希/原文与组合顺序完整性，失败给出首个差异的归档标识、字段路径与双方值 |
 | POST | `/audit/evidence/<id>/retry` | 手动复位 `failed` 证据包，从已保存进度继续（非 failed 409） |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |

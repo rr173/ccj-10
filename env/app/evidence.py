@@ -43,8 +43,11 @@
 
 独立核验（verified / verify_failed）
 ====================================
-逐份检查：源归档是否存在、源归档内容哈希是否与冻结的 source_sha256 一致、
-冻结载荷是否与源内容一致、组合顺序是否完整，并重算组合摘要与总校验值。
+逐份检查：源归档是否存在、**源归档自身的独立核验是否通过
+（verify_failed 的源归档内容已不可信，证据包必须直接判失败，
+并给出该归档与其首个差异位置）**、源归档内容哈希是否与冻结的
+source_sha256 一致、冻结载荷是否与源内容一致、组合顺序是否完整，
+并重算组合摘要与总校验值。
 任一失败给出**首个差异**的归档标识（archive_id）、字段路径（path）
 与双方值（archived / recomputed）。
 
@@ -829,8 +832,10 @@ class EvidencePackageManager:
         1. 证据包文档与保存的总校验值一致（文档未被改动）；
         2. 组合摘要可由冻结条目按组合顺序独立重算得到；
         3. 清单/顺序/长度完整，且冻结载荷表与文档逐条一致；
-        4. 逐份检查源归档：存在、源内容哈希 = 冻结的 source_sha256、
-           冻结载荷与源内容一致、内嵌原文可独立通过内容哈希自洽校验。
+        4. 逐份检查源归档：存在、源归档自身核验未失败（不能引用
+           verify_failed 的不可信归档）、源内容哈希 = 冻结的
+           source_sha256、冻结载荷与源内容一致、内嵌原文可独立通过
+           内容哈希自洽校验。
         只写 evidence_packages 自有表，绝不触碰源归档/租约/委托/历史。
         """
         store = self._store
@@ -1016,7 +1021,7 @@ class EvidencePackageManager:
         return None
 
     def _check_sources(self, conn, content) -> dict | None:
-        """逐份检查源归档：存在性、内容哈希一致、原文/引用一致。"""
+        """逐份检查源归档：存在性、自身核验可信、内容哈希一致、原文/引用一致。"""
         for i, (m, payload) in enumerate(zip(content["manifest"],
                                              content["sources"])):
             aid = m["archive_id"]
@@ -1032,7 +1037,31 @@ class EvidencePackageManager:
                     "archived": aid, "recomputed": _MISSING,
                     "message": f"第 {i} 份源归档 {aid} 已不存在",
                 }
-            # 2) 源归档当前内容哈希必须与冻结时钉死的 source_sha256 一致
+            # 2) 源归档自身的独立核验必须通过：处于 verify_failed 的归档
+            # 内容已被判定为不可信（冻结副本与原始审计历史/派生内容出现
+            # 差异），证据包绝不能把不可信内容判为通过。差异位置直接给出
+            # 源归档核验记录的首个差异，便于定位到具体分叉字段。
+            if source["verify_status"] == VERIFY_FAILED:
+                source_detail = None
+                if source["verify_detail"]:
+                    try:
+                        source_detail = json.loads(source["verify_detail"])
+                    except (TypeError, ValueError):
+                        source_detail = None
+                first_path = (source_detail or {}).get("path")
+                return {
+                    "section": "sources",
+                    "path": f"sources[{i}].verify_status",
+                    "position": i, "archive_id": aid,
+                    "archived": VERIFY_VERIFIED,
+                    "recomputed": VERIFY_FAILED,
+                    "source_verify_status": VERIFY_FAILED,
+                    "source_first_divergence": source_detail,
+                    "message": f"源归档 {aid} 的独立核验已失败（verify_failed"
+                               f"{('，首个差异位于 ' + first_path) if first_path else ''}），"
+                               "其内容不可信，证据包核验不得通过",
+                }
+            # 3) 源归档当前内容哈希必须与冻结时钉死的 source_sha256 一致
             if source["content_sha256"] != m["source_sha256"]:
                 return {
                     "section": "sources",
@@ -1043,7 +1072,7 @@ class EvidencePackageManager:
                     "message": f"源归档 {aid} 的内容哈希与证据包冻结值不一致"
                                "（源归档可能被改动）",
                 }
-            # 3) 收录方式与载荷自洽
+            # 4) 收录方式与载荷自洽
             if payload.get("include_mode") != m["include_mode"]:
                 return {
                     "section": "sources",

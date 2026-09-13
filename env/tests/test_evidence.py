@@ -700,6 +700,90 @@ def test_tampered_source_during_generation_fails_package(client):
 
 
 # ---------------------------------------------------------------------------
+# 独立核验：源归档自身核验失败（verify_failed）绝不能把证据包判为通过
+# ---------------------------------------------------------------------------
+
+def _fail_source_archive(client, aid, *, seq=None):
+    """删改一条原始审计历史事件，让源归档的独立核验落到 verify_failed。"""
+    conn = sqlite3.connect(db_path(client))
+    if seq is None:
+        row = conn.execute(
+            "SELECT seq FROM lease_events ORDER BY seq ASC LIMIT 1").fetchone()
+        seq = row[0]
+    conn.execute(
+        "UPDATE lease_events SET holder='forged-holder' WHERE seq=?", (seq,))
+    conn.commit()
+    conn.close()
+    body = client.post(f"/audit/archives/{aid}/verify").get_json()
+    assert body["verify_status"] == "verify_failed", body
+    return body["first_divergence"]
+
+
+def test_verify_fails_when_source_archive_is_verify_failed(client):
+    res_aid, cred_aid, _ = make_archives(client, "ev-vsrcfail")
+    rv = create_package(client, [res_aid, cred_aid], "vsrcfail-k")
+    pid = rv.get_json()["package_id"]
+    finish(client, pid)
+    # 先证明确实曾经可以核验通过
+    assert client.post(f"/audit/evidence/{pid}/verify").get_json()[
+        "verify_status"] == "verified"
+
+    # 源归档（cred）自身独立核验失败：证据包核验必须失败
+    src_div = _fail_source_archive(client, cred_aid)
+
+    body = client.post(f"/audit/evidence/{pid}/verify").get_json()
+    assert body["verify_status"] == "verify_failed"
+    div = body["first_divergence"]
+    assert div["section"] == "sources"
+    assert div["archive_id"] == cred_aid
+    assert div["position"] == 1
+    assert div["path"] == "sources[1].verify_status"
+    assert div["archived"] == "verified"
+    assert div["recomputed"] == "verify_failed"
+    # 指出源归档自身的首个差异位置，便于定位不可信内容
+    assert div["source_first_divergence"]["path"] == src_div["path"]
+    # 失败结果持久化在证据包上（重启不丢）
+    st = client.get(f"/audit/evidence/{pid}").get_json()
+    assert st["verify_status"] == "verify_failed"
+    assert st["verify_detail"]["archive_id"] == cred_aid
+    assert st["verify_detail"]["source_first_divergence"]["path"] == \
+        src_div["path"]
+
+
+def test_verify_first_failed_source_is_reported_by_position(client):
+    res_aid, cred_aid, _ = make_archives(client, "ev-vsrcorder")
+    # 顺序 [res, cred]：让第 0 份（res）核验失败，首个差异必须落在 position 0，
+    # 而不是后面的任何位置
+    _fail_source_archive(client, res_aid)
+    rv = create_package(client, [res_aid, cred_aid], "vsrcorder-k")
+    pid = rv.get_json()["package_id"]
+    finish(client, pid)
+    body = client.post(f"/audit/evidence/{pid}/verify").get_json()
+    assert body["verify_status"] == "verify_failed"
+    div = body["first_divergence"]
+    assert div["position"] == 0
+    assert div["archive_id"] == res_aid
+    assert div["path"] == "sources[0].verify_status"
+
+
+def test_verify_failed_source_blocks_reference_mode_too(client):
+    res_aid, cred_aid, _ = make_archives(client, "ev-vsrcref")
+    _fail_source_archive(client, res_aid)
+    rv = create_package(
+        client,
+        [{"archive_id": res_aid, "include": "reference"}, cred_aid],
+        "vsrcref-k")
+    pid = rv.get_json()["package_id"]
+    finish(client, pid)
+    body = client.post(f"/audit/evidence/{pid}/verify").get_json()
+    assert body["verify_status"] == "verify_failed"
+    div = body["first_divergence"]
+    assert div["archive_id"] == res_aid
+    assert div["position"] == 0
+    assert div["path"] == "sources[0].verify_status"
+
+
+# ---------------------------------------------------------------------------
 # 独立核验：源归档丢失/被改、下载后篡改
 # ---------------------------------------------------------------------------
 

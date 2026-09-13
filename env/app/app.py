@@ -58,7 +58,9 @@
   GET    /audit/evidence/<id>/download          下载证据包文档（清单+原文/引用+
                                                 组合摘要+总校验值；未完成 409）
   POST   /audit/evidence/<id>/verify            独立核验：逐份检查源归档存在性/
-                                                内容哈希/原文与组合顺序完整性，
+                                                自身核验可信（verify_failed 的
+                                                源归档直接判失败）/内容哈希/
+                                                原文与组合顺序完整性，
                                                 失败给出首个差异位置
   POST   /audit/evidence/<id>/retry             失败的证据包复位重试（从已存进度继续）
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
@@ -531,8 +533,9 @@ def create_app(
 
     @app.post("/audit/evidence/<package_id>/verify")
     def evidence_verify(package_id):
-        # 独立核验：逐份检查源归档存在性/内容哈希/原文与组合顺序完整性，
-        # 通过标记 verified，失败标记 verify_failed 并给出首个差异位置
+        # 独立核验：逐份检查源归档存在性/自身核验可信/内容哈希/原文与
+        # 组合顺序完整性，通过标记 verified，失败标记 verify_failed 并给出
+        # 首个差异位置
         return jsonify(evidence.verify(package_id))
 
     @app.post("/audit/evidence/<package_id>/retry")
