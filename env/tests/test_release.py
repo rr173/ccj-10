@@ -303,6 +303,34 @@ def test_same_key_different_compare_target_conflicts(client):
         "compare_with_index_id"
 
 
+def test_same_key_missing_index_still_conflicts_not_404(client):
+    """同键重试把索引标识改成不存在的值：幂等比对先于存在性校验，
+    必须返回 409 release_id_conflict 并保留原计划标识，而不是 404。"""
+    a, _ = two_indexes(client)
+    rid = register_immediate(client, a, "v1", "k").get_json()["release_id"]
+    rv = register_immediate(client, "missing-index", "v1", "k")
+    assert rv.status_code == 409
+    body = rv.get_json()
+    assert body["error"] == "release_id_conflict"
+    assert body["release_id"] == rid
+    diff = body["first_difference"]
+    assert diff["path"] == "index_id"
+    assert diff["existing"] == a
+    assert diff["requested"] == "missing-index"
+    # 比较对象改成不存在的值同理：首个差异落在 compare_with_index_id
+    b, _ = two_indexes(client, resource="r2")
+    register_immediate(client, b, "v2", "k2")
+    rv = register_immediate(client, b, "v2", "k2",
+                            compare_with_index_id="missing")
+    assert rv.status_code == 409
+    body = rv.get_json()
+    assert body["error"] == "release_id_conflict"
+    assert body["first_difference"]["path"] == "compare_with_index_id"
+    # 原计划的标识与冻结视图不因冲突请求而改变
+    j = client.get(f"/audit/index-releases/{rid}").get_json()
+    assert j["index_id"] == a and j["version"] == "v1"
+
+
 def test_same_version_different_key_conflicts_forever(client):
     a, b = two_indexes(client)
     register_immediate(client, a, "v1", "k1")

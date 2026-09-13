@@ -37,7 +37,9 @@
 - 相同版本号 + 相同幂等键：重复登记只返回同一计划（200 + ``replayed``），
   计划状态（active/cancelled/failed）也原样返回；
 - 同一幂等键换索引、换生效时间或换比较对象 → 409
-  ``release_id_conflict``，``first_difference`` 给出首个差异字段与双方值；
+  ``release_id_conflict``，``first_difference`` 给出首个差异字段与双方值。
+  幂等键比对先于索引存在性/完成态校验：重试把索引标识改成不存在的值
+  时同样返回 409 并保留原计划标识，索引不存在（404）不改变冲突语义；
 - 版本号已被别的幂等键占用 → 409 ``release_version_conflict``。
   版本别名一旦登记永不复用（已取消/已失败也不能重新登记同名版本）。
 
@@ -318,6 +320,39 @@ class IndexReleaseManager:
             # 状态，而不是登记瞬间的 scheduled 快照
             self._sweep_due_locked(conn)
 
+            # 幂等键先行：同键即回放或显式冲突。规格比对必须先于发布对象
+            # 的存在性/完成态校验——重试若把索引标识改成不存在的值，也必须
+            # 按首次登记的规格判定冲突（409 release_id_conflict，保留原
+            # 计划标识），不能让"索引不存在"（404）改变冲突语义
+            prev = conn.execute(
+                "SELECT * FROM index_releases WHERE idempotency_key=?",
+                (key,)).fetchone()
+            if prev is not None:
+                diff = self._first_spec_diff(
+                    prev, version, index_id, effective_at, compare_id)
+                # 标量规格一致且带比较对象：比较结果摘要也必须仍与首次
+                # 登记一致（比较对象在两次登记间被改动时同键也必须显式
+                # 冲突，绝不静默换成另一份比较结果）。摘要需重算比较，
+                # 只在标量一致后核对
+                if diff is None and compare_id \
+                        and prev["compare_digest"] is not None:
+                    current = self._full_comparison_locked(
+                        conn, index_id, compare_id)
+                    if prev["compare_digest"] != current["_digest"]:
+                        diff = {"path": "compare_digest",
+                                "field": "compare_digest",
+                                "existing": prev["compare_digest"],
+                                "requested": current["_digest"]}
+                if diff is None:
+                    return self._view(prev), False
+                raise ReleaseIdConflict(
+                    f"幂等键 {key} 已用于发布计划 {prev['release_id']}"
+                    f"（版本 {prev['version']}），本次请求与首次登记不"
+                    f"一致：首个差异位于 {diff['path']}",
+                    release_id=prev["release_id"],
+                    existing_version=prev["version"],
+                    first_difference=diff)
+
             # 发布对象必须存在且已完成（登记即要求，延迟期间其变化在发布时
             # 再复核；比较对象同此规则，登记时也必须已完成）
             index_row = conn.execute(
@@ -342,24 +377,6 @@ class IndexReleaseManager:
                 compare_digest = comparison["_digest"]
 
             now = store.clock.wall_ms()
-
-            # 幂等键先行：同键即回放或显式冲突
-            prev = conn.execute(
-                "SELECT * FROM index_releases WHERE idempotency_key=?",
-                (key,)).fetchone()
-            if prev is not None:
-                diff = self._first_spec_diff(
-                    prev, version, index_id, effective_at, compare_id,
-                    compare_digest)
-                if diff is None:
-                    return self._view(prev), False
-                raise ReleaseIdConflict(
-                    f"幂等键 {key} 已用于发布计划 {prev['release_id']}"
-                    f"（版本 {prev['version']}），本次请求与首次登记不"
-                    f"一致：首个差异位于 {diff['path']}",
-                    release_id=prev["release_id"],
-                    existing_version=prev["version"],
-                    first_difference=diff)
 
             # 版本别名全局唯一：换索引/换生效时间/换比较对象必须明确冲突，
             # 已取消/已失败的版本号也不能再分配
@@ -419,8 +436,13 @@ class IndexReleaseManager:
 
     @staticmethod
     def _first_spec_diff(prev, version, index_id, effective_at,
-                         compare_id, compare_digest) -> dict | None:
-        """比较登记规格，返回首个差异字段（路径/双方值）。"""
+                         compare_id) -> dict | None:
+        """比较登记规格的标量字段，返回首个差异字段（路径/双方值）。
+
+        只比对请求报文直接给出的字段，不访问索引现态：同键重试即使指向
+        不存在的索引，也必须在此显式冲突。比较结果摘要（compare_digest）
+        需重算比较才能核对，由调用方在标量一致后补充。
+        """
         checks = [
             ("version", prev["version"], version),
             ("index_id", prev["index_id"], index_id),
@@ -432,13 +454,6 @@ class IndexReleaseManager:
             if old != new:
                 return {"path": field, "field": field,
                         "existing": old, "requested": new}
-        # 比较对象相同但其冻结结果与首次登记不同（比较对象在两次登记间被
-        # 改动）：同键也必须显式冲突，绝不静默换成另一份比较结果
-        if compare_id and prev["compare_digest"] is not None \
-                and prev["compare_digest"] != compare_digest:
-            return {"path": "compare_digest", "field": "compare_digest",
-                    "existing": prev["compare_digest"],
-                    "requested": compare_digest}
         return None
 
     def _full_comparison_locked(self, conn, a_index_id: str,
