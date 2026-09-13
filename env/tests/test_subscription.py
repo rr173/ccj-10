@@ -319,6 +319,33 @@ def test_filter_outcome_rejected(client, cb):
     assert cb.calls[0]["payload"]["summary"]["outcome"] == "rejected"
 
 
+def test_filter_applies_to_events_arriving_after_create(client, cb):
+    """创建时历史里只有 acquire；write 在订阅创建后才落库。
+
+    过滤条件同样只让后来到达的匹配事件进入投递队列：acquire 既不产生
+    投递记录也不发给回调，订阅序号对匹配事件从 1 连续编号。
+    """
+    lease = acquire(client, "r1")  # 创建前唯一的历史事件：acquire
+    sub = create_sub(client, key="k-f4",
+                     filters={"event_types": ["write"]})
+    sid = sub["subscription_id"]
+    tick_process(client)
+    assert cb.calls == []  # acquire 不匹配，只推进游标
+
+    write_ok(client, "r1", generation=lease["generation"], value="a")
+    write_ok(client, "r1", generation=lease["generation"], value="b")
+    for _ in range(2):
+        tick_process(client)
+
+    assert [c["payload"]["event_type"] for c in cb.calls] == ["write", "write"]
+    assert [c["payload"]["subscription_seq"] for c in cb.calls] == [1, 2]
+    # 投递队列里只有 write 行：acquire 从未入队
+    rv = client.get(f"/audit/subscriptions/{sid}/deliveries?limit=10")
+    rows = rv.get_json()["deliveries"]
+    assert [d["notification"]["event_type"] for d in rows] == ["write", "write"]
+    assert [d["subscription_seq"] for d in rows] == [1, 2]
+
+
 # ---------------------------------------------------------------------------
 # 4. 重复确认 / 错误签名
 # ---------------------------------------------------------------------------
