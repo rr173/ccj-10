@@ -91,6 +91,38 @@
                                                 verified / 失败 verify_failed
                                                 （给出首个差异节点/字段/双方值）
   POST   /audit/causal-indexes/<id>/retry       失败的索引复位重试（从已存进度继续）
+因果索引增量派生（只写 causal_derivation_* 自有表，绝不修改原索引/租约/
+委托/原始历史/源归档/证据包；派生链复用基线冻结节点，只重建新增节点）：
+  POST   /audit/causal-derivations              以已完成索引为基线提交增量派生
+                                                {baseline_index_id,
+                                                 at_seq?|at_wall_ms?|head?
+                                                 （缺省 head）,
+                                                 filters?（缺省沿用基线）,
+                                                 idempotency_key}
+                                                同基线+同节点+同过滤+同键 →
+                                                同一份（200 回放）；同键换
+                                                基线/节点/过滤 409；同规格换键
+                                                409；基线不存在 404 / 未完成 409
+  GET    /audit/causal-derivations              列派生任务（?status&baseline_index_id）
+  GET    /audit/causal-derivations/<id>         查进度/状态/基线快照与链摘要/
+                                                复用·新增·移除节点计数
+  GET    /audit/causal-derivations/<id>/chain   按因果顺序分页查询派生链
+                                                （?after=<position>&limit=；
+                                                节点带 origin=reused/added；
+                                                报告结构异常/源漂移/基线漂移）
+  GET    /audit/causal-derivations/<id>/nodes/<node_id>
+                                                查单个冻结节点（含其基线位置）
+  GET    /audit/causal-derivations/<id>/download 下载冻结的派生链文档
+  POST   /audit/causal-derivations/<id>/verify  独立核验（总校验值/基线链摘要/
+                                                源/成员集合/复用与新增载荷/链摘要）
+  POST   /audit/causal-derivations/<id>/retry   failed 复位重试（进度保留）
+  POST   /audit/causal-derivations/<id>/pause   暂停（worker 跳过；幂等）
+  POST   /audit/causal-derivations/<id>/resume  暂停后恢复（回到待跑队列）
+  POST   /audit/causal-indexes/comparisons      比较两份已完成索引（纯只读）：
+                                                {a_index_id, b_index_id,
+                                                 after?, limit?} → 共同节点、
+                                                首个分叉、增删节点、逐字段变化
+                                                （每项带节点标识与双方值）
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
   POST   /debug/tick           手动推进逻辑钟
   POST   /debug/wall-shift     拨墙钟（可正可负）
@@ -131,6 +163,17 @@ from .causal import (
     CausalNotFound,
     CausalNotReady,
     CausalSourceNotFound,
+)
+from .derivation import (
+    DerivationBadState,
+    DerivationBaselineNotFound,
+    DerivationBaselineNotReady,
+    DerivationIdConflict,
+    DerivationManager,
+    DerivationNotFound,
+    DerivationNotReady,
+    DerivationSourceChanged,
+    DerivationSpecConflict,
 )
 from .audit import (
     AuditBadRequest,
@@ -192,6 +235,12 @@ def create_app(
     causal = CausalIndexManager(
         store, audit, chunk_size=_env_int("CAUSAL_CHUNK_SIZE", 100))
     app.extensions["causal"] = causal
+    # 因果索引增量派生与索引差异比较：派生只写 causal_derivation_* 自有表，
+    # 比较纯只读
+    derivation = DerivationManager(
+        store, audit, causal,
+        chunk_size=_env_int("CAUSAL_DERIVATION_CHUNK_SIZE", 100))
+    app.extensions["derivation"] = derivation
     if enable_debug_api is None:
         enable_debug_api = os.environ.get("ENABLE_DEBUG_API", "1") == "1"
 
@@ -662,6 +711,105 @@ def create_app(
         return jsonify(causal.retry(index_id))
 
     # ------------------------------------------------------------------
+    # 因果索引增量派生
+    #
+    # 以一份已完成的因果索引为基线，在新冻结快照上增量派生新链。创建时
+    # 冻结新的 snapshot_seq/范围/过滤，并原样保留基线快照信息与链摘要；
+    # 复用节点的载荷复制自基线冻结副本（生成期间源数据再变化也污染不了
+    # 派生链），只重建基线快照之后新增的事件/源归档/证据包条目节点。
+    # 支持创建进度、暂停/恢复、失败重试与稳定查询；只写 causal_derivation_*
+    # 自有表，绝不修改原索引、租约、委托、审计历史、源归档或证据包。
+    # ------------------------------------------------------------------
+    @app.post("/audit/causal-derivations")
+    def derivation_create():
+        data = body()
+        view, created = derivation.create_derivation(
+            baseline_index_id=data.get("baseline_index_id"),
+            scope=data.get("scope"),
+            resource=data.get("resource"),
+            credential_id=data.get("credential_id"),
+            package_id=data.get("package_id"),
+            at_seq=data.get("at_seq"),
+            at_wall_ms=data.get("at_wall_ms"),
+            head=bool(data.get("head", False)),
+            filters=data.get("filters"),
+            idempotency_key=data.get("idempotency_key"),
+        )
+        # 同基线+同范围+同快照节点+同过滤+同键：200 回放同一个派生任务
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/causal-derivations")
+    def derivation_list():
+        return jsonify(derivation.list_derivations(
+            status=request.args.get("status"),
+            baseline_index_id=request.args.get("baseline_index_id"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/causal-derivations/<derivation_id>")
+    def derivation_status(derivation_id):
+        return jsonify(derivation.get_derivation(derivation_id))
+
+    @app.get("/audit/causal-derivations/<derivation_id>/chain")
+    def derivation_chain(derivation_id):
+        return jsonify(derivation.get_chain(
+            derivation_id,
+            after=request.args.get("after"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/causal-derivations/<derivation_id>/nodes/<node_id>")
+    def derivation_node(derivation_id, node_id):
+        return jsonify(
+            derivation.get_frozen_node(derivation_id, node_id))
+
+    @app.get("/audit/causal-derivations/<derivation_id>/download")
+    def derivation_download(derivation_id):
+        text, view = derivation.download(derivation_id)
+        return Response(
+            text, mimetype="application/json",
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="audit-causal-derivation-'
+                    f'{derivation_id}.json"',
+                "X-Derivation-SHA256": view["content_sha256"] or "",
+                "X-Derivation-Chain-Digest": view["chain_digest"] or "",
+            },
+        )
+
+    @app.post("/audit/causal-derivations/<derivation_id>/verify")
+    def derivation_verify(derivation_id):
+        return jsonify(derivation.verify(derivation_id))
+
+    @app.post("/audit/causal-derivations/<derivation_id>/retry")
+    def derivation_retry(derivation_id):
+        # failed -> pending，从已保存进度继续
+        return jsonify(derivation.retry(derivation_id))
+
+    @app.post("/audit/causal-derivations/<derivation_id>/pause")
+    def derivation_pause(derivation_id):
+        return jsonify(derivation.pause(derivation_id))
+
+    @app.post("/audit/causal-derivations/<derivation_id>/resume")
+    def derivation_resume(derivation_id):
+        return jsonify(derivation.resume(derivation_id))
+
+    # ------------------------------------------------------------------
+    # 已完成因果索引的差异比较（纯只读，不写任何表）：
+    # 共同节点、首个分叉节点、增删节点与逐字段变化（节点标识+双方值）
+    # ------------------------------------------------------------------
+    @app.post("/audit/causal-indexes/comparisons")
+    def causal_compare():
+        data = body()
+        return jsonify(derivation.compare_indexes(
+            require(data, "a_index_id"),
+            require(data, "b_index_id"),
+            after=data.get("after"),
+            limit=data.get("limit", 100),
+        ))
+
+    # ------------------------------------------------------------------
     # 调试：手动驱动两种时钟，演练"拨表/逻辑卡死"故障
     # ------------------------------------------------------------------
     @app.post("/debug/tick")
@@ -733,6 +881,19 @@ def create_app(
         # 同键换范围/节点/过滤冲突 409、状态不允许 409
         return jsonify(exc.to_response()), exc.status
 
+    @app.errorhandler(DerivationNotFound)
+    @app.errorhandler(DerivationBaselineNotFound)
+    @app.errorhandler(DerivationNotReady)
+    @app.errorhandler(DerivationBaselineNotReady)
+    @app.errorhandler(DerivationIdConflict)
+    @app.errorhandler(DerivationSpecConflict)
+    @app.errorhandler(DerivationBadState)
+    @app.errorhandler(DerivationSourceChanged)
+    def _derivation_error(exc):
+        # 增量派生显式错误：派生/基线不存在 404、未完成 409、幂等/规格冲突
+        # 409、暂停/恢复/重试状态不允许 409、新增节点的源被篡改 409
+        return jsonify(exc.to_response()), exc.status
+
     @app.errorhandler(GenerationTooSmall)
     def _gen_conflict(exc):
         return jsonify({"error": "generation_fence", "message": str(exc)}), 409
@@ -800,11 +961,16 @@ def create_app(
                 causal.process_pending()
             except Exception:  # noqa: BLE001
                 app.logger.exception("因果索引后台处理失败")
+            try:
+                derivation.process_pending()
+            except Exception:  # noqa: BLE001
+                app.logger.exception("增量派生后台处理失败")
 
     if start_archive_worker:
         archive.process_pending()  # 启动即续跑重启前未完成的归档
         evidence.process_pending()  # 同步续跑未完成的证据包
         causal.process_pending()  # 同步续跑未完成的因果索引
+        derivation.process_pending()  # 同步续跑未完成的增量派生
         t = threading.Thread(target=_run_archive_worker,
                              name="archive-worker", daemon=True)
         t.start()

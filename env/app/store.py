@@ -347,6 +347,90 @@ CREATE TABLE IF NOT EXISTS causal_index_nodes (
 );
 CREATE INDEX IF NOT EXISTS idx_causal_nodes_position
     ON causal_index_nodes(index_id, position);
+-- 因果索引增量派生：以一份**已完成**的因果索引为基线，在新的冻结快照上
+-- 增量派生一条新链。创建时即冻结新的 snapshot_seq / 范围 / 过滤，并把
+-- 基线的快照信息与链摘要原样保留（baseline_* 列）；基线或源数据之后发生
+-- 任何变化都改不动已冻结的派生链。成员分两类：reused（基线中仍有效的
+-- 节点，载荷从基线冻结副本复制，只重盖链环字段）与 added（基线快照之后
+-- 才出现的事件/源归档/证据包条目，从冻结事件与归档清单重建）。
+-- 派生只写本表与 causal_derivation_members / causal_derivation_nodes，
+-- 绝不修改租约、委托、审计历史、源归档、证据包或基线索引。
+-- idempotency_key 全局唯一：同基线+同范围+同过滤+同键只返回同一派生任务；
+-- spec_fingerprint 全局唯一：同基线+同节点+同过滤换键也明确 409。
+CREATE TABLE IF NOT EXISTS causal_derivations (
+    derivation_id           TEXT PRIMARY KEY,
+    idempotency_key         TEXT NOT NULL,
+    spec_fingerprint        TEXT NOT NULL,    -- 基线+范围+节点+过滤的 SHA-256
+    baseline_index_id       TEXT NOT NULL,    -- 基线索引（创建后只读引用）
+    scope                   TEXT NOT NULL,    -- 继承自基线：resource/credential/evidence_package
+    resource                TEXT NOT NULL DEFAULT '',
+    credential_id           TEXT NOT NULL DEFAULT '',
+    package_id              TEXT NOT NULL DEFAULT '',
+    node_seq                INTEGER NOT NULL, -- 新链冻结的历史节点
+    snapshot_seq            INTEGER NOT NULL, -- 创建时新冻结的稳定视图上界
+    filters_json            TEXT NOT NULL,
+    baseline_snapshot_seq   INTEGER NOT NULL, -- 创建时钉死的基线快照上界
+    baseline_node_seq       INTEGER NOT NULL, -- 创建时钉死的基线历史节点
+    baseline_total_nodes    INTEGER NOT NULL, -- 创建时钉死的基线节点总数
+    baseline_chain_digest   TEXT,             -- 创建时钉死的基线链摘要
+    baseline_content_sha256 TEXT,             -- 创建时钉死的基线文档总校验值
+    status                  TEXT NOT NULL DEFAULT 'pending',
+                            -- pending / building / paused / completed / failed
+    total_nodes             INTEGER NOT NULL DEFAULT 0,
+    processed_nodes         INTEGER NOT NULL DEFAULT 0,
+    last_position           INTEGER NOT NULL DEFAULT -1, -- 续跑游标
+    reused_nodes            INTEGER NOT NULL DEFAULT 0,
+    added_nodes             INTEGER NOT NULL DEFAULT 0,
+    removed_nodes           INTEGER NOT NULL DEFAULT 0,
+    attempts                INTEGER NOT NULL DEFAULT 0,
+    error                   TEXT,
+    content                 TEXT,             -- 冻结的派生链文档（JSON）
+    content_sha256          TEXT,
+    chain_digest            TEXT,
+    verify_status           TEXT NOT NULL DEFAULT 'unverified',
+                            -- unverified / verified / verify_failed
+    verify_detail           TEXT,
+    verified_at_ms          INTEGER,
+    created_logical         INTEGER NOT NULL DEFAULT 0,
+    created_at_ms           INTEGER NOT NULL,
+    updated_at_ms           INTEGER NOT NULL,
+    completed_at_ms         INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_derivation_idem
+    ON causal_derivations(idempotency_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_derivation_spec
+    ON causal_derivations(spec_fingerprint);
+-- 派生链的冻结成员集合：创建事务里一次性写入。origin 标 reused/added，
+-- reused 成员另记录其在基线链上的 baseline_position；之后只读。
+CREATE TABLE IF NOT EXISTS causal_derivation_members (
+    derivation_id     TEXT NOT NULL,
+    position          INTEGER NOT NULL,       -- 0 起的新链因果顺序
+    node_id           TEXT NOT NULL,
+    node_type         TEXT NOT NULL,
+    object_id         TEXT NOT NULL,
+    anchor_seq        INTEGER NOT NULL,
+    origin            TEXT NOT NULL,          -- reused / added
+    baseline_position INTEGER,                -- reused：基线链位置；added：NULL
+    descriptor_json   TEXT NOT NULL,
+    PRIMARY KEY (derivation_id, position)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_derivation_member_node
+    ON causal_derivation_members(derivation_id, node_id);
+-- 派生链的冻结节点载荷：reused 节点的载荷体逐字段复制自基线冻结副本，
+-- added 节点由冻结事件/归档清单重建；主键 (derivation_id, node_id) +
+-- INSERT OR IGNORE，中断续跑/失败重试不重复写入。
+CREATE TABLE IF NOT EXISTS causal_derivation_nodes (
+    derivation_id  TEXT NOT NULL,
+    node_id        TEXT NOT NULL,
+    node_type      TEXT NOT NULL,
+    position       INTEGER NOT NULL,
+    origin         TEXT NOT NULL,             -- reused / added
+    payload_sha256 TEXT NOT NULL,
+    payload        TEXT NOT NULL,
+    PRIMARY KEY (derivation_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_derivation_nodes_position
+    ON causal_derivation_nodes(derivation_id, position);
 """
 
 

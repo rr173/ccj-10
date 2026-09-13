@@ -541,6 +541,102 @@ POST /audit/causal-indexes
 | 分页游标越过链末 | 416 | `node_out_of_range` |
 | 非法 scope/过滤/节点选择器、缺幂等键 | 400 | `bad_request` |
 
+## 因果索引增量派生（incremental derivation）
+
+管理员可指定一份**已完成**的因果索引作为基线，在新的冻结快照上提交增量派生
+任务。创建时一次性冻结新的 `snapshot_seq`、范围与过滤条件，并把**基线的快照
+信息**（`baseline.snapshot_seq` / `node_seq` / `total_nodes` /
+`chain_digest` / `content_sha256`）原样保留进派生任务；基线或源数据在生成
+期间发生任何变化都**不能改写已冻结的派生链**。派生只写
+`causal_derivations` / `causal_derivation_members` /
+`causal_derivation_nodes` 三张自有表，比较、派生、查询与重试都**绝不修改原
+索引、租约、委托、审计历史、源归档或证据包**。
+
+```
+POST /audit/causal-derivations
+{"baseline_index_id":"<已完成索引id>", "idempotency_key":"der-1"}   # 缺省 head
+{"baseline_index_id":"...", "at_seq":120,
+ "filters":{"outcomes":["ok"]}, "idempotency_key":"der-2"}
+```
+
+- 作用域与对象（resource / credential / evidence_package）**继承自基线**，
+  显式给出但与基线不一致 → 400；派生历史节点不能早于基线节点（400）；
+  证据包作用域不接受节点选择器与过滤；资源/凭证作用域的过滤缺省沿用基线；
+- 成员集合在创建事务里分类落库：`reused`（基线中仍有效的节点）、`added`
+  （基线快照之后新增的事件/写入/源归档/证据包条目）、基线有而新范围不再包含
+  的计入 `removed`（如过滤变窄）；
+- 复用节点的**载荷体逐字节复制自基线冻结副本**，只重盖 position/prev/next
+  链环字段——基线之后源数据再被改动也污染不了派生链；新增节点由冻结的审计
+  事件与归档清单重建，生成时再次核对源完整性（源归档/证据包条目缺失或内容
+  哈希与冻结描述不一致 → 任务失败并给出双方值，绝不静默收录被掉包内容）。
+
+幂等与冲突：**同基线、同范围、同快照节点、同过滤、同幂等键**重复提交只返回
+同一任务（200 + `replayed`）；同键换基线/快照节点/范围/过滤 → 409
+`causal_derivation_id_conflict`（`first_difference` 给出首个差异字段与双方
+值）；同基线+同节点+同过滤但换幂等键 → 409
+`causal_derivation_spec_conflict`。基线不存在 → 404
+`causal_derivation_baseline_not_found`；基线未完成 → 409
+`causal_derivation_baseline_not_ready`。无新增内容是合法完成态
+（`increment.added_nodes=0`、`has_changes=false`，节点全部 reused）。
+
+### 生成进度、暂停/恢复与失败重试
+
+后台 worker 按块（`CAUSAL_DERIVATION_CHUNK_SIZE`，默认 100）还原节点，每块
+一个事务、进度落库；重启或失败从已保存位置继续，主键
+`(derivation_id, node_id)` + `INSERT OR IGNORE` 保证**重试不重复写入**。
+
+| 操作 | 说明 |
+|---|---|
+| `GET /audit/causal-derivations` | 列派生任务（`?status=&baseline_index_id=&limit=`） |
+| `GET /audit/causal-derivations/<id>` | 进度/状态/基线快照/链摘要/`reused·added·removed` 计数 |
+| `POST .../<id>/pause` | 暂停（pending/building → paused，worker 跳过；幂等） |
+| `POST .../<id>/resume` | 暂停后恢复（paused → pending；已在队列则幂等回放） |
+| `POST .../<id>/retry` | failed 复位为 pending（进度保留；非 failed → 409） |
+| `GET .../<id>/chain` | 按因果顺序分页查询派生链（节点带 `origin=reused/added`；报告结构异常、源漂移与**基线链漂移**） |
+| `GET .../<id>/nodes/<node_id>` | 单个冻结节点（含 `baseline_position`） |
+| `GET .../<id>/download` | 下载冻结派生链文档（含基线/增量段与独立链摘要，未完成 409） |
+| `POST .../<id>/verify` | 独立核验（见下） |
+
+`POST .../<id>/verify` 按序核验：文档总校验值 → **基线仍存在/完成且基线链
+摘要与创建时冻结值一致（基线被篡改在此明确报 `baseline.chain_digest`）** →
+源归档/证据包条目可用且哈希未变 → 成员集合（含 reused/added 分类）可由冻结
+事件/归档清单重算 → 复用节点载荷与基线冻结副本逐字段一致、新增节点可独立
+重建 → 派生链摘要。任一失败标记 `verify_failed`，`first_divergence` 给出
+section/path/node_id 与双方值。
+
+## 已完成索引的差异比较（纯只读）
+
+```
+POST /audit/causal-indexes/comparisons
+{"a_index_id":"<索引A>", "b_index_id":"<索引B>", "after?":-1, "limit?":100}
+```
+
+对任意两份**已完成**索引做无副作用比较（不写任何表）：
+
+- `summary`：共同节点数、A→B 的新增/缺失节点数、逐字段变化数、`identical`；
+- `first_divergence`：按因果位置逐位比对的首个分叉（`changed` 给出双方节点
+  标识；一方链结束则为 `a_ends_b_extends` / `b_ends_a_extends`）；
+- `common_nodes` / `added_nodes`（B 有 A 无）/ `removed_nodes`（A 有 B 无）：
+  每项带 node_id / node_type / seq / 位置；
+- `field_changes`：共同节点的载荷体（不含 position/prev/next 链环字段）逐项
+  叶子差异，**每项都带节点标识、字段路径与双方值**（value_a/value_b），按
+  A 侧因果顺序排序，支持与链查询同语义的位置游标分页（越界 416
+  `node_out_of_range`）；
+- `same_snapshot` 标明双方快照节点是否相同；不同快照/不同作用域也可比较，
+  只是报告差异，不算错误。任一方索引不存在 → 404、未完成 → 409。
+
+| 派生/比较场景 | 状态码 | error |
+|---|---|---|
+| 派生任务不存在 / 节点不在链中 | 404 | `causal_derivation_not_found` |
+| 基线索引不存在 | 404 | `causal_derivation_baseline_not_found` |
+| 基线未完成 / 派生未完成就查询·下载·核验 | 409 | `causal_derivation_baseline_not_ready` / `causal_derivation_not_ready` |
+| 同幂等键换基线/节点/范围/过滤 | 409 | `causal_derivation_id_conflict` |
+| 同规格换幂等键 | 409 | `causal_derivation_spec_conflict` |
+| 暂停/恢复/重试的状态前提不满足 | 409 | `causal_derivation_bad_state` |
+| 新增节点的源缺失或哈希漂移（源被篡改） | 409（任务 failed） | `causal_derivation_source_changed` |
+| 链/字段变化分页游标越过末位 | 416 | `node_out_of_range` |
+| 非法节点选择器/过滤、节点早于基线、缺幂等键 | 400 | `bad_request` |
+
 
 ## 持久性
 
@@ -552,10 +648,14 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 组合摘要、总校验值与核验标记）**、
 **审计因果索引与冻结成员集合/节点载荷（snapshot_seq、范围与过滤、
 因果链摘要、总校验值与核验标记）**、
+**因果索引增量派生任务与冻结成员/节点（基线快照与链摘要、新 snapshot_seq、
+范围与过滤、reused/added/removed 分类、派生链摘要、总校验值与核验标记；
+比较请求不落库）**、
 逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
 正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放，
 **审计回放、节点比较与一致性诊断对同一份历史给出逐字节一致的结果**；
-启动时即按墙钟收割已到期的委托，并自动续跑未完成的归档、证据包与因果索引生成。
+启动时即按墙钟收割已到期的委托，并自动续跑未完成的归档、证据包、因果索引与
+增量派生生成（暂停中的派生任务不会被自动续跑）。
 旧版本数据库会在启动时自动补列迁移。
 逻辑钟由后台 ticker 每秒 +1（每次推进都 fsync 落库）。
 
@@ -607,6 +707,17 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 | GET | `/audit/causal-indexes/<id>/download` | **下载链文档**（全部节点+链摘要+总校验值；未完成 409） |
 | POST | `/audit/causal-indexes/<id>/verify` | **独立核验**：从冻结审计事件与归档清单重算链路，失败给出首个差异节点标识、字段路径与双方值 |
 | POST | `/audit/causal-indexes/<id>/retry` | 手动复位 `failed` 索引，从已保存进度继续（非 failed 409） |
+| POST | `/audit/causal-derivations` | **创建增量派生**：`{baseline_index_id, at_seq?/at_wall_ms?/head?（缺省 head）, filters?（缺省沿用基线）, idempotency_key}`；同基线+同节点+同过滤+同键回放同一任务（200），同键换基线/节点/过滤 409，同规格换键 409；基线不存在 404、未完成 409 |
+| GET | `/audit/causal-derivations` | 列派生任务（`?status=&baseline_index_id=&limit=`） |
+| GET | `/audit/causal-derivations/<id>` | **查派生进度**：状态、已还原/总节点、基线快照与链摘要、复用/新增/移除计数 |
+| GET | `/audit/causal-derivations/<id>/chain` | 按因果顺序分页查询派生链（节点带 `origin=reused/added`；报告结构异常、源漂移与基线链漂移） |
+| GET | `/audit/causal-derivations/<id>/nodes/<node_id>` | 取单个冻结节点（含其基线位置，只读） |
+| GET | `/audit/causal-derivations/<id>/download` | 下载冻结派生链文档（基线/增量段+独立链摘要+总校验值；未完成 409） |
+| POST | `/audit/causal-derivations/<id>/verify` | **独立核验**：总校验值/基线链摘要/源/成员集合/复用与新增载荷/派生链摘要 |
+| POST | `/audit/causal-derivations/<id>/retry` | 手动复位 `failed` 派生任务，从已保存进度继续（非 failed 409） |
+| POST | `/audit/causal-derivations/<id>/pause` | 暂停派生任务（worker 跳过；幂等） |
+| POST | `/audit/causal-derivations/<id>/resume` | 暂停后恢复（paused → pending；非 paused 409） |
+| POST | `/audit/causal-indexes/comparisons` | **比较两份已完成索引**（纯只读）：`{a_index_id, b_index_id, after?, limit?}` → 共同节点、首个分叉、增删节点、逐字段变化（每项带节点标识与双方值）；任一方不存在 404、未完成 409、游标越界 416 |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
 | GET | `/debug/now` | 两种时钟当前读数 |
@@ -669,6 +780,7 @@ curl -s localhost:8080/writes/1
 | `ARCHIVE_WORKER_INTERVAL_S` | 0.2 | 后台归档 worker 的轮询间隔（秒；归档与证据包共用） |
 | `EVIDENCE_CHUNK_SIZE` | 1 | 证据包后台生成时每块冻结的归档条目数（每块提交一次、进度落库） |
 | `CAUSAL_CHUNK_SIZE` | 100 | 因果索引后台生成时每块还原的成员节点数（每块提交一次、进度落库） |
+| `CAUSAL_DERIVATION_CHUNK_SIZE` | 100 | 增量派生后台生成时每块还原的成员节点数（复用节点复制基线载荷、新增节点从冻结源重建） |
 | `ENABLE_DEBUG_API` | 1 | 是否开放 `/debug/*` 故障演练接口 |
 
 ## 测试
@@ -732,3 +844,16 @@ finalize 失败重试不重复写入冻结事件、
 源归档核验失败/源归档删除或内容哈希变化/证据条目缺失等篡改的
 首个差异节点标识/字段路径/双方值、
 全流程不修改租约/委托/原始历史/源归档/证据包、未完成/不存在等显式错误。
+增量派生与索引比较覆盖：复用基线节点（载荷逐字节复制、仅重盖链环）+
+新增节点重建的正常派生、无新增内容全复用完成态、窄过滤移除基线节点、
+证据包作用域约束、基线不存在 404/未完成 409/节点早于基线 400/缺幂等键 400、
+同键回放与同键换基线/换快照/换过滤冲突、同规格换键冲突、
+分块中断后服务重启从已保存进度续跑且不重复写入、下载文档逐字节稳定、
+暂停（worker 跳过、幂等）/恢复/失败重试与非法状态转换、
+新增节点的源归档或证据包条目缺失/哈希漂移即生成失败、修复后重试成功、
+基线描述漂移创建即拒绝、基线在派生完成后被篡改/删除时核验失败在
+baseline.chain_digest 且复用节点载荷不被污染、
+索引比较的共同节点/首个分叉（changed 与一方链结束）/增删节点/逐字段变化
+（节点标识+双方值）/自比较 identical/不同快照可比较/分页与越界 416/
+未完成 409/不存在 404、派生与比较全流程只读（租约/委托/历史/源归档/证据包/
+原索引的核验标记均不被修改）。
