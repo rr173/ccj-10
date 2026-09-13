@@ -431,6 +431,51 @@ CREATE TABLE IF NOT EXISTS causal_derivation_nodes (
 );
 CREATE INDEX IF NOT EXISTS idx_derivation_nodes_position
     ON causal_derivation_nodes(derivation_id, position);
+-- 索引版本发布计划：管理员把一份**已完成**的因果索引登记为逻辑版本（version
+-- 是不可再分配的版本别名，全局唯一；idempotency_key 全局唯一），提交带生效
+-- 时间的发布计划。登记时一次性冻结索引摘要、快照信息与可选的索引比较结果；
+-- 生效（发布）时再次冻结并复核原索引链摘要与比较结果——原索引被篡改/删除、
+-- 比较对象缺失/未完成/比较结果漂移都会让计划 failed 并留下可解释原因。
+-- 生效后按版本别名查询只指向冻结的索引（服务时再次核对链摘要），旧版本仍
+-- 可按原索引标识查询。发布管理只写本表，绝不修改原索引、派生任务、租约、
+-- 委托、审计历史、源归档或证据包。
+CREATE TABLE IF NOT EXISTS index_releases (
+    release_id                  TEXT PRIMARY KEY,
+    version                     TEXT NOT NULL,   -- 逻辑版本别名（一旦登记永不复用）
+    idempotency_key             TEXT NOT NULL,
+    index_id                    TEXT NOT NULL,   -- 被发布的已完成因果索引（只读引用）
+    effective_at_ms             INTEGER NOT NULL,-- 计划生效墙钟时间（<=登记时刻即立即生效）
+    status                      TEXT NOT NULL DEFAULT 'scheduled',
+                                -- scheduled / active / cancelled / failed
+    plan_fingerprint            TEXT NOT NULL,   -- version+索引+生效时间+比较对象规格指纹
+    -- 登记时冻结
+    frozen_index_summary_json   TEXT NOT NULL,   -- 索引摘要（作用域/对象/节点数/链摘要/校验值/核验标记）
+    frozen_snapshot_json        TEXT NOT NULL,   -- 快照信息（snapshot_seq/node_seq/MAX(seq)）
+    frozen_compare_json         TEXT,            -- 可选：与比较对象的完整比较结果（规范化 JSON）
+    compare_with_index_id       TEXT NOT NULL DEFAULT '',
+    compare_digest              TEXT,            -- 比较结果规范化摘要
+    -- 生效（发布）时再次冻结
+    activate_index_summary_json TEXT,
+    activate_snapshot_json      TEXT,
+    activate_compare_json       TEXT,
+    activate_index_chain_digest TEXT,            -- 生效时重算的原索引链摘要（应与登记冻结值一致）
+    attempts                    INTEGER NOT NULL DEFAULT 0,
+    error                       TEXT,            -- 失败的人类可读原因
+    error_code                  TEXT,            -- 失败错误码（release_index_tampered 等）
+    error_detail_json           TEXT,            -- 失败的结构化解释（路径/双方值）
+    created_logical             INTEGER NOT NULL DEFAULT 0,
+    created_at_ms               INTEGER NOT NULL,
+    updated_at_ms               INTEGER NOT NULL,
+    activated_at_ms             INTEGER,
+    cancelled_at_ms             INTEGER,
+    failed_at_ms                INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_release_version
+    ON index_releases(version);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_release_idem
+    ON index_releases(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_release_due
+    ON index_releases(status, effective_at_ms);
 """
 
 

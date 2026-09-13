@@ -123,6 +123,27 @@
                                                  after?, limit?} → 共同节点、
                                                 首个分叉、增删节点、逐字段变化
                                                 （每项带节点标识与双方值）
+索引版本发布管理（只写 index_releases 自有表，绝不修改原索引/派生任务/
+租约/委托/审计历史/源归档/证据包）：
+  POST   /audit/index-releases                  登记发布计划
+                                                {version, index_id,
+                                                 idempotency_key,
+                                                 effective_at_ms,
+                                                 compare_with_index_id?}
+                                                相同版本号+幂等键回放同一计划
+                                                （200）；同键换索引/生效时间/
+                                                比较对象 409；版本号换键 409；
+                                                生效时间已到则同步 active/failed
+  GET    /audit/index-releases                  列发布计划（?status&version&index_id）
+  GET    /audit/index-releases/<id>             查计划/登记冻结/发布冻结/失败原因
+  POST   /audit/index-releases/<id>/cancel      取消仍 scheduled 的计划（幂等）
+  POST   /audit/index-releases/<id>/retry       failed 计划重新发布
+  GET    /audit/index-versions/<version>        版本别名稳定解析（冻结指针+live 诊断）
+  GET    /audit/index-versions/<version>/chain  版本固化的因果链（篡改 409/删除 404）
+  GET    /audit/index-versions/<version>/nodes/<node_id>
+                                                版本固化的单个冻结节点
+  GET    /audit/index-versions/<version>/download
+                                                版本固化的链文档（字节稳定）
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
   POST   /debug/tick           手动推进逻辑钟
   POST   /debug/wall-shift     拨墙钟（可正可负）
@@ -174,6 +195,21 @@ from .derivation import (
     DerivationNotReady,
     DerivationSourceChanged,
     DerivationSpecConflict,
+)
+from .release import (
+    IndexReleaseManager,
+    ReleaseBadState,
+    ReleaseCancelled,
+    ReleaseCompareTargetNotReady,
+    ReleaseComparisonChanged,
+    ReleaseFailed as ReleaseFailedPlan,
+    ReleaseIdConflict,
+    ReleaseIndexDeleted,
+    ReleaseIndexNotCompleted,
+    ReleaseIndexTampered,
+    ReleaseNotFound,
+    ReleaseNotReady,
+    ReleaseVersionConflict,
 )
 from .audit import (
     AuditBadRequest,
@@ -241,6 +277,10 @@ def create_app(
         store, audit, causal,
         chunk_size=_env_int("CAUSAL_DERIVATION_CHUNK_SIZE", 100))
     app.extensions["derivation"] = derivation
+    # 索引版本发布管理：登记/发布冻结索引摘要、快照与可选比较结果，只写
+    # index_releases 自有表，绝不修改原索引/派生/租约/委托/历史/归档/证据包
+    releases = IndexReleaseManager(store, causal, derivation)
+    app.extensions["releases"] = releases
     if enable_debug_api is None:
         enable_debug_api = os.environ.get("ENABLE_DEBUG_API", "1") == "1"
 
@@ -810,6 +850,85 @@ def create_app(
         ))
 
     # ------------------------------------------------------------------
+    # 索引版本发布管理
+    #
+    # 把一份已完成的因果索引登记为逻辑版本并提交带生效时间的发布计划。
+    # 登记时冻结索引摘要/快照/可选比较结果，生效时再次冻结并复核（原索引
+    # 被篡改/删除、比较对象未完成 -> 计划 failed 并保留原因）。支持延迟
+    # 生效、取消、中断恢复（worker + 查询惰性扫描）与版本别名稳定查询。
+    # 只写 index_releases 自有表，绝不修改原索引、派生任务、租约、委托、
+    # 审计历史、源归档或证据包。
+    # ------------------------------------------------------------------
+    @app.post("/audit/index-releases")
+    def release_register():
+        data = body()
+        view, created = releases.register_release(
+            version=data.get("version"),
+            index_id=data.get("index_id"),
+            idempotency_key=data.get("idempotency_key"),
+            effective_at_ms=data.get("effective_at_ms"),
+            compare_with_index_id=data.get("compare_with_index_id"),
+        )
+        # 相同版本号+幂等键重复登记：200 回放同一计划（含其当前状态）
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/index-releases")
+    def release_list():
+        return jsonify(releases.list_releases(
+            status=request.args.get("status"),
+            version=request.args.get("version"),
+            index_id=request.args.get("index_id"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/index-releases/<release_id>")
+    def release_status(release_id):
+        return jsonify(releases.get_release(release_id))
+
+    @app.post("/audit/index-releases/<release_id>/cancel")
+    def release_cancel(release_id):
+        return jsonify(releases.cancel_release(release_id))
+
+    @app.post("/audit/index-releases/<release_id>/retry")
+    def release_retry(release_id):
+        # failed -> 立即重新发布（生效时间不变；到点计划无需重试）
+        return jsonify(releases.retry_release(release_id))
+
+    @app.get("/audit/index-versions/<version>")
+    def version_resolve(version):
+        # 版本别名稳定查询：只解析冻结的索引指针（附原索引只读 live 诊断）
+        return jsonify(releases.resolve_version(version))
+
+    @app.get("/audit/index-versions/<version>/chain")
+    def version_chain(version):
+        # 服务前再次核对原索引链摘要，被篡改/删除 -> 409/404
+        return jsonify(releases.version_chain(
+            version,
+            after=request.args.get("after"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/index-versions/<version>/nodes/<node_id>")
+    def version_node(version, node_id):
+        return jsonify(releases.version_node(version, node_id))
+
+    @app.get("/audit/index-versions/<version>/download")
+    def version_download(version):
+        text, view = releases.version_download(version)
+        return Response(
+            text, mimetype="application/json",
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="index-version-'
+                    f'{version}.json"',
+                "X-Index-Version": version,
+                "X-Causal-SHA256": view["content_sha256"] or "",
+                "X-Causal-Chain-Digest": view["chain_digest"] or "",
+            },
+        )
+
+    # ------------------------------------------------------------------
     # 调试：手动驱动两种时钟，演练"拨表/逻辑卡死"故障
     # ------------------------------------------------------------------
     @app.post("/debug/tick")
@@ -894,6 +1013,24 @@ def create_app(
         # 409、暂停/恢复/重试状态不允许 409、新增节点的源被篡改 409
         return jsonify(exc.to_response()), exc.status
 
+    @app.errorhandler(ReleaseNotFound)
+    @app.errorhandler(ReleaseNotReady)
+    @app.errorhandler(ReleaseCancelled)
+    @app.errorhandler(ReleaseFailedPlan)
+    @app.errorhandler(ReleaseIdConflict)
+    @app.errorhandler(ReleaseVersionConflict)
+    @app.errorhandler(ReleaseBadState)
+    @app.errorhandler(ReleaseIndexDeleted)
+    @app.errorhandler(ReleaseIndexNotCompleted)
+    @app.errorhandler(ReleaseIndexTampered)
+    @app.errorhandler(ReleaseCompareTargetNotReady)
+    @app.errorhandler(ReleaseComparisonChanged)
+    def _release_error(exc):
+        # 版本发布显式错误：计划/版本不存在 404、未生效/已取消/已失败 409、
+        # 幂等键/版本号冲突 409、状态不允许 409、原索引删除/未完成/被篡改
+        # 409、比较对象未完成/比较结果漂移 409
+        return jsonify(exc.to_response()), exc.status
+
     @app.errorhandler(GenerationTooSmall)
     def _gen_conflict(exc):
         return jsonify({"error": "generation_fence", "message": str(exc)}), 409
@@ -965,12 +1102,17 @@ def create_app(
                 derivation.process_pending()
             except Exception:  # noqa: BLE001
                 app.logger.exception("增量派生后台处理失败")
+            try:
+                releases.process_due()  # 到点发布计划（延迟生效）
+            except Exception:  # noqa: BLE001
+                app.logger.exception("索引版本发布后台处理失败")
 
     if start_archive_worker:
         archive.process_pending()  # 启动即续跑重启前未完成的归档
         evidence.process_pending()  # 同步续跑未完成的证据包
         causal.process_pending()  # 同步续跑未完成的因果索引
         derivation.process_pending()  # 同步续跑未完成的增量派生
+        releases.process_due()  # 中断恢复：错过生效时间的计划立即发布
         t = threading.Thread(target=_run_archive_worker,
                              name="archive-worker", daemon=True)
         t.start()

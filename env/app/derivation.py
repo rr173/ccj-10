@@ -1624,135 +1624,141 @@ class DerivationManager:
         store = self._store
         with store._lock:  # noqa: SLF001
             conn = store._conn  # noqa: SLF001
-            a = conn.execute(
-                "SELECT * FROM causal_indexes WHERE index_id=?",
-                (a_index_id,)).fetchone()
-            if a is None:
-                raise CausalNotFound(
-                    f"比较方 A 的因果索引 {a_index_id} 不存在",
-                    index_id=a_index_id)
-            b = conn.execute(
-                "SELECT * FROM causal_indexes WHERE index_id=?",
-                (b_index_id,)).fetchone()
-            if b is None:
-                raise CausalNotFound(
-                    f"比较方 B 的因果索引 {b_index_id} 不存在",
-                    index_id=b_index_id)
-            if a["status"] != STATUS_COMPLETED:
-                raise CausalNotReady(
-                    f"比较方 A 的因果索引 {a_index_id} 尚未完成（"
-                    f"{a['status']}），不能比较",
-                    index_id=a_index_id, status=a["status"])
-            if b["status"] != STATUS_COMPLETED:
-                raise CausalNotReady(
-                    f"比较方 B 的因果索引 {b_index_id} 尚未完成（"
-                    f"{b['status']}），不能比较",
-                    index_id=b_index_id, status=b["status"])
-
-            a_nodes = self._ordered_index_nodes(conn, a_index_id)
-            b_nodes = self._ordered_index_nodes(conn, b_index_id)
-            a_ids = [n["payload"]["node_id"] for n in a_nodes]
-            b_ids = [n["payload"]["node_id"] for n in b_nodes]
-            a_set, b_set = set(a_ids), set(b_ids)
-            common_ids = a_set & b_set
-            added_ids = [nid for nid in b_ids if nid not in a_set]    # B 有 A 无
-            removed_ids = [nid for nid in a_ids if nid not in b_set]  # A 有 B 无
-            a_map = {n["payload"]["node_id"]: n for n in a_nodes}
-            b_map = {n["payload"]["node_id"]: n for n in b_nodes}
-
-            first_divergence = self._first_divergence(
-                a_ids, b_ids, a_map, b_map)
-
-            field_changes = []
-            change_index = 0
-            for nid in a_ids:  # 以 A 的因果顺序作为变化排序主轴
-                if nid not in common_ids:
-                    continue
-                na, nb = a_map[nid], b_map[nid]
-                leaf_diffs: list[dict] = []
-                collect_field_diffs(self._body(na["payload"]),
-                                    self._body(nb["payload"]),
-                                    "node", leaf_diffs)
-                for d in leaf_diffs:
-                    field_changes.append({
-                        "_index": change_index,
-                        "node_id": nid,
-                        "node_type": na["payload"]["node_type"],
-                        "seq": na["payload"].get("seq"),
-                        "anchor_seq": na["payload"].get("anchor_seq"),
-                        "position_a": na["position"],
-                        "position_b": nb["position"],
-                        "field": d["path"][len("node."):],
-                        "path": d["path"],
-                        "value_a": d["value_a"],
-                        "value_b": d["value_b"],
-                    })
-                    change_index += 1
-
-            total_changes = len(field_changes)
-            if total_changes and after_pos > total_changes - 1:
-                raise _compare_range_error(after_pos, total_changes)
-            start = after_pos + 1
-            page = field_changes[start: start + limit]
-            has_more = start + limit < total_changes
-
-            def node_brief(nid, side):
-                n = (a_map if side == "a" else b_map)[nid]
-                p = n["payload"]
-                return {"node_id": nid, "node_type": p["node_type"],
-                        "object_id": p.get("object_id"),
-                        "seq": p.get("seq"),
-                        "anchor_seq": p.get("anchor_seq"),
-                        "position": n["position"]}
-
             try:
-                return {
-                    "comparison": "a_to_b",
-                    "a": {"index_id": a_index_id, "scope": a["scope"],
-                          "node_seq": a["node_seq"],
-                          "snapshot_seq": a["snapshot_seq"],
-                          "total_nodes": a["total_nodes"],
-                          "chain_digest": a["chain_digest"]},
-                    "b": {"index_id": b_index_id, "scope": b["scope"],
-                          "node_seq": b["node_seq"],
-                          "snapshot_seq": b["snapshot_seq"],
-                          "total_nodes": b["total_nodes"],
-                          "chain_digest": b["chain_digest"]},
-                    "same_snapshot": (a["snapshot_seq"] == b["snapshot_seq"]
-                                      and a["node_seq"] == b["node_seq"]),
-                    "summary": {
-                        "common_nodes": len(common_ids),
-                        "added_nodes": len(added_ids),
-                        "removed_nodes": len(removed_ids),
-                        "field_changes": total_changes,
-                        "identical": (not added_ids and not removed_ids
-                                      and total_changes == 0),
-                    },
-                    "first_divergence": first_divergence,
-                    "common_nodes": [
-                        {"node_id": nid,
-                          "node_type": a_map[nid]["payload"]["node_type"],
-                          "position_a": a_map[nid]["position"],
-                          "position_b": b_map[nid]["position"]}
-                        for nid in a_ids if nid in common_ids],
-                    "added_nodes": [node_brief(nid, "b")
-                                    for nid in added_ids],
-                    "removed_nodes": [node_brief(nid, "a")
-                                      for nid in removed_ids],
-                    "field_changes": [
-                        {k: v for k, v in ch.items() if k != "_index"}
-                        for ch in page],
-                    "limit": limit,
-                    "next": page[-1]["_index"]
-                    if has_more and page else None,
-                    "next_cursor": page[-1]["_index"]
-                    if has_more and page else None,
-                    "reached_end": not has_more,
-                    "total_field_changes": total_changes,
-                    "read_only": True,
-                }
+                return self._compare_indexes_conn(
+                    conn, a_index_id, b_index_id, after_pos, limit)
             finally:
                 conn.rollback()
+
+    def _compare_indexes_conn(self, conn, a_index_id: str, b_index_id: str,
+                              after_pos: int, limit: int) -> dict[str, Any]:
+        """比较核心：调用方已持锁并自行管理事务（不 rollback）。
+
+        供纯只读 HTTP 比较与发布管理在更大事务内冻结比较结果共用：后者
+        不能接受比较结束时的 rollback（会冲掉同事务内尚未提交的发布行）。
+        """
+        a = conn.execute(
+            "SELECT * FROM causal_indexes WHERE index_id=?",
+            (a_index_id,)).fetchone()
+        if a is None:
+            raise CausalNotFound(
+                f"比较方 A 的因果索引 {a_index_id} 不存在",
+                index_id=a_index_id)
+        b = conn.execute(
+            "SELECT * FROM causal_indexes WHERE index_id=?",
+            (b_index_id,)).fetchone()
+        if b is None:
+            raise CausalNotFound(
+                f"比较方 B 的因果索引 {b_index_id} 不存在",
+                index_id=b_index_id)
+        if a["status"] != STATUS_COMPLETED:
+            raise CausalNotReady(
+                f"比较方 A 的因果索引 {a_index_id} 尚未完成（"
+                f"{a['status']}），不能比较",
+                index_id=a_index_id, status=a["status"])
+        if b["status"] != STATUS_COMPLETED:
+            raise CausalNotReady(
+                f"比较方 B 的因果索引 {b_index_id} 尚未完成（"
+                f"{b['status']}），不能比较",
+                index_id=b_index_id, status=b["status"])
+
+        a_nodes = self._ordered_index_nodes(conn, a_index_id)
+        b_nodes = self._ordered_index_nodes(conn, b_index_id)
+        a_ids = [n["payload"]["node_id"] for n in a_nodes]
+        b_ids = [n["payload"]["node_id"] for n in b_nodes]
+        a_set, b_set = set(a_ids), set(b_ids)
+        common_ids = a_set & b_set
+        added_ids = [nid for nid in b_ids if nid not in a_set]    # B 有 A 无
+        removed_ids = [nid for nid in a_ids if nid not in b_set]  # A 有 B 无
+        a_map = {n["payload"]["node_id"]: n for n in a_nodes}
+        b_map = {n["payload"]["node_id"]: n for n in b_nodes}
+
+        first_divergence = self._first_divergence(
+            a_ids, b_ids, a_map, b_map)
+
+        field_changes = []
+        change_index = 0
+        for nid in a_ids:  # 以 A 的因果顺序作为变化排序主轴
+            if nid not in common_ids:
+                continue
+            na, nb = a_map[nid], b_map[nid]
+            leaf_diffs: list[dict] = []
+            collect_field_diffs(self._body(na["payload"]),
+                                self._body(nb["payload"]),
+                                "node", leaf_diffs)
+            for d in leaf_diffs:
+                field_changes.append({
+                    "_index": change_index,
+                    "node_id": nid,
+                    "node_type": na["payload"]["node_type"],
+                    "seq": na["payload"].get("seq"),
+                    "anchor_seq": na["payload"].get("anchor_seq"),
+                    "position_a": na["position"],
+                    "position_b": nb["position"],
+                    "field": d["path"][len("node."):],
+                    "path": d["path"],
+                    "value_a": d["value_a"],
+                    "value_b": d["value_b"],
+                })
+                change_index += 1
+
+        total_changes = len(field_changes)
+        if total_changes and after_pos > total_changes - 1:
+            raise _compare_range_error(after_pos, total_changes)
+        start = after_pos + 1
+        page = field_changes[start: start + limit]
+        has_more = start + limit < total_changes
+
+        def node_brief(nid, side):
+            n = (a_map if side == "a" else b_map)[nid]
+            p = n["payload"]
+            return {"node_id": nid, "node_type": p["node_type"],
+                    "object_id": p.get("object_id"),
+                    "seq": p.get("seq"),
+                    "anchor_seq": p.get("anchor_seq"),
+                    "position": n["position"]}
+
+        return {
+            "comparison": "a_to_b",
+            "a": {"index_id": a_index_id, "scope": a["scope"],
+                  "node_seq": a["node_seq"],
+                  "snapshot_seq": a["snapshot_seq"],
+                  "total_nodes": a["total_nodes"],
+                  "chain_digest": a["chain_digest"]},
+            "b": {"index_id": b_index_id, "scope": b["scope"],
+                  "node_seq": b["node_seq"],
+                  "snapshot_seq": b["snapshot_seq"],
+                  "total_nodes": b["total_nodes"],
+                  "chain_digest": b["chain_digest"]},
+            "same_snapshot": (a["snapshot_seq"] == b["snapshot_seq"]
+                              and a["node_seq"] == b["node_seq"]),
+            "summary": {
+                "common_nodes": len(common_ids),
+                "added_nodes": len(added_ids),
+                "removed_nodes": len(removed_ids),
+                "field_changes": total_changes,
+                "identical": (not added_ids and not removed_ids
+                              and total_changes == 0),
+            },
+            "first_divergence": first_divergence,
+            "common_nodes": [
+                {"node_id": nid,
+                 "node_type": a_map[nid]["payload"]["node_type"],
+                 "position_a": a_map[nid]["position"],
+                 "position_b": b_map[nid]["position"]}
+                for nid in a_ids if nid in common_ids],
+            "added_nodes": [node_brief(nid, "b") for nid in added_ids],
+            "removed_nodes": [node_brief(nid, "a") for nid in removed_ids],
+            "field_changes": [
+                {k: v for k, v in ch.items() if k != "_index"}
+                for ch in page],
+            "limit": limit,
+            "next": page[-1]["_index"] if has_more and page else None,
+            "next_cursor": page[-1]["_index"] if has_more and page else None,
+            "reached_end": not has_more,
+            "total_field_changes": total_changes,
+            "read_only": True,
+        }
 
     @staticmethod
     def _ordered_index_nodes(conn, index_id) -> list[dict]:

@@ -641,6 +641,123 @@ POST /audit/causal-indexes/comparisons
 | 链/字段变化分页游标越过末位 | 416 | `node_out_of_range` |
 | 非法节点选择器/过滤、节点早于基线、缺幂等键 | 400 | `bad_request` |
 
+## 索引版本发布管理（index version release）
+
+管理员可以把一份**已完成**的因果索引登记为一个逻辑**版本**，提交带
+**生效时间**的发布计划。系统在**登记**与**发布（生效）**两个时刻分别
+冻结索引摘要、快照信息以及可选的比较结果；计划支持延迟生效、取消、
+服务中断后的恢复与稳定查询。登记、发布、取消与查询只写
+`index_releases` 一张自有表，**绝不修改原索引、派生任务、租约、委托、
+审计历史、源归档或证据包**。
+
+### 登记（幂等 + 冲突显式化）
+
+```
+POST /audit/index-releases
+{"version":"2026.09", "index_id":"<已完成索引id>",
+ "idempotency_key":"release-2026-09", "effective_at_ms":1789000000000,
+ "compare_with_index_id":"<可选：另一份已完成索引>"}
+```
+
+- 必填：`version`（逻辑版本别名，一旦登记永不复用）、`index_id`
+  （已完成的因果索引；不存在 404、未完成 409）、`idempotency_key`、
+  `effective_at_ms`（生效墙钟时间，整数毫秒；取当前时刻或更早表示
+  立即生效）。可选 `compare_with_index_id`：登记时对两份索引做**完整
+  只读比较**并把比较结果冻结进计划（比较对象缺失 404、未完成 409）；
+- **登记时一次性冻结**三样东西：
+  1. **索引摘要**：索引标识、作用域、对象、历史节点 `node_seq`、
+     稳定视图 `snapshot_seq`、节点总数、链摘要 `chain_digest`、
+     文档总校验值与核验标记；
+  2. **快照信息**：索引的 snapshot/node 序号与登记时刻全局 `latest_seq`；
+  3. **可选比较结果**：完整比较报告（剥离分页元数据后规范化）及其
+     `compare_digest`；
+- 幂等与冲突：
+  - **相同版本号 + 相同幂等键**（且索引、生效时间、比较对象、比较
+    结果都一致）重复登记只返回同一计划（HTTP 200 + `"replayed":
+    true`），计划当前状态（active/cancelled/failed）原样返回；计划
+    已到生效时间时，回放会先完成发布再返回；
+  - **同键换索引、换生效时间或换比较对象** → 409 `release_id_conflict`，
+    `first_difference` 给出首个差异字段（`index_id` / `effective_at_ms`
+    / `compare_with_index_id`）与双方值；比较对象相同但其比较结果在
+    两次登记间发生变化 → 首个差异为 `compare_digest`；
+  - **版本号已被别的幂等键占用** → 409 `release_version_conflict`
+    （附既有计划与幂等键）。版本别名一旦登记即不可再分配，**计划被
+    取消或失败后同名版本仍然冲突**——要换索引/换生效时间/换比较对象
+    必须使用新版本号；
+- `effective_at_ms` 已到（含过去）时登记事务内**立即发布**，响应同步
+  为 `active` 或 `failed`；否则进入 `scheduled`。
+
+### 延迟生效、取消与中断恢复
+
+- 后台 worker（与归档/证据包/因果索引/增量派生同一轮询循环）扫描
+  `effective_at_ms <= now` 的 `scheduled` 计划并发布；查询入口
+  （版本解析、版本链路/下载、计划查询、登记回放、取消）在锁内还会
+  **惰性扫描**，保证即使错过 worker 轮询也"到点必生效"；
+- `POST /audit/index-releases/<id>/cancel` 只允许取消仍 `scheduled`
+  的计划（重复取消幂等回放）；已生效不可取消（409
+  `release_bad_state`），已失败请用 retry；
+- 服务中断/进程重启：启动即扫描，**错过生效时间的计划在重启后立即
+  发布**（墙钟偏移随数据库持久化，恢复时按恢复后的墙钟判定）；
+- `POST /audit/index-releases/<id>/retry` 对 `failed` 计划立即重新
+  复核发布（不改变生效时间与任何冻结规格；非 failed → 409）。
+
+### 发布复核与失败（保留可解释原因）
+
+计划发布在同一事务里再次冻结 `activate_index_summary` /
+`activate_snapshot` / `activate_comparison` 与重算的原索引链摘要，
+并按序复核；**任一不通过计划即置 `failed`**，保留 `error_code` 与
+结构化 `error_detail`（字段路径、冻结值/当前值），绝不静默发布被
+掉包的索引：
+
+| 发布时发现 | error_code |
+|---|---|
+| 原索引已被删除 | `release_index_deleted` |
+| 原索引不再是完成态 | `release_index_not_completed` |
+| 原索引行内链摘要/总校验值/节点数/核验标记与登记冻结值不一致 | `release_index_tampered`（`path=index.chain_digest` 等） |
+| 从冻结节点重算的链摘要与登记冻结值不一致（节点载荷被篡改，即使行摘要被一起伪造） | `release_index_tampered`（`path=index.chain_digest_recomputed`） |
+| 比较对象被删除 / 未完成 | `release_compare_target_not_ready` |
+| 比较结果与登记冻结结果不一致（首个叶子差异路径） | `release_comparison_changed` |
+
+每个计划独立事务：单个计划失败不影响其它到点计划；计划视图始终带
+`status`（scheduled/active/cancelled/failed）、`attempts`、
+`error/error_code/error_detail` 与登记/生效/取消/失败四个时间戳。
+
+### 生效后的稳定查询
+
+| 接口 | 说明 |
+|---|---|
+| `GET /audit/index-versions/<version>` | **版本别名解析**：主体只来自发布行冻结字段（冻结索引指针、发布时快照、冻结比较结果），永远不随后续变化漂移；另附对原索引当前状态的只读 `live` 诊断（`intact`/`tampered`/`deleted`）与 `stable` 标记 |
+| `GET /audit/index-versions/<version>/chain` | 版本固化的因果链（分页参数与原索引链查询一致）；服务前再次核对原索引当前链摘要 |
+| `GET /audit/index-versions/<version>/nodes/<node_id>` | 版本固化的单个冻结节点 |
+| `GET /audit/index-versions/<version>/download` | 版本固化的链文档（字节稳定，响应头 `X-Index-Version` / `X-Causal-SHA256` / `X-Causal-Chain-Digest`） |
+| `GET /audit/index-releases` | 列发布计划（`?status=&version=&index_id=&limit=`） |
+| `GET /audit/index-releases/<id>` | 计划进度/状态/登记冻结/发布冻结/失败原因 |
+
+- **生效后按版本别名查询只能指向发布时冻结的索引**：原索引被篡改
+  （重算链摘要不等于冻结值）→ 版本链/节点/下载一律 409
+  `release_index_tampered`；原索引被删除 → 404
+  `release_index_deleted`；绝不把被掉包的内容当作版本内容。
+  版本解析接口本身仍可返回冻结指针，并把 `live.state` 标为
+  `tampered`/`deleted`（冻结视图不依赖原索引是否还在）；
+- **旧版本仍可按原索引标识查询**（`/audit/causal-indexes/<id>`），
+  新版本发布、计划取消或失败都不影响既有索引；
+- 未生效（409 `index_release_not_effective`）、已取消（409
+  `index_release_cancelled`）、已失败（409 `index_release_failed`，
+  附失败错误码）、版本/计划不存在（404 `index_release_not_found`）
+  都给出显式错误，而不是空结果或漂移到别的索引。
+
+| 发布场景 | 状态码 | error |
+|---|---|---|
+| 计划/版本不存在 | 404 | `index_release_not_found` |
+| 发布对象/比较对象索引不存在 | 404 | `causal_index_not_found` |
+| 发布对象/比较对象索引未完成 | 409 | `causal_index_not_ready` |
+| 同幂等键换索引/生效时间/比较对象（含比较结果漂移） | 409 | `release_id_conflict` |
+| 版本号被别的幂等键占用（含已取消/已失败） | 409 | `release_version_conflict` |
+| 取消/重试状态前提不满足 | 409 | `release_bad_state` |
+| 版本查询：计划未生效/已取消/已失败 | 409 | `index_release_not_effective` / `index_release_cancelled` / `index_release_failed` |
+| 版本链/节点/下载：原索引被篡改 | 409 | `release_index_tampered` |
+| 版本链/节点/下载：原索引被删除/节点缺失 | 404 | `release_index_deleted` |
+| 缺 version/index_id/幂等键/生效时间、时间非整数 | 400 | `bad_request` |
 
 ## 持久性
 
@@ -655,11 +772,15 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 **因果索引增量派生任务与冻结成员/节点（基线快照与链摘要、新 snapshot_seq、
 范围与过滤、reused/added/removed 分类、派生链摘要、总校验值与核验标记；
 比较请求不落库）**、
+**索引版本发布计划（版本别名与幂等键、发布对象、生效时间、登记时冻结的
+索引摘要/快照/可选比较结果、发布时再次冻结的摘要与重算链摘要、
+scheduled/active/cancelled/failed 状态机与可解释失败原因）**、
 逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
 正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放，
 **审计回放、节点比较与一致性诊断对同一份历史给出逐字节一致的结果**；
 启动时即按墙钟收割已到期的委托，并自动续跑未完成的归档、证据包、因果索引与
-增量派生生成（暂停中的派生任务不会被自动续跑）。
+增量派生生成（暂停中的派生任务不会被自动续跑），
+**错过生效时间的版本发布计划在启动时立即发布（失败保留原因，可 retry）**。
 旧版本数据库会在启动时自动补列迁移。
 逻辑钟由后台 ticker 每秒 +1（每次推进都 fsync 落库）。
 
@@ -722,6 +843,15 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 | POST | `/audit/causal-derivations/<id>/pause` | 暂停派生任务（worker 跳过；幂等） |
 | POST | `/audit/causal-derivations/<id>/resume` | 暂停后恢复（paused → pending；非 paused 409） |
 | POST | `/audit/causal-indexes/comparisons` | **比较两份已完成索引**（纯只读）：`{a_index_id, b_index_id, after?, limit?}` → 共同节点、首个分叉、增删节点、逐字段变化（每项带节点标识与双方值）；任一方不存在 404、未完成 409、游标越界 416 |
+| POST | `/audit/index-releases` | **登记索引版本发布计划**：`{version, index_id, idempotency_key, effective_at_ms, compare_with_index_id?}`；相同版本号+幂等键返回同一计划（200 回放，已到点先发布），同键换索引/生效时间/比较对象 409、版本号被别的键占用 409；生效时间已到则同步 active/failed |
+| GET | `/audit/index-releases` | 列发布计划（`?status=scheduled/active/cancelled/failed&version=&index_id=&limit=`） |
+| GET | `/audit/index-releases/<id>` | 查计划：状态、登记时冻结的索引摘要/快照/比较结果、发布时再次冻结的内容、失败错误码与结构化原因 |
+| POST | `/audit/index-releases/<id>/cancel` | 取消仍 scheduled 的计划（幂等）；已生效/已失败 409 |
+| POST | `/audit/index-releases/<id>/retry` | failed 计划立即重新发布（生效时间与冻结规格不变；非 failed 409） |
+| GET | `/audit/index-versions/<version>` | **版本别名稳定解析**：冻结索引指针/发布快照/冻结比较结果 + 原索引只读 `live` 诊断（intact/tampered/deleted）；未生效 409、已取消 409、已失败 409、不存在 404 |
+| GET | `/audit/index-versions/<version>/chain` | 版本固化的因果链分页（服务前复核原索引链摘要：被篡改 409、被删除 404） |
+| GET | `/audit/index-versions/<version>/nodes/<node_id>` | 版本固化的单个冻结节点（同样的篡改/删除闸门） |
+| GET | `/audit/index-versions/<version>/download` | 版本固化的链文档（字节稳定，`X-Index-Version` / `X-Causal-SHA256` / `X-Causal-Chain-Digest`） |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
 | GET | `/debug/now` | 两种时钟当前读数 |
@@ -861,3 +991,19 @@ baseline.chain_digest 且复用节点载荷不被污染、
 （节点标识+双方值）/自比较 identical/不同快照可比较/分页与越界 416/
 未完成 409/不存在 404、派生与比较全流程只读（租约/委托/历史/源归档/证据包/
 原索引的核验标记均不被修改）。
+索引版本发布管理覆盖：立即发布与延迟发布（登记冻结索引摘要/快照/完整比较
+结果、发布时二次冻结）、worker 与查询惰性扫描双路径到点生效、
+错过生效时间的计划在服务重启（启动扫描）后立即发布、
+相同版本号+幂等键回放同一计划（含到点回放先激活）、同键换索引/换生效时间/
+换比较对象/比较结果漂移的显式 409（首个差异字段与双方值）、版本号换键
+（含取消/失败后同名）409 且永不复用、多版本互不影响、
+取消仅对 scheduled 生效且幂等/对 active·failed 409、
+发布期间原索引被篡改（节点载荷→chain_digest_recomputed、行摘要→
+chain_digest）/删除/非完成态、比较对象删除/未完成/比较结果变化均 failed
+并保留 error_code 与结构化 error_detail、failed retry 仍失败、源修复后
+retry 成功、worker 批量发布时单计划失败不影响其它、
+版本别名稳定查询（冻结指针不漂移、live 诊断 intact/tampered/deleted、
+生效后新增写入与新索引不改变版本内容与下载字节、被篡改 409/被删除 404）、
+旧版本仍按原索引标识查询、计划/版本不存在与未生效/已取消/已失败的显式错误、
+登记/发布/取消/重试/查询全流程不修改原索引（含核验标记）、派生任务、租约、
+委托、审计历史、源归档或证据包（只写 index_releases）。
