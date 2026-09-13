@@ -281,6 +281,72 @@ CREATE TABLE IF NOT EXISTS evidence_entry_contents (
     payload    TEXT NOT NULL,                   -- 收录条目的规范化 JSON（原文或稳定引用）
     PRIMARY KEY (package_id, position)
 );
+-- 审计因果索引：把一次管理员任务作用域内的租约事件、写入、委托、源归档、
+-- 证据包条目组织成一条有向因果链。创建时即冻结 snapshot_seq、查询范围
+-- （scope/对象/历史节点）与过滤条件（filters_json），成员集合在同一事务
+-- 写入 causal_index_members；之后新增事件、再核验源归档、新增归档/证据包
+-- 都进不了已冻结的链。索引只写本表与 causal_index_members /
+-- causal_index_nodes 三张自有表，绝不修改租约、委托、原始审计历史、
+-- 源归档或证据包。idempotency_key 全局唯一：同键换范围/节点/过滤 → 409。
+CREATE TABLE IF NOT EXISTS causal_indexes (
+    index_id          TEXT PRIMARY KEY,
+    idempotency_key   TEXT NOT NULL,
+    scope             TEXT NOT NULL,           -- resource / credential / evidence_package
+    resource          TEXT NOT NULL DEFAULT '',
+    credential_id     TEXT NOT NULL DEFAULT '',
+    package_id        TEXT NOT NULL DEFAULT '',
+    node_seq          INTEGER NOT NULL,        -- 冻结的历史节点（证据包作用域=包快照节点）
+    snapshot_seq      INTEGER NOT NULL,        -- 创建时的稳定视图上界
+    filters_json      TEXT NOT NULL,           -- 创建时冻结的过滤条件（规范化 JSON）
+    status            TEXT NOT NULL DEFAULT 'pending',
+                        -- pending / building / completed / failed
+    total_nodes       INTEGER NOT NULL DEFAULT 0,
+    processed_nodes   INTEGER NOT NULL DEFAULT 0,
+    last_position     INTEGER NOT NULL DEFAULT -1, -- 续跑游标：已还原到的成员位置
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    error             TEXT,
+    content           TEXT,                    -- 冻结的链文档（JSON）
+    content_sha256    TEXT,                    -- 总校验值
+    chain_digest      TEXT,                    -- 顺序敏感的链摘要
+    verify_status     TEXT NOT NULL DEFAULT 'unverified',
+                        -- unverified / verified / verify_failed
+    verify_detail     TEXT,                    -- JSON：核验失败的首个差异位置
+    verified_at_ms    INTEGER,
+    created_logical   INTEGER NOT NULL DEFAULT 0,
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL,
+    completed_at_ms   INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_causal_idem
+    ON causal_indexes(idempotency_key);
+-- 冻结的成员集合：创建时一次性写入（因果顺序 position、节点标识、类型、
+-- 对象标识、锚点序号与不可变描述），之后只读；worker 按 position 分块
+-- 还原节点载荷。主键 (index_id, position) 保证顺序唯一不重复。
+CREATE TABLE IF NOT EXISTS causal_index_members (
+    index_id        TEXT NOT NULL,
+    position        INTEGER NOT NULL,          -- 0 起的因果顺序
+    node_id         TEXT NOT NULL,             -- 稳定节点标识（event:<seq> 等）
+    node_type       TEXT NOT NULL,             -- lease_event/write/delegation/...
+    object_id       TEXT NOT NULL,             -- 序号 / write_id / 凭证号 / 归档号 ...
+    anchor_seq      INTEGER NOT NULL,          -- 锚定的审计序号（同层排序用）
+    descriptor_json TEXT NOT NULL,             -- 创建时冻结的不可变成员描述
+    PRIMARY KEY (index_id, position)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_causal_member_node
+    ON causal_index_members(index_id, node_id);
+-- 分块还原的节点载荷：主键 (index_id, node_id) + INSERT OR IGNORE，
+-- 服务重启续跑、失败重试都不会重复写入或写出矛盾内容。
+CREATE TABLE IF NOT EXISTS causal_index_nodes (
+    index_id      TEXT NOT NULL,
+    node_id       TEXT NOT NULL,
+    node_type     TEXT NOT NULL,
+    position      INTEGER NOT NULL,            -- 冗余成员位置，便于按因果顺序取页
+    payload_sha256 TEXT NOT NULL,
+    payload       TEXT NOT NULL,               -- 节点载荷的规范化 JSON
+    PRIMARY KEY (index_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_causal_nodes_position
+    ON causal_index_nodes(index_id, position);
 """
 
 

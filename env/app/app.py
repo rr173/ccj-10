@@ -63,6 +63,34 @@
                                                 原文与组合顺序完整性，
                                                 失败给出首个差异位置
   POST   /audit/evidence/<id>/retry             失败的证据包复位重试（从已存进度继续）
+审计因果索引（只写 causal_index_* 自有表，绝不修改租约/委托/原始历史/
+归档/证据包）：
+  POST   /audit/causal-indexes                  创建因果索引
+                                                {scope: resource|credential|
+                                                 evidence_package,
+                                                 resource?|credential_id?|package_id?,
+                                                 at_seq?|at_wall_ms?|head?,
+                                                 filters?, idempotency_key}
+                                                同作用域+同快照节点+同过滤+同键
+                                                → 同一份（200 回放）；同键换
+                                                范围/节点/过滤 → 409
+  GET    /audit/causal-indexes                  列索引（?scope&status&limit）
+  GET    /audit/causal-indexes/<id>             查生成进度/状态/链摘要/核验标记
+  GET    /audit/causal-indexes/<id>/chain       按因果顺序分页查询链路
+                                                （?after=<position>&limit=，
+                                                报告断链/环路/重号/缺源归档等）
+  GET    /audit/causal-indexes/<id>/nodes/<node_id>
+                                                查单个冻结节点
+  POST   /audit/causal-indexes/<id>/nodes/<node_id>/rebuild
+                                                从冻结事件/归档清单独立重建节点
+                                                （只读）并与冻结节点比对
+  GET    /audit/causal-indexes/<id>/download    下载冻结的链文档（含链摘要/
+                                                总校验值；未完成 409）
+  POST   /audit/causal-indexes/<id>/verify      独立核验：从冻结审计事件与
+                                                归档清单重算整条链路，通过
+                                                verified / 失败 verify_failed
+                                                （给出首个差异节点/字段/双方值）
+  POST   /audit/causal-indexes/<id>/retry       失败的索引复位重试（从已存进度继续）
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
   POST   /debug/tick           手动推进逻辑钟
   POST   /debug/wall-shift     拨墙钟（可正可负）
@@ -95,6 +123,14 @@ from .evidence import (
     EvidencePackageManager,
     EvidenceSourceNotFound,
     EvidenceSourceNotReady,
+)
+from .causal import (
+    CausalBadState,
+    CausalIdConflict,
+    CausalIndexManager,
+    CausalNotFound,
+    CausalNotReady,
+    CausalSourceNotFound,
 )
 from .audit import (
     AuditBadRequest,
@@ -151,6 +187,11 @@ def create_app(
     evidence = EvidencePackageManager(
         store, chunk_size=_env_int("EVIDENCE_CHUNK_SIZE", 1))
     app.extensions["evidence"] = evidence
+    # 审计因果索引：组织事件/写入/委托/源归档/证据包条目为有向因果链，
+    # 只写 causal_index_* 自有表
+    causal = CausalIndexManager(
+        store, audit, chunk_size=_env_int("CAUSAL_CHUNK_SIZE", 100))
+    app.extensions["causal"] = causal
     if enable_debug_api is None:
         enable_debug_api = os.environ.get("ENABLE_DEBUG_API", "1") == "1"
 
@@ -543,6 +584,84 @@ def create_app(
         return jsonify(evidence.retry(package_id))
 
     # ------------------------------------------------------------------
+    # 审计因果索引
+    #
+    # 把作用域内的租约事件、写入、委托、源归档、证据包条目组织成可查询
+    # 的有向因果链。创建时冻结 snapshot_seq、查询范围与过滤条件，成员集合
+    # 同事务落库；后台分块还原节点，进度落库，重启/失败续跑，重试不重复
+    # 写入。所有接口只写 causal_index_* 自有表，绝不修改租约、委托、原始
+    # 审计历史、源归档或证据包。
+    # ------------------------------------------------------------------
+    @app.post("/audit/causal-indexes")
+    def causal_create():
+        data = body()
+        view, created = causal.create_index(
+            scope=data.get("scope"),
+            resource=data.get("resource"),
+            credential_id=data.get("credential_id"),
+            package_id=data.get("package_id"),
+            at_seq=data.get("at_seq"),
+            at_wall_ms=data.get("at_wall_ms"),
+            head=bool(data.get("head", False)),
+            filters=data.get("filters"),
+            idempotency_key=data.get("idempotency_key"),
+        )
+        # 同作用域+同快照节点+同范围+同过滤+同键：200 回放同一份索引
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/causal-indexes")
+    def causal_list():
+        return jsonify(causal.list_indexes(
+            scope=request.args.get("scope"),
+            status=request.args.get("status"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/causal-indexes/<index_id>")
+    def causal_status(index_id):
+        return jsonify(causal.get_index(index_id))
+
+    @app.get("/audit/causal-indexes/<index_id>/chain")
+    def causal_chain(index_id):
+        return jsonify(causal.get_chain(
+            index_id,
+            after=request.args.get("after"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/causal-indexes/<index_id>/nodes/<node_id>")
+    def causal_node(index_id, node_id):
+        # 单节点查询：取冻结载荷（只读）
+        return jsonify(causal.get_frozen_node(index_id, node_id))
+
+    @app.post("/audit/causal-indexes/<index_id>/nodes/<node_id>/rebuild")
+    def causal_node_rebuild(index_id, node_id):
+        return jsonify(causal.rebuild_node(index_id, node_id))
+
+    @app.get("/audit/causal-indexes/<index_id>/download")
+    def causal_download(index_id):
+        text, view = causal.download(index_id)
+        return Response(
+            text, mimetype="application/json",
+            headers={
+                "Content-Disposition":
+                    f'attachment; filename="audit-causal-index-'
+                    f'{index_id}.json"',
+                "X-Causal-SHA256": view["content_sha256"] or "",
+                "X-Causal-Chain-Digest": view["chain_digest"] or "",
+            },
+        )
+
+    @app.post("/audit/causal-indexes/<index_id>/verify")
+    def causal_verify(index_id):
+        return jsonify(causal.verify(index_id))
+
+    @app.post("/audit/causal-indexes/<index_id>/retry")
+    def causal_retry(index_id):
+        return jsonify(causal.retry(index_id))
+
+    # ------------------------------------------------------------------
     # 调试：手动驱动两种时钟，演练"拨表/逻辑卡死"故障
     # ------------------------------------------------------------------
     @app.post("/debug/tick")
@@ -602,6 +721,16 @@ def create_app(
     def _evidence_error(exc: EvidenceError):
         # 证据包显式错误：不存在/源归档不存在 404、未完成/源归档未完成 409、
         # 幂等键/清单冲突 409、状态不允许 409
+        return jsonify(exc.to_response()), exc.status
+
+    @app.errorhandler(CausalNotFound)
+    @app.errorhandler(CausalSourceNotFound)
+    @app.errorhandler(CausalNotReady)
+    @app.errorhandler(CausalIdConflict)
+    @app.errorhandler(CausalBadState)
+    def _causal_error(exc):
+        # 因果索引显式错误：索引/证据包源不存在 404、未完成 409、
+        # 同键换范围/节点/过滤冲突 409、状态不允许 409
         return jsonify(exc.to_response()), exc.status
 
     @app.errorhandler(GenerationTooSmall)
@@ -667,10 +796,15 @@ def create_app(
                 evidence.process_pending()
             except Exception:  # noqa: BLE001
                 app.logger.exception("证据包后台处理失败")
+            try:
+                causal.process_pending()
+            except Exception:  # noqa: BLE001
+                app.logger.exception("因果索引后台处理失败")
 
     if start_archive_worker:
         archive.process_pending()  # 启动即续跑重启前未完成的归档
         evidence.process_pending()  # 同步续跑未完成的证据包
+        causal.process_pending()  # 同步续跑未完成的因果索引
         t = threading.Thread(target=_run_archive_worker,
                              name="archive-worker", daemon=True)
         t.start()

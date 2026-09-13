@@ -428,6 +428,119 @@ POST /audit/evidence
 | 对非 failed 证据包发起重试 | 409 | `evidence_bad_state` |
 | archives 非数组、条目非法、缺幂等键、非法 include/metadata/status | 400 | `bad_request` |
 
+## 审计因果索引（audit causal index）
+
+在租约服务、审计回放、可验证归档与证据包能力之上，因果索引把一次管理员
+任务作用范围内的**租约事件、写入、委托、源归档、证据包条目**组织成一条
+可查询的**有向因果链**，并提供创建进度、链路查询、节点重建与独立完整性
+核验。任何索引、查询或核验操作都只写 `causal_indexes` /
+`causal_index_members` / `causal_index_nodes` 三张自有表，**绝不修改租约、
+委托、原始审计历史、源归档或证据包**。
+
+### 作用域与冻结
+
+```
+POST /audit/causal-indexes
+{"scope":"resource","resource":"cfg-1","head":true,"idempotency_key":"ci-1"}
+{"scope":"credential","credential_id":"ab12...","at_seq":40,"idempotency_key":"ci-2",
+ "filters":{"outcomes":["ok"],"event_types":["write","delegate_write"],
+            "from_ms":...,"to_ms":...,"seq_min":...,"seq_max":...}}
+{"scope":"evidence_package","package_id":"<证据包id>","idempotency_key":"ci-3"}
+```
+
+- 三种作用域：`resource`（资源）、`credential`（委托凭证）、
+  `evidence_package`（证据包，跨资源混合链路）；
+- **创建时一次性冻结**三样东西：`snapshot_seq`（稳定视图上界）、查询范围
+  （作用域 + 历史节点 `at_seq` / `at_wall_ms` / `head` 三选一，证据包
+  作用域的历史节点就是包创建时钉死的快照）、过滤条件（规范化 JSON 落库）；
+- 成员集合（节点标识、类型、对象标识、锚点序号、不可变描述）在创建事务里
+  同批写入 `causal_index_members`，链包含哪些节点、按什么顺序排列在创建时
+  就固定；**生成期间新增事件、再次核验源归档、新增归档或证据包都进不了
+  已冻结的因果链**；
+- 资源/凭证作用域只收录创建时**已完成**且冻结节点不晚于索引历史节点的源
+  归档；证据包作用域收录包的全部条目、每份源归档及其覆盖的事件（去重），
+  证据包不存在 → 404 `causal_source_not_found`。
+
+幂等与冲突：**同作用域、同快照节点、同范围、同过滤、同幂等键**重复创建
+只返回同一份索引（HTTP 200 + `"replayed": true`）；**同一幂等键换作用域/
+换节点/换范围/换过滤** → 409 `causal_index_id_conflict`，响应
+`first_difference` 给出首个差异字段（如 `node_seq` / `filters.outcomes`）
+与双方值。
+
+### 因果分层与节点
+
+节点按因果分层排列（同层按锚点审计序号，节点顺序即因果顺序）：
+
+| 层 | 节点类型 | node_id | 对象标识 / 锚点 |
+|---|---|---|---|
+| 0 | `lease_event` 租约事件 | `event:<seq>` | 全局审计序号 |
+| 1 | `write` 接受的写入 | `write:<write_id>` | 对应成功写入事件序号 |
+| 1 | `delegation` 委托凭证 | `delegation:<credential_id>` | 发放事件序号（状态由冻结事件纯重放） |
+| 2 | `source_archive` 源归档 | `archive:<archive_id>` | 归档冻结节点 `node_seq` |
+| 3 | `evidence_entry` 证据包条目 | `evidence:<package_id>:<position>` | 该条源归档的 `node_seq` |
+
+事件层按**全局 seq** 交错，因此证据包作用域天然形成跨资源混合链路；每个
+节点记录链上的 `prev` / `next` 节点标识（首节点无前驱、末节点无后继）。
+
+### 生成进度与断点续跑
+
+后台 worker 按块（`CAUSAL_CHUNK_SIZE`，默认 100 个成员/块）从冻结的审计
+事件与归档清单还原节点载荷，每块一个事务、进度落库
+（`processed_nodes` / `last_position`，`GET` 可见 `progress.percent`）。
+服务重启或后台失败后从已保存位置继续；节点表主键
+`(index_id, node_id)` + `INSERT OR IGNORE` 保证**失败重试不重复写入**。
+自动重试上限 5 次，`POST /audit/causal-indexes/<id>/retry` 可手动复位
+`failed` 索引（进度保留）。
+
+### 链路查询、分页与异常报告
+
+`GET /audit/causal-indexes/<id>/chain?after=<上一页最后position>&limit=`
+按因果顺序返回每个节点的事件序号、对象标识、前置、后继与载荷；游标是
+固定快照下的节点位置，分页结果不随后续写入漂移，游标越过末位 → 416
+`node_out_of_range`。响应的 `anomalies` / `anomaly_summary` 报告：
+
+- **断链** `chain_broken`：节点的 prev/next 与因果邻接不一致或指向缺失节点；
+- **环路** `chain_cycle`：沿 next 指针重复访问到同一节点；
+- **重复序号** `duplicate_seq`：多个事件节点引用同一审计 seq；
+- **缺失/漂移源归档** `source_archive_missing` / `source_archive_changed`
+  / `source_archive_verify_failed`：源归档被删除、内容哈希变化，或源归档
+  自身独立核验已失败（其内容不可信）；
+- **缺失/漂移证据包条目** `evidence_entry_missing` /
+  `evidence_entry_changed`：证据包、条目或冻结载荷缺失，或归档标识/源哈希
+  /冻结载荷哈希变化。
+
+未完成的索引不能查询/下载/核验（409 `causal_index_not_ready`）。
+单节点可用 `GET /audit/causal-indexes/<id>/nodes/<node_id>` 取冻结载荷；
+`POST .../nodes/<node_id>/rebuild` **只读地**从冻结事件/归档清单独立重建
+该节点并与冻结节点逐字段比对，返回 `matches` 与 `first_divergence`
+（源事件被删导致无法重建时给出 `<missing>`，不写任何表）。
+
+### 链文档、链摘要与独立核验
+
+`GET /audit/causal-indexes/<id>/download` 返回落库链文档（字节稳定，
+响应头带 `X-Causal-SHA256` 与 `X-Causal-Chain-Digest`）。`chain_digest`
+是顺序敏感的链式哈希（`sha256-causal-chain-v1`，固定初值起逐步混入位置、
+节点标识与节点载荷哈希）；`content_sha256` 是除本字段外规范化 JSON 的
+总校验值。空结果（过滤后零节点）也是合法完成态，链为空且摘要确定。
+
+`POST /audit/causal-indexes/<id>/verify` 重新从**冻结的审计事件与归档
+清单**计算整条链路，按序核验：文档总校验值 → 源归档/证据包条目可用性
+（存在、源归档自身核验未失败、内容哈希未变）→ 成员集合 → 每个事件/写入/
+委托节点逐字段可独立重建（同时核对下载文档与冻结表）→ 链摘要。任一失败
+标记 `verify_failed` 并在 `first_divergence` 给出**首个差异节点标识
+（node_id）、字段路径（path，如 `nodes[0].event.holder`）与双方值
+（archived / recomputed）**；全部通过标记 `verified`（重启不丢）。
+
+| 场景 | 状态码 | error |
+|---|---|---|
+| 索引不存在 / 节点不在链中 | 404 | `causal_index_not_found` |
+| 证据包作用域指向的证据包不存在 | 404 | `causal_source_not_found` |
+| 未完成就查询/下载/核验/重建 | 409 | `causal_index_not_ready` |
+| 同幂等键换作用域/节点/范围/过滤 | 409 | `causal_index_id_conflict`（附首个差异） |
+| 对非 failed 索引起重试 | 409 | `causal_index_bad_state` |
+| 分页游标越过链末 | 416 | `node_out_of_range` |
+| 非法 scope/过滤/节点选择器、缺幂等键 | 400 | `bad_request` |
+
 
 ## 持久性
 
@@ -437,10 +550,12 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 **审计归档与冻结事件副本（归档进度、内容校验值与核验标记）**、
 **审计证据包与冻结清单/收录载荷（组合顺序、每份源归档内容哈希、
 组合摘要、总校验值与核验标记）**、
+**审计因果索引与冻结成员集合/节点载荷（snapshot_seq、范围与过滤、
+因果链摘要、总校验值与核验标记）**、
 逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
 正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放，
 **审计回放、节点比较与一致性诊断对同一份历史给出逐字节一致的结果**；
-启动时即按墙钟收割已到期的委托，并自动续跑未完成的归档与证据包生成。
+启动时即按墙钟收割已到期的委托，并自动续跑未完成的归档、证据包与因果索引生成。
 旧版本数据库会在启动时自动补列迁移。
 逻辑钟由后台 ticker 每秒 +1（每次推进都 fsync 落库）。
 
@@ -483,6 +598,15 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 | GET | `/audit/evidence/<id>/download` | **下载证据包文档**（清单+原文/稳定引用+组合摘要+总校验值；未完成 409） |
 | POST | `/audit/evidence/<id>/verify` | **独立核验**：逐份检查源归档存在性/自身核验可信/内容哈希/原文与组合顺序完整性，失败给出首个差异的归档标识、字段路径与双方值 |
 | POST | `/audit/evidence/<id>/retry` | 手动复位 `failed` 证据包，从已保存进度继续（非 failed 409） |
+| POST | `/audit/causal-indexes` | **创建审计因果索引**：`{scope: resource\|credential\|evidence_package, resource?\|credential_id?\|package_id?, at_seq?\|at_wall_ms?\|head?, filters?, idempotency_key}`；同作用域+同快照节点+同过滤+同键返回同一份（200 回放），同键换范围/节点/过滤 409 |
+| GET | `/audit/causal-indexes` | 列因果索引（`?scope=&status=&limit=`） |
+| GET | `/audit/causal-indexes/<id>` | **查索引进度**：状态、已还原/总节点数、冻结范围与过滤、链摘要、总校验值、核验标记 |
+| GET | `/audit/causal-indexes/<id>/chain` | **按因果顺序分页查询链路**（`?after=<position>&limit=`）：每节点事件序号/对象标识/前置/后继，报告断链/环路/重号/缺源归档/缺证据包条目 |
+| GET | `/audit/causal-indexes/<id>/nodes/<node_id>` | 取单个冻结节点载荷（只读） |
+| POST | `/audit/causal-indexes/<id>/nodes/<node_id>/rebuild` | **节点重建**：从冻结事件/归档清单独立重算单节点并与冻结节点比对（只读，不写任何表） |
+| GET | `/audit/causal-indexes/<id>/download` | **下载链文档**（全部节点+链摘要+总校验值；未完成 409） |
+| POST | `/audit/causal-indexes/<id>/verify` | **独立核验**：从冻结审计事件与归档清单重算链路，失败给出首个差异节点标识、字段路径与双方值 |
+| POST | `/audit/causal-indexes/<id>/retry` | 手动复位 `failed` 索引，从已保存进度继续（非 failed 409） |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
 | GET | `/debug/now` | 两种时钟当前读数 |
@@ -544,6 +668,7 @@ curl -s localhost:8080/writes/1
 | `ARCHIVE_CHUNK_SIZE` | 100 | 归档后台生成时每块冻结的事件条数（每块提交一次、进度落库） |
 | `ARCHIVE_WORKER_INTERVAL_S` | 0.2 | 后台归档 worker 的轮询间隔（秒；归档与证据包共用） |
 | `EVIDENCE_CHUNK_SIZE` | 1 | 证据包后台生成时每块冻结的归档条目数（每块提交一次、进度落库） |
+| `CAUSAL_CHUNK_SIZE` | 100 | 因果索引后台生成时每块还原的成员节点数（每块提交一次、进度落库） |
 | `ENABLE_DEBUG_API` | 1 | 是否开放 `/debug/*` 故障演练接口 |
 
 ## 测试
@@ -592,3 +717,18 @@ finalize 失败重试不重复写入冻结事件、
 核验通过与六类失败（源归档删除、源内容哈希变化、下载文档篡改、
 组合顺序重排、冻结载荷伪造、内嵌原文漂移）的首个差异归档标识/字段路径/双方值、
 证据包全流程不修改租约/委托/原始历史/源归档、未完成/不存在/源未就绪等显式错误。
+审计因果索引覆盖：资源/凭证/证据包三种作用域的创建-分块生成-链路查询-
+下载-链摘要-核验闭环，因果分层（事件→写入/委托→源归档→证据包条目）
+与 prev/next 邻接、跨资源混合链路按全局 seq 交错、
+空结果（过滤后零节点、确定摘要与校验值）、
+同作用域+同节点+同过滤+同键重放（含 8 线程并发同键创建）、
+同键换节点/换过滤/换作用域/证据包换包的显式冲突（首个差异字段与双方值）、
+创建即冻结（生成期间新增事件、再核验源归档、新增归档均不进链）、
+固定快照游标分页与越界 416、分块进度、finalize 失败后自动/手动续跑且
+不重复写入节点、服务重启后续跑且链文档逐字节一致、
+断链/环路/重号/缺失源归档/缺失证据包条目等异常报告、
+节点重建一致/漂移/源已删、
+核验通过与删原始事件/篡改链文档（含连校验值一起伪造）/篡改冻结节点表/
+源归档核验失败/源归档删除或内容哈希变化/证据条目缺失等篡改的
+首个差异节点标识/字段路径/双方值、
+全流程不修改租约/委托/原始历史/源归档/证据包、未完成/不存在等显式错误。
