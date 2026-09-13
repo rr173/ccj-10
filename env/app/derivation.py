@@ -529,8 +529,15 @@ class DerivationManager:
         old_filters = json.loads(prev["filters_json"])
         if old_filters != filt:
             diff = first_diff(old_filters, filt, "filters")
-            return diff or {"path": "filters", "field": "filters",
-                            "existing": old_filters, "requested": filt}
+            if diff is None:
+                return {"path": "filters", "field": "filters",
+                        "existing": old_filters, "requested": filt}
+            # 与其它规格字段统一为 existing/requested，同时保留
+            # first_diff 的 path 与 archived/recomputed 别名
+            diff.setdefault("field", diff["path"])
+            diff["existing"] = diff.get("archived")
+            diff["requested"] = diff.get("recomputed")
+            return diff
         return None
 
     # ======================================================================

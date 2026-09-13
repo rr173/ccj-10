@@ -497,7 +497,82 @@ def test_same_key_different_filters_conflict(client):
     assert rv.status_code == 409
     body = rv.get_json()
     assert body["error"] == "causal_derivation_id_conflict"
-    assert body["first_difference"]["path"].startswith("filters")
+    diff = body["first_difference"]
+    assert diff["path"].startswith("filters")
+    # 双方值必须随冲突一起给出，不能静默复用旧任务
+    assert diff["existing"] is None
+    assert diff["requested"] == ["rejected"]
+
+
+def test_same_key_changed_explicit_filters_conflicts(client):
+    # 用户场景：相同基线 + 相同幂等键，两次都显式给过滤条件但值不同，
+    # 必须 409，绝不能把不同过滤条件当成同一个派生任务回放 200。
+    build_resource_history(client, n=3)
+    bid = make_index(client, {"scope": "resource", "resource": "r1",
+                              "head": True, "idempotency_key": "b"})
+    finish_index(client, bid)
+    r1 = create_derivation(client, bid, "k",
+                           filters={"outcomes": ["ok"]})
+    assert r1.status_code == 201
+    first_id = r1.get_json()["derivation_id"]
+
+    rv = create_derivation(client, bid, "k",
+                           filters={"outcomes": ["rejected"]})
+    assert rv.status_code == 409
+    body = rv.get_json()
+    assert body["error"] == "causal_derivation_id_conflict"
+    assert body["derivation_id"] == first_id
+    diff = body["first_difference"]
+    assert diff["path"].startswith("filters.outcomes")
+    assert diff["existing"] == "ok"
+    assert diff["requested"] == "rejected"
+
+
+@pytest.mark.parametrize("second_filters", [
+    {"event_types": ["acquire"]},
+    {"seq_min": 2},
+    {"seq_max": 3},
+    {"from_ms": 1},
+    {"to_ms": 10_000_000},
+    {"outcomes": ["ok", "rejected"]},
+])
+def test_same_key_any_filter_dimension_change_conflicts(client, second_filters):
+    build_resource_history(client, n=3)
+    bid = make_index(client, {"scope": "resource", "resource": "r1",
+                              "head": True, "idempotency_key": "b"})
+    finish_index(client, bid)
+    assert create_derivation(
+        client, bid, "k", filters={"outcomes": ["ok"]}).status_code == 201
+    rv = create_derivation(client, bid, "k", filters=second_filters)
+    assert rv.status_code == 409, rv.get_json()
+    assert rv.get_json()["error"] == "causal_derivation_id_conflict"
+
+
+def test_unknown_filter_key_rejected_not_silently_ignored(client):
+    # 拼写错误/文档外的过滤键不能被静默吞掉，否则两次"不同过滤"会规范化成
+    # 同一规格并错误回放 200
+    build_resource_history(client, n=2)
+    bid = make_index(client, {"scope": "resource", "resource": "r1",
+                              "head": True, "idempotency_key": "b"})
+    finish_index(client, bid)
+    rv = create_derivation(client, bid, "k",
+                           filters={"outcome": ["ok"]})  # 少了 s
+    assert rv.status_code == 400
+    assert rv.get_json()["error"] == "bad_request"
+    assert "outcome" in rv.get_json()["unknown_filters"]
+
+
+def test_same_key_omitted_then_explicit_filters_conflicts(client):
+    # 第一次显式窄过滤、第二次省略 filters（继承基线=无过滤），规格不同 -> 409
+    build_resource_history(client, n=3)
+    bid = make_index(client, {"scope": "resource", "resource": "r1",
+                              "head": True, "idempotency_key": "b"})
+    finish_index(client, bid)
+    assert create_derivation(
+        client, bid, "k", filters={"outcomes": ["ok"]}).status_code == 201
+    rv = create_derivation(client, bid, "k")
+    assert rv.status_code == 409
+    assert rv.get_json()["error"] == "causal_derivation_id_conflict"
 
 
 def test_same_spec_different_key_conflicts(client):

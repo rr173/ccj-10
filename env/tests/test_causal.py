@@ -393,6 +393,17 @@ def test_same_scope_node_filter_key_returns_same_index(client):
     assert r4.get_json()["first_difference"]["path"].startswith("filters")
 
 
+def test_unknown_filter_key_rejected_not_ignored(client):
+    # 拼写错误/文档外的过滤键必须 400，不能被静默吞掉后错误命中幂等回放
+    build_history(client, "cx-badf")
+    rv = create_index(client, {"scope": "resource", "resource": "cx-badf",
+                               "head": True, "idempotency_key": "k",
+                               "filters": {"outcome": ["ok"]}})
+    assert rv.status_code == 400
+    assert rv.get_json()["error"] == "bad_request"
+    assert "outcome" in rv.get_json()["unknown_filters"]
+
+
 def test_same_key_changed_scope_conflicts_on_real_credential(client):
     _, _, cid, _, _ = build_history(client, "cx-idem2")
     r1 = create_index(client, {"scope": "credential", "credential_id": cid,

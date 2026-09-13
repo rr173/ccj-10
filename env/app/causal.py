@@ -181,6 +181,19 @@ def normalize_filters(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise AuditBadRequest("filters 必须是对象（JSON）")
 
+    # 只允许已知过滤维度：未知键（含拼写错误，如 ``outcome`` 少个 s）必须
+    # 明确 400，绝不能被静默丢弃——否则两份"过滤条件不同"的请求会规范化成
+    # 同一规格，从而错误地命中幂等回放，把不同派生任务当成同一个任务。
+    known = {"outcomes", "event_types", "events", "from_ms", "to_ms",
+             "seq_min", "seq_max"}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise AuditBadRequest(
+            "filters 含不支持的过滤字段：" + "、".join(unknown)
+            + "；可用字段为 outcomes / event_types / from_ms / to_ms / "
+              "seq_min / seq_max",
+            unknown_filters=unknown)
+
     def as_int(value, name):
         if value in (None, ""):
             return None
@@ -466,8 +479,15 @@ class CausalIndexManager:
         old_filters = json.loads(prev["filters_json"])
         if old_filters != filt:
             diff = first_diff(old_filters, filt, "filters")
-            return diff or {"path": "filters", "field": "filters",
-                            "existing": old_filters, "requested": filt}
+            if diff is None:
+                return {"path": "filters", "field": "filters",
+                        "existing": old_filters, "requested": filt}
+            # 与其它规格字段统一为 existing/requested，同时保留
+            # first_diff 的 path 与 archived/recomputed 别名
+            diff.setdefault("field", diff["path"])
+            diff["existing"] = diff.get("archived")
+            diff["requested"] = diff.get("recomputed")
+            return diff
         return None
 
     # ---- 成员集合（创建时冻结） ----------------------------------------
