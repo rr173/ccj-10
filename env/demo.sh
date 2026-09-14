@@ -304,3 +304,90 @@ from collections import Counter
 print('   ', dict(Counter(x['status'] for x in d['deliveries'])))
 "
 echo "订阅流程只写自有表：源审计历史、租约、委托、索引、归档、证据包、发布计划均不被改写。"
+
+# ---------------------------------------------------------------------------
+# 24. 订阅版本切换（预创建 -> 差异 -> 原子激活 -> 边界路由 -> 审计历史）
+# ---------------------------------------------------------------------------
+echo
+echo "== 24. 订阅版本切换 =="
+# 用独立资源演示，避免与前面演练的短 TTL 租约互相干扰
+VR="demo-ver-$RANDOM$RANDOM"
+VGEN=$(curl -s -X POST "$BASE/leases/acquire" -H 'Content-Type: application/json' \
+  -d "{\"resource\":\"$VR\",\"holder\":\"ver-1\",\"ttl_ms\":600000}" \
+  | j "['lease']['generation']")
+# 先写两条边界前事件（v1 范围）
+curl -s -X POST "$BASE/resources/$VR/writes" -H 'Content-Type: application/json' \
+  -d "{\"holder\":\"ver-1\",\"generation\":$VGEN,\"value\":\"before-1\"}" >/dev/null
+curl -s -X POST "$BASE/resources/$VR/writes" -H 'Content-Type: application/json' \
+  -d "{\"holder\":\"ver-1\",\"generation\":$VGEN,\"value\":\"before-2\"}" >/dev/null
+VSUB=$(curl -s -X POST "$BASE/audit/subscriptions" -H 'Content-Type: application/json' \
+  -d "{\"scope\":\"resource\",\"resource\":\"$VR\",\"callback_url\":\"http://127.0.0.1:9/v1\",\"start_seq\":0,\"idempotency_key\":\"demo-ver-$VR\"}")
+VSID=$(echo "$VSUB" | j "['subscription_id']")
+echo "   新订阅 $VSID（资源 $VR，v1 回调不可达）"
+# 越过稳定历史上界的预创建 -> 416（必须在创建待激活版本之前演示）
+echo "   生效序号越过稳定历史上界 -> 416 且原订阅不变："
+curl -s -o /tmp/voor.json -w "    HTTP %{http_code} " -X POST \
+  "$BASE/audit/subscriptions/$VSID/versions" -H 'Content-Type: application/json' \
+  -d "{\"callback_url\":\"http://x/\",\"effective_seq\":999999999,\"idempotency_key\":\"demo-ver-oor-$VR\"}"
+python3 -c "import json;d=json.load(open('/tmp/voor.json'));print(d['error'],'available_max_seq=%s' % d['available_max_seq'])"
+# 生效序号取当前稳定历史上界（含）；预创建后边界立即钉住，下一条事件
+# （下面切换后写入）即按新版本投递。后台 worker 持续扫描，故建订阅后
+# 立即预创建。
+EFF=$(curl -s "$BASE/audit/events?limit=1000" \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['events'][-1]['seq'])")
+echo "   预创建 v2（生效序号 $EFF，新回调地址，只要 write 事件），同键重放："
+curl -s -X POST "$BASE/audit/subscriptions/$VSID/versions" -H 'Content-Type: application/json' \
+  -d "{\"callback_url\":\"http://127.0.0.1:9/v2\",\"filters\":{\"event_types\":[\"write\"]},\"effective_seq\":$EFF,\"idempotency_key\":\"demo-ver-prep-$VR\"}" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('    v%s status=%s eff=%s' % (d['version_no'],d['status'],d['effective_seq']))"
+curl -s -o /tmp/vreplay.json -w "    同键重放 HTTP %{http_code} replayed=" -X POST \
+  "$BASE/audit/subscriptions/$VSID/versions" -H 'Content-Type: application/json' \
+  -d "{\"callback_url\":\"http://127.0.0.1:9/v2\",\"filters\":{\"event_types\":[\"write\"]},\"effective_seq\":$EFF,\"idempotency_key\":\"demo-ver-prep-$VR\"}"
+python3 -c "import json;print(json.load(open('/tmp/vreplay.json'))['replayed'])"
+echo "   同键换回调 -> 409："
+curl -s -o /tmp/vconf.json -w "    HTTP %{http_code} " -X POST \
+  "$BASE/audit/subscriptions/$VSID/versions" -H 'Content-Type: application/json' \
+  -d "{\"callback_url\":\"http://changed/\",\"effective_seq\":$EFF,\"idempotency_key\":\"demo-ver-prep-$VR\"}"
+python3 -c "import json;d=json.load(open('/tmp/vconf.json'));print(d['error'],'首个差异:',d['first_difference']['path'])"
+echo "   版本差异（相对当前 v1）："
+curl -s "$BASE/audit/subscriptions/$VSID/versions/2/diff" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for x in d['differences']:
+    print('    -',x['path'],':',x['existing'],'->',x['requested'])
+"
+echo "   原子激活（同键重放；换键重复激活 409）："
+curl -s -X POST "$BASE/audit/subscriptions/$VSID/versions/2/activate" -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"demo-ver-act-'$R'"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('    -> v%s status=%s' % (d['version_no'],d['status']))"
+curl -s -o /dev/null -w "    换键重复激活 -> HTTP %{http_code}\n" -X POST \
+  "$BASE/audit/subscriptions/$VSID/versions/2/activate" -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"demo-ver-act-other"}'
+curl -s "$BASE/audit/subscriptions/$VSID" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print('    当前版本=%s 回调=%s 版本状态=%s' % (d['current_version'],d['callback_url'],{v['version_no']:v['status'] for v in d['versions']}))
+"
+echo "   切换后写入两条新事件：只进入 v2（回调不可达会退避，但版本路由可见）："
+curl -s -X POST "$BASE/resources/$VR/writes" -H 'Content-Type: application/json' \
+  -d "{\"holder\":\"ver-1\",\"generation\":$VGEN,\"value\":\"after-1\"}" >/dev/null
+curl -s -X POST "$BASE/resources/$VR/writes" -H 'Content-Type: application/json' \
+  -d "{\"holder\":\"ver-1\",\"generation\":$VGEN,\"value\":\"after-2\"}" >/dev/null
+curl -s -X POST "$BASE/audit/subscriptions/process" -d '{}' >/dev/null
+curl -s "$BASE/audit/subscriptions/$VSID/deliveries?limit=10" | python3 -c "
+import sys,json
+for d in json.load(sys.stdin)['deliveries']:
+    print('    event_seq=%s version=v%s 订阅序号=%s 状态=%s' % (d['event_seq'],d['version_no'],d['subscription_seq'],d['status']))
+"
+echo "   只重试某版本死信（空操作也幂等）："
+curl -s -X POST "$BASE/audit/subscriptions/$VSID/versions/2/retry-dead-letters" -H 'Content-Type: application/json' \
+  -d '{"idempotency_key":"demo-ver-retry"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('    -> requeued=%s' % d['requeued'])"
+echo "   订阅自己的审计历史（只追加：创建/拒绝原因/激活）："
+curl -s "$BASE/audit/subscriptions/$VSID/history?limit=100" | python3 -c "
+import sys,json
+for e in json.load(sys.stdin)['events']:
+    v = 'v%s' % e['version_no'] if e['version_no'] is not None else '-'
+    print('    #%s %s %s/%s' % (e['id'], v, e['event'], e['outcome']))
+"
+curl -s -X POST "$BASE/audit/subscriptions/$VSID/cancel" -d '{}' >/dev/null
+echo "版本切换只写订阅自有表：租约、委托、原始审计事件与已有投递记录均不被改写。"

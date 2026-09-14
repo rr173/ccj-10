@@ -497,8 +497,10 @@ CREATE TABLE IF NOT EXISTS audit_subscriptions (
     filters_json      TEXT NOT NULL,                  -- 创建时冻结的规范化过滤条件
     start_seq         INTEGER NOT NULL,               -- 登记的起始历史序号（含）
     position_seq      INTEGER NOT NULL,               -- 扫描游标：下一个待检视 seq
-    sub_seq           INTEGER NOT NULL DEFAULT 0,     -- 已入队通知数（订阅序号）
+    sub_seq           INTEGER NOT NULL DEFAULT 0,     -- 已入队通知数（订阅序号，版本1）
     snapshot_seq      INTEGER NOT NULL,               -- 创建时钉死的稳定视图上界
+    current_version   INTEGER NOT NULL DEFAULT 1,     -- 当前生效版本号
+    pending_version   INTEGER,                        -- 预创建待激活的版本号
     status            TEXT NOT NULL DEFAULT 'active',
     blocked           INTEGER NOT NULL DEFAULT 0,     -- 有 dead_letter 挡队
     max_attempts      INTEGER NOT NULL DEFAULT 5,
@@ -546,6 +548,72 @@ CREATE INDEX IF NOT EXISTS idx_delivery_due
     ON audit_subscription_deliveries(status, next_retry_at_ms);
 CREATE INDEX IF NOT EXISTS idx_delivery_sub_order
     ON audit_subscription_deliveries(subscription_id, event_seq);
+-- 订阅版本切换：管理员为活动订阅预创建带新回调地址、新事件过滤条件与
+-- 生效历史序号（effective_seq，含）的下一版本。版本切换在一个事务内
+-- 原子完成：旧版本（superseded）只继续处理切换前已入队/进行中的通知
+-- （投递行冻结了当时的回调地址、密钥、过滤条件与订阅序号），生效序号
+-- 之后新匹配的事件只能进入新版本（active）。同一订阅的两个版本在
+-- 投递表内按**全局 event_seq** 共享同一条严格顺序队列，队首约束保证
+-- 旧版本未确认通知与新版本通知互不越过、不重复、不丢失。
+-- status: prepared（预创建待激活）/ active（当前生效版本）/
+--         superseded（已被下一版本切换，只做收尾投递）/
+--         cancelled（预创建版本被取消，永不生效）。
+-- position_seq 是该版本自己的扫描游标；sub_seq 是该版本自己的订阅
+-- 序号计数（每个版本从 1 重新连续编号，随版本字段签名）。
+CREATE TABLE IF NOT EXISTS audit_subscription_versions (
+    version_id        TEXT PRIMARY KEY,
+    subscription_id   TEXT NOT NULL,
+    version_no        INTEGER NOT NULL,
+    idempotency_key   TEXT NOT NULL,
+    callback_url      TEXT NOT NULL,
+    secret            TEXT NOT NULL,
+    filters_json      TEXT NOT NULL,
+    effective_seq     INTEGER NOT NULL,
+    scan_upper_seq    INTEGER,                      -- 被切换时钉死：下一版本 effective_seq-1
+    status            TEXT NOT NULL DEFAULT 'prepared',
+    position_seq      INTEGER NOT NULL,
+    sub_seq           INTEGER NOT NULL DEFAULT 0,
+    snapshot_seq      INTEGER NOT NULL,
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL,
+    activated_at_ms   INTEGER,
+    cancelled_at_ms   INTEGER,
+    reject_reason     TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subversion_no
+    ON audit_subscription_versions(subscription_id, version_no);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subversion_idem
+    ON audit_subscription_versions(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_subversion_status
+    ON audit_subscription_versions(subscription_id, status);
+-- 订阅自己的审计历史（只追加，永不更新/删除）：版本的创建、激活、
+-- 拒绝原因、取消与死信重试都在此留痕。只写订阅自有表，绝不改写租约、
+-- 委托、lease_events 原始审计事件或已有投递记录。
+CREATE TABLE IF NOT EXISTS audit_subscription_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id   TEXT NOT NULL,
+    version_no        INTEGER,
+    event             TEXT NOT NULL,   -- version_prepared/version_activated/
+                                       -- version_rejected/version_cancelled/
+                                       -- version_retry
+    outcome           TEXT NOT NULL,   -- ok / rejected
+    detail            TEXT,
+    detail_json       TEXT,
+    created_at_ms     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_subevent_sub
+    ON audit_subscription_events(subscription_id, id);
+-- 订阅版本管理操作（激活/取消/死信重试）的幂等日志：同一幂等键重复
+-- 提交回放首次结果（result_json），同键换操作类型/目标订阅/版本或
+-- 重试目标即 409 冲突。创建版本的幂等键由版本行自身的唯一索引承载。
+CREATE TABLE IF NOT EXISTS audit_subscription_idempotency (
+    idempotency_key   TEXT PRIMARY KEY,
+    subscription_id   TEXT NOT NULL,
+    operation         TEXT NOT NULL,   -- activate / cancel / retry_dead_letters
+    target            TEXT NOT NULL,   -- 版本号/重试作用域（冻结的操作目标）
+    result_json       TEXT NOT NULL,
+    created_at_ms     INTEGER NOT NULL
+);
 """
 
 
@@ -609,6 +677,25 @@ class Store:
             "CREATE INDEX IF NOT EXISTS idx_events_credential "
             "ON lease_events(credential_id, seq)"
         )
+        # 订阅版本切换特性的增量列（旧库兼容；表尚不存在时 PRAGMA 返回空集）
+        sub_cols = columns("audit_subscriptions")
+        if sub_cols and "current_version" not in sub_cols:
+            self._conn.execute(
+                "ALTER TABLE audit_subscriptions "
+                "ADD COLUMN current_version INTEGER NOT NULL DEFAULT 1")
+        if sub_cols and "pending_version" not in sub_cols:
+            self._conn.execute(
+                "ALTER TABLE audit_subscriptions ADD COLUMN pending_version INTEGER")
+        delivery_cols = columns("audit_subscription_deliveries")
+        if delivery_cols and "version_no" not in delivery_cols:
+            self._conn.execute(
+                "ALTER TABLE audit_subscription_deliveries "
+                "ADD COLUMN version_no INTEGER NOT NULL DEFAULT 1")
+        if delivery_cols:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_delivery_version "
+                "ON audit_subscription_deliveries(subscription_id, "
+                "version_no, event_seq)")
 
     def close(self) -> None:
         with self._lock:

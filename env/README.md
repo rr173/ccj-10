@@ -834,10 +834,50 @@ POST /audit/index-releases
   配置）；
 - 410 Gone 视为永久拒收，直接死信；其余失败超过 `max_attempts` 进入
   `dead_letter` 并**挡住后续投递**（订阅 `blocked: true`，绝不跳过）；
-- `GET /audit/subscriptions/dead-letters`（可按订阅过滤）查看失败原因；
+- `GET /audit/subscriptions/dead-letters`（可按订阅 `subscription_id`
+  与版本 `version_no` 过滤）查看失败原因；
   `POST /audit/subscriptions/<id>/dead-letters/<event_seq>/requeue`
   清空尝试次数、立即重新放回队列（严格顺序仍受队首约束）；
 - `POST .../deliveries/<event_seq>/retry` 可忽略退避立即重试一条等待中的投递。
+
+### 订阅版本切换
+
+管理员可以为一个**活动**订阅预先创建带新回调地址、新事件过滤条件和
+生效历史序号（`effective_seq`，含）的下一版本，再原子激活：
+
+| 接口 | 语义 |
+|---|---|
+| `POST /audit/subscriptions/<id>/versions` | 预创建下一版本 `{callback_url, filters?, effective_seq, idempotency_key}`（201；同键 200 回放）；同键换回调/过滤/生效序号/目标订阅 409，生效序号越过当前稳定历史上界 416（**原订阅不变**），早于当前版本已检视位置 409，订阅非 active 或已有待激活版本 409 |
+| `GET /audit/subscriptions/<id>/versions` | 列版本状态（`?status=prepared/active/superseded/cancelled&limit=`） |
+| `GET /audit/subscriptions/<id>/versions/<v>` | 查版本：状态、回调、过滤、生效序号、版本游标/下一订阅序号、confirmed/dead/open 计数、`drained` |
+| `GET /audit/subscriptions/<id>/versions/<v>/diff?base_version=` | 与基线版本（默认当前生效版本）的回调/过滤/生效序号差异 |
+| `POST /audit/subscriptions/<id>/versions/<v>/activate` | **原子切换**（单事务）：旧版本 `superseded`、新版本 `active`、订阅主行回调/密钥/过滤/版本号/游标整体切换；同键 200 回放，换目标/操作 409，版本不存在 404，非 prepared/非待激活版本 409 |
+| `POST /audit/subscriptions/<id>/versions/<v>/cancel` | 取消预创建版本（只有 prepared 可取消；幂等键，永不生效） |
+| `POST /audit/subscriptions/<id>/versions/<v>/retry-dead-letters` | 只重试某版本的全部死信（幂等键；复位尝试次数立即重投，回放首次结果，换版本/订阅/操作 409） |
+| `GET /audit/subscriptions/<id>/history` | 该订阅自己的审计历史（只追加；`?after_id=&event=&limit=`）：版本创建/激活/取消/重试与所有拒绝原因 |
+
+切换语义与不变量：
+
+- **原子**：激活在单个写事务内完成，进程在事务中途崩溃则整笔回滚，
+  不留半切换；用同一幂等键重试即完成；
+- **在途通知按旧版本收尾**：投递行冻结版本号，切换前已入队/认领中的
+  通知继续发往旧回调地址、用旧密钥签名、沿用旧版本内的订阅序号；
+  202 待显式确认的通知也只能用旧版本密钥确认（新密钥确认返回 401）；
+  迟到响应只匹配本行认领令牌；
+- **边界不重不漏不乱序**：旧版本扫描上界钉在 `effective_seq-1`
+  （预创建后立即钉住，即便激活前持续扫描也不会越过边界），新版本从
+  `effective_seq` 开始。两个版本在投递表内按全局 event_seq 共享同一条
+  严格顺序队列——队首（最小 event_seq 非终态行）约束保证旧版本未确认
+  通知与新版本通知**互不越过**；`(subscription_id, event_seq)` 唯一保证
+  同一事件绝不重复；边界前被旧过滤跳过的事件不回头重放；
+- **版本独立编号与密钥**：通知载荷带 `version_no`，订阅序号在版本内
+  从 1 连续编号，用该版本自己的密钥 HMAC 签名；
+- **重启续跑**：版本状态、边界（`scan_upper_seq`）、游标、认领行全部
+  持久化；新进程构造即回收认领中状态行，superseded 版本继续补齐边界前
+  事件并收尾，active 版本从边界继续；
+- **只追加审计**：版本创建、激活、取消、重试与所有拒绝原因只写订阅
+  自有表 `audit_subscription_events`，绝不改写租约、委托、
+  `lease_events` 原始审计事件或已有投递记录。
 
 ### 暂停、恢复、取消与重新开始
 
@@ -847,7 +887,7 @@ POST /audit/index-releases
 | `POST /audit/subscriptions/<id>/resume` | 恢复（幂等） |
 | `POST /audit/subscriptions/<id>/cancel` | 取消（幂等）：未终态投递置 `discarded` 但保留历史；取消后迟到的回调响应被令牌/状态检查忽略，**不会再发送任何通知** |
 | `POST /audit/subscriptions/<id>/restart-from` `{"from_seq": N}` | 从指定序号重新开始：**已有投递记录全部保留**，已确认行不重置（同一事件不重复确认），其余非终态/死信行复位为 pending 并立即补齐区间；已取消 409、越界 416 |
-| `GET /audit/subscriptions/<id>/deliveries?after=&status=&limit=` | 分页读取投递历史（游标为 event_seq，升序） |
+| `GET /audit/subscriptions/<id>/deliveries?after=&status=&version_no=&limit=` | 分页读取投递历史（游标为 event_seq，升序；可按版本过滤切换前后的投递/失败记录） |
 | `POST /audit/subscriptions/process` | 管理/演练入口：扫描入队 + 到点投递各跑一轮 |
 
 ### 并发、重启与只读边界
@@ -878,9 +918,11 @@ SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库
 **索引版本发布计划（版本别名与幂等键、发布对象、生效时间、登记时冻结的
 索引摘要/快照/可选比较结果、发布时再次冻结的摘要与重算链摘要、
 scheduled/active/cancelled/failed 状态机与可解释失败原因）**、
-**审计变更订阅与投递记录（过滤条件、起始/当前序号、订阅序号、HMAC 密钥、
+**审计变更订阅、订阅版本与投递记录（各版本冻结的回调地址/过滤条件/
+生效序号/扫描上界/HMAC 密钥、过滤条件、起始/当前序号、版本内订阅序号、
 pending/inflight/awaiting_confirm/confirmed/dead_letter/discarded 状态机、
-尝试次数与退避时刻、失败与死信原因、认领令牌、冻结通知载荷与签名）**、
+尝试次数与退避时刻、失败与死信原因、认领令牌、冻结通知载荷与签名、
+版本操作幂等日志、订阅审计历史）**、
 逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
 正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放，
 **审计回放、节点比较与一致性诊断对同一份历史给出逐字节一致的结果**；
@@ -969,8 +1011,16 @@ pending/inflight/awaiting_confirm/confirmed/dead_letter/discarded 状态机、
 | GET | `/audit/subscriptions/<id>/deliveries/<event_seq>` | 单条投递：状态、尝试次数、下次重试时间、失败/死信原因、通知摘要与签名 |
 | POST | `/audit/subscriptions/<id>/deliveries/<event_seq>/ack` | 回调 202 后的显式签名确认（`X-Signature` 头或 `{signature}`；重复确认幂等不推进两次，坏签名 401 不改状态） |
 | POST | `/audit/subscriptions/<id>/deliveries/<event_seq>/retry` | 忽略退避立即重试一条等待中的投递（非等待/待确认状态 409） |
-| GET | `/audit/subscriptions/dead-letters` | 列死信（`?subscription_id=&limit=`，含 `dead_letter_reason` 与 `last_error`） |
+| GET | `/audit/subscriptions/dead-letters` | 列死信（`?subscription_id=&version_no=&limit=`，含 `dead_letter_reason` 与 `last_error`） |
 | POST | `/audit/subscriptions/<id>/dead-letters/<event_seq>/requeue` | 死信重新放回队列（清空尝试次数立即重试；非 dead_letter 409） |
+| POST | `/audit/subscriptions/<id>/versions` | **预创建下一版本**：`{callback_url, filters?, effective_seq, idempotency_key}`；同键 200 回放，换回调/过滤/生效序号/目标订阅 409，越过稳定历史上界 416（原订阅不变） |
+| GET | `/audit/subscriptions/<id>/versions` | 列版本（`?status=&limit=`） |
+| GET | `/audit/subscriptions/<id>/versions/<v>` | 查版本状态/游标/投递计数 |
+| GET | `/audit/subscriptions/<id>/versions/<v>/diff` | 与基线版本差异（`?base_version=`，默认当前版本） |
+| POST | `/audit/subscriptions/<id>/versions/<v>/activate` | **原子激活**（`{idempotency_key}`；同键回放，非 prepared/非待激活 409） |
+| POST | `/audit/subscriptions/<id>/versions/<v>/cancel` | 取消预创建版本（`{idempotency_key}`；只有 prepared 可取消） |
+| POST | `/audit/subscriptions/<id>/versions/<v>/retry-dead-letters` | 只重试该版本死信（`{idempotency_key}`；回放首次结果，换目标 409） |
+| GET | `/audit/subscriptions/<id>/history` | 订阅自己的审计历史（只追加；`?after_id=&event=&limit=`） |
 | POST | `/audit/subscriptions/process` | 管理/演练：扫描入队 + 到点投递各跑一轮，返回 `{enqueued, delivered}` |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
@@ -1150,3 +1200,18 @@ retry 成功、worker 批量发布时单计划失败不影响其它、
 稀疏交错事件分窗口扫描不跳事件、真实 HTTP 回调（本地服务器校验签名头）、
 订阅全生命周期不改写租约/委托/历史/归档/证据包/因果索引/发布计划
 （表内容逐行相等、全局诊断一致）。
+
+订阅版本切换覆盖：正常预创建/查询/差异/原子激活（含三版本连续切换）、
+预创建后边界立即钉住（active 不扫过 effective_seq-1）、切换前后事件按
+版本路由（回调地址/密钥/版本内订阅序号分流、边界前事件不重放、队列共享
+不重不乱不丢、回调顺序全局升序）、202 待确认在途通知切换后仍用旧密钥
+确认（新密钥 401）、认领后回调进行中切换版本的迟到成功响应按认领令牌
+确认旧行、创建/激活/取消/死信重试的同键回放与换回调/过滤/生效序号/目标
+订阅/版本/操作类型的 409 冲突（首个差异字段）、生效序号越过稳定历史
+上界 416 且原订阅不变（拒绝入审计历史）、早于已检视位置 409、8 线程同
+幂等键并发激活恰好一次切换其余回放、按版本分页查看投递/死信与只重试某
+版本死信（严格顺序不越过）、服务重启回收认领行后从已保存状态继续
+（待确认恢复、切换后未收尾重启、预创建中重启后仍可激活）、取消订阅
+连带取消所有版本、版本创建/激活/取消/重试与全部拒绝原因只追加进订阅
+自己的审计历史（分页/事件过滤）、版本流程不改写租约/委托/
+`lease_events`/已有投递记录、事务中途故障注入不留半切换。

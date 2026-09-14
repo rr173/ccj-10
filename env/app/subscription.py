@@ -43,7 +43,34 @@
 ========
 ``restart-from`` 把游标重置到指定序号：已有投递记录全部保留作为历史，
 未确认的旧行复位为 pending（不重置已确认行，已确认事件不会重复确认），
-并立即重新扫描入队。
+并立即重新扫描入队。已发生过版本切换（含存在预创建版本）的订阅为避免
+跨版本重放一律 409 拒绝（版本不可变，需要新回调/过滤请创建下一版本）。
+
+订阅版本切换
+============
+管理员可以为一个**活动**订阅预先创建下一版本（新回调地址、新事件过滤
+条件、生效历史序号 ``effective_seq``，含），随后原子激活：
+
+1. **原子切换**：激活在单个写事务内完成——旧版本置 ``superseded``、
+   新版本置 ``active``、订阅的当前回调/过滤/密钥/版本号/游标整体切换。
+   事务要么全成要么全不成，崩溃/中断后从已保存状态继续，不留半切换。
+2. **进行中投递按旧版本收尾**：切换前已入队/认领中的投递行冻结了当时
+   版本的回调地址、密钥、载荷与订阅序号，继续按旧版本签名与订阅序号
+   投递和确认；迟到响应只匹配本行认领令牌，绝不被新版本改写。
+3. **生效序号之后只进新版本**：旧版本扫描上界钉在 ``effective_seq-1``，
+   新版本从 ``effective_seq`` 开始扫描。两个版本在投递表内按全局
+   event_seq 共享同一条严格顺序队列，队首（最小 event_seq 非终态行）
+   约束保证旧版本未确认通知与新版本通知**互不越过**；
+   ``(subscription_id, event_seq)`` 唯一保证同一事件绝不重复，未匹配
+   事件也各自推进版本游标，保证不丢事件。
+4. **每个版本独立的订阅序号**：通知载荷带 ``version_no``，订阅序号在
+   版本内从 1 连续编号并用该版本自己的密钥签名。
+5. **幂等**：创建/激活/取消/死信重试都要幂等键。同一幂等键换回调地址、
+   过滤条件、生效序号或目标订阅/版本 → 409 明确冲突（给出首个差异）；
+   ``effective_seq`` 越过当前稳定历史上界 → 416 拒绝且原订阅不变。
+6. **审计**：版本创建、激活、取消、重试与所有拒绝原因都只追加进该订阅
+   自己的审计历史（``audit_subscription_events``），绝不改写租约、
+   委托、``lease_events`` 原始审计事件或已有投递记录。
 """
 
 from __future__ import annotations
@@ -118,6 +145,34 @@ class InvalidSignature(SubscriptionError):
     status = 401
 
 
+class SubscriptionVersionNotFound(SubscriptionError):
+    """订阅版本不存在（404）。"""
+
+    code = "subscription_version_not_found"
+    status = 404
+
+
+class SubscriptionVersionConflict(SubscriptionError):
+    """版本操作的幂等键被参数不同的请求占用（409）。"""
+
+    code = "subscription_version_conflict"
+    status = 409
+
+
+class SubscriptionVersionBadState(SubscriptionError):
+    """版本/订阅当前状态不允许该版本操作（409）。"""
+
+    code = "subscription_version_bad_state"
+    status = 409
+
+
+class SubscriptionVersionRangeError(SubscriptionError):
+    """生效序号越过当前稳定历史上界（416），原订阅不改变。"""
+
+    code = "subscription_version_seq_out_of_range"
+    status = 416
+
+
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
@@ -143,6 +198,18 @@ D_DISCARDED = "discarded"
 # 非终态：还需要（或可能需要）投递/确认
 D_OPEN = (D_PENDING, D_INFLIGHT, D_AWAITING)
 D_TERMINAL = (D_CONFIRMED, D_DEAD, D_DISCARDED)
+
+# 订阅版本状态
+V_PREPARED = "prepared"        # 预创建，等待激活
+V_ACTIVE = "active"            # 当前生效版本
+V_SUPERSEDED = "superseded"    # 已被下一版本替换，只做收尾投递
+V_CANCELLED = "cancelled"      # 预创建版本被取消，永不生效
+V_OPEN = (V_PREPARED, V_ACTIVE, V_SUPERSEDED)
+
+# 版本操作幂等日志中的操作类型
+OP_ACTIVATE = "activate"
+OP_CANCEL = "cancel"
+OP_RETRY_DEAD = "retry_dead_letters"
 
 # 回调 2xx 中，只有 202 表示"先收下，稍后显式签名确认"
 ACK_PENDING_STATUS = 202
@@ -364,6 +431,8 @@ class SubscriptionManager:
                 position_seq      INTEGER NOT NULL,
                 sub_seq           INTEGER NOT NULL DEFAULT 0,
                 snapshot_seq      INTEGER NOT NULL,
+                current_version   INTEGER NOT NULL DEFAULT 1,
+                pending_version   INTEGER,
                 status            TEXT NOT NULL DEFAULT 'active',
                 blocked           INTEGER NOT NULL DEFAULT 0,
                 max_attempts      INTEGER NOT NULL DEFAULT 5,
@@ -382,6 +451,7 @@ class SubscriptionManager:
                 subscription_id    TEXT NOT NULL,
                 event_seq          INTEGER NOT NULL,
                 subscription_seq   INTEGER NOT NULL,
+                version_no         INTEGER NOT NULL DEFAULT 1,
                 status             TEXT NOT NULL DEFAULT 'pending',
                 attempts           INTEGER NOT NULL DEFAULT 0,
                 next_retry_at_ms   INTEGER NOT NULL DEFAULT 0,
@@ -402,6 +472,100 @@ class SubscriptionManager:
             CREATE INDEX IF NOT EXISTS idx_delivery_sub_order
                 ON audit_subscription_deliveries(subscription_id, event_seq);
             """)
+        # 旧库增量列/索引（IF NOT EXISTS 不影响新库）
+        cols = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(audit_subscription_deliveries)").fetchall()}
+        if "version_no" not in cols:
+            self._conn.execute(
+                "ALTER TABLE audit_subscription_deliveries "
+                "ADD COLUMN version_no INTEGER NOT NULL DEFAULT 1")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_version "
+            "ON audit_subscription_deliveries(subscription_id, "
+            "version_no, event_seq)")
+        scolumns = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(audit_subscriptions)").fetchall()}
+        if "current_version" not in scolumns:
+            self._conn.execute(
+                "ALTER TABLE audit_subscriptions "
+                "ADD COLUMN current_version INTEGER NOT NULL DEFAULT 1")
+        if "pending_version" not in scolumns:
+            self._conn.execute(
+                "ALTER TABLE audit_subscriptions ADD COLUMN "
+                "pending_version INTEGER")
+        # 增量列：版本被切换时钉死的扫描上界（下一版本 effective_seq-1）。
+        # 旧库已有版本行该列为 NULL：superseded 旧版本退化用自身
+        # effective_seq-1（等于其 start_seq-1，历史行为一致）。
+        vcolumns = {r["name"] for r in self._conn.execute(
+            "PRAGMA table_info(audit_subscription_versions)").fetchall()}
+        if vcolumns and "scan_upper_seq" not in vcolumns:
+            self._conn.execute(
+                "ALTER TABLE audit_subscription_versions "
+                "ADD COLUMN scan_upper_seq INTEGER")
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS audit_subscription_versions (
+                version_id        TEXT PRIMARY KEY,
+                subscription_id   TEXT NOT NULL,
+                version_no        INTEGER NOT NULL,
+                idempotency_key   TEXT NOT NULL,
+                callback_url      TEXT NOT NULL,
+                secret            TEXT NOT NULL,
+                filters_json      TEXT NOT NULL,
+                effective_seq     INTEGER NOT NULL,
+                scan_upper_seq    INTEGER,
+                status            TEXT NOT NULL DEFAULT 'prepared',
+                position_seq      INTEGER NOT NULL,
+                sub_seq           INTEGER NOT NULL DEFAULT 0,
+                snapshot_seq      INTEGER NOT NULL,
+                created_at_ms     INTEGER NOT NULL,
+                updated_at_ms     INTEGER NOT NULL,
+                activated_at_ms   INTEGER,
+                cancelled_at_ms   INTEGER,
+                reject_reason     TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_subversion_no
+                ON audit_subscription_versions(subscription_id, version_no);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_subversion_idem
+                ON audit_subscription_versions(idempotency_key);
+            CREATE INDEX IF NOT EXISTS idx_subversion_status
+                ON audit_subscription_versions(subscription_id, status);
+            CREATE TABLE IF NOT EXISTS audit_subscription_events (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                subscription_id   TEXT NOT NULL,
+                version_no        INTEGER,
+                event             TEXT NOT NULL,
+                outcome           TEXT NOT NULL,
+                detail            TEXT,
+                detail_json       TEXT,
+                created_at_ms     INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_subevent_sub
+                ON audit_subscription_events(subscription_id, id);
+            CREATE TABLE IF NOT EXISTS audit_subscription_idempotency (
+                idempotency_key   TEXT PRIMARY KEY,
+                subscription_id   TEXT NOT NULL,
+                operation         TEXT NOT NULL,
+                target            TEXT NOT NULL,
+                result_json       TEXT NOT NULL,
+                created_at_ms     INTEGER NOT NULL
+            );
+            """)
+        # 为版本切换特性之前创建的订阅回填隐式版本 1（active）：
+        # 冻结其创建时的回调/过滤/密钥/位置；旧投递行 version_no 默认 1。
+        self._conn.execute(
+            "INSERT OR IGNORE INTO audit_subscription_versions(version_id, "
+            "subscription_id, version_no, idempotency_key, callback_url, "
+            "secret, filters_json, effective_seq, status, position_seq, "
+            "sub_seq, snapshot_seq, created_at_ms, updated_at_ms, "
+            "activated_at_ms) SELECT 'v1:'||subscription_id, "
+            "subscription_id, 1, 'implicit-v1:'||idempotency_key, "
+            "callback_url, secret, filters_json, start_seq, 'active', "
+            "position_seq, sub_seq, snapshot_seq, created_at_ms, "
+            "updated_at_ms, created_at_ms FROM audit_subscriptions s "
+            "WHERE NOT EXISTS (SELECT 1 FROM audit_subscription_versions v "
+            "WHERE v.subscription_id=s.subscription_id AND v.version_no=1)")
+        self._conn.commit()
 
     # ---- 时钟 / 默认投递 ------------------------------------------------
     def _now(self) -> int:
@@ -526,14 +690,26 @@ class SubscriptionManager:
                         "idempotency_key, scope, resource, credential_id, "
                         "index_id, release_id, callback_url, secret, "
                         "filters_json, start_seq, position_seq, sub_seq, "
-                        "snapshot_seq, status, max_attempts, ack_required, "
+                        "snapshot_seq, current_version, pending_version, "
+                        "status, max_attempts, ack_required, "
                         "created_at_ms, updated_at_ms) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (subscription_id, key, scope, target["resource"],
                          target["credential_id"], target["index_id"],
                          target["release_id"], url, secret,
                          canonical_json(filt), start, start, 0, max_seq,
-                         SUB_ACTIVE, attempts_val, 0, now, now))
+                         1, None, SUB_ACTIVE, attempts_val, 0, now, now))
+                    # 版本 1：创建即生效，冻结同样的回调/过滤/密钥
+                    conn.execute(
+                        "INSERT INTO audit_subscription_versions(version_id, "
+                        "subscription_id, version_no, idempotency_key, "
+                        "callback_url, secret, filters_json, effective_seq, "
+                        "status, position_seq, sub_seq, snapshot_seq, "
+                        "created_at_ms, updated_at_ms, activated_at_ms) "
+                        "VALUES(?,?,1,?,?,?,?,?, 'active', ?,0,?,?,?,?)",
+                        ("v1:" + subscription_id, subscription_id, key,
+                         url, secret, canonical_json(filt), start,
+                         start, max_seq, now, now, now))
             except sqlite3.IntegrityError:
                 # 并发重复提交兜底
                 prev = conn.execute(
@@ -661,15 +837,20 @@ class SubscriptionManager:
     # ======================================================================
     def scan_and_enqueue(self, *, now_ms: int | None = None,
                          max_events: int = SCAN_BATCH) -> int:
-        """扫描各 active 订阅游标之后的历史事件，把匹配事件入队。
+        """扫描各 active 订阅各版本游标之后的历史事件，把匹配事件入队。
 
-        事件来自只增的 ``lease_events``（与审计回放同一稳定历史），扫描
-        时一次性把 ``position_seq..MAX(seq)`` 区间内属于该订阅目标的事件
-        取出按 seq 升序处理；订阅处理只 SELECT 租约侧表，绝不改写。
+        事件来自只增的 ``lease_events``（与审计回放同一稳定历史）；订阅
+        处理只 SELECT 租约侧表，绝不改写。
 
-        每个订阅独立事务：未匹配事件只推进游标；匹配事件插入投递行
+        版本切换后一个订阅同时存在两个需要扫描的版本，各自独立游标：
+
+        - ``superseded`` 旧版本：扫描上界钉在新版本 ``effective_seq-1``，
+          只负责把切换时还没检视完的边界前事件补齐入队；
+        - ``active`` 当前版本：从自己的 ``effective_seq`` 扫到视图上界。
+
+        每个版本独立事务：未匹配事件只推进该版本游标；匹配事件插入投递行
         （``(subscription_id, event_seq)`` 唯一 + INSERT OR IGNORE 兜底），
-        订阅序号在同一事务内单调递增。返回新入队的投递行数。
+        版本内订阅序号在同一事务内单调递增。返回新入队的投递行数。
         """
         now = now_ms if now_ms is not None else self._now()
         # 全局稳定视图上界：在租约锁内取一次 MAX(seq)，与写入互斥
@@ -683,75 +864,123 @@ class SubscriptionManager:
         with self._lock:
             conn = self._conn
             subs_rows = conn.execute(
-                "SELECT * FROM audit_subscriptions WHERE status=? "
-                "AND position_seq<=?", (SUB_ACTIVE, max_seq),
-            ).fetchall()
+                "SELECT subscription_id FROM audit_subscriptions "
+                "WHERE status=?", (SUB_ACTIVE,)).fetchall()
             conn.rollback()
         for s in subs_rows:
-            # 每个订阅分窗口扫描直到追上视图上界；每个窗口独立事务，
-            # 长历史不会长时间占锁
+            sid = s["subscription_id"]
+            # 旧版本（superseded，版本号更小）排在前面补扫，再扫当前
+            # active 版本；分窗口推进直到两个版本都追上各自上界。
             while True:
-                n = self._enqueue_subscription(s["subscription_id"],
-                                               max_seq, now,
-                                               max_events=max_events)
-                enqueued += n
+                progressed = False
                 with self._lock:
-                    cur = self._get_row(conn, s["subscription_id"])
-                    caught_up = cur is None or cur["status"] != SUB_ACTIVE \
-                        or int(cur["position_seq"]) > max_seq
-                if caught_up:
+                    versions = conn.execute(
+                        "SELECT * FROM audit_subscription_versions "
+                        "WHERE subscription_id=? AND status IN (?,?) "
+                        "ORDER BY version_no ASC",
+                        (sid, V_SUPERSEDED, V_ACTIVE)).fetchall()
+                    # 已预创建但尚未激活的版本钉住边界：在激活完成之前，
+                    # 当前 active 版本也不得扫过 effective_seq-1，否则边界
+                    # 上的事件会被错误地按旧回调/旧过滤入旧版本队列
+                    prepared = conn.execute(
+                        "SELECT effective_seq FROM "
+                        "audit_subscription_versions "
+                        "WHERE subscription_id=? AND status=?",
+                        (sid, V_PREPARED)).fetchall()
+                    conn.rollback()
+                pending_caps = [int(r["effective_seq"]) - 1 for r in prepared]
+                for v in versions:
+                    upper = self._version_upper_seq(v, max_seq)
+                    if v["status"] == V_ACTIVE and pending_caps:
+                        upper = min(upper, *pending_caps)
+                    if int(v["position_seq"]) <= upper:
+                        n = self._enqueue_version(
+                            sid, int(v["version_no"]), upper, now,
+                            max_events=max_events)
+                        enqueued += n
+                        progressed = True
+                if not progressed:
                     break
         return enqueued
 
-    def _enqueue_subscription(self, subscription_id: str, max_seq: int,
-                              now: int, *, max_events: int) -> int:
+    @staticmethod
+    def _version_upper_seq(version_row, max_seq: int) -> int:
+        """版本允许扫描到的全局序号上界（含）。
+
+        superseded 旧版本钉死在切换时保存的 ``scan_upper_seq``（即新版本
+        生效序号 - 1，边界前事件）；该列为 NULL 的历史版本退化用自身
+        effective_seq-1；active 当前版本取稳定视图上界（若存在预创建版本，
+        调用方还会进一步压到其 effective_seq-1）。
+        """
+        if version_row["status"] == V_SUPERSEDED:
+            keys = version_row.keys()
+            if "scan_upper_seq" in keys \
+                    and version_row["scan_upper_seq"] is not None:
+                return int(version_row["scan_upper_seq"])
+            return int(version_row["effective_seq"]) - 1
+        return max_seq
+
+    def _enqueue_version(self, subscription_id: str, version_no: int,
+                         seq_to: int, now: int, *, max_events: int) -> int:
+        """把一个版本 [position_seq, seq_to] 区间内一个窗口的事件入队。"""
         with self._lock:
             conn = self._conn
             sub = self._get_row(conn, subscription_id)
             if sub is None or sub["status"] != SUB_ACTIVE:
                 return 0
-            pos = int(sub["position_seq"])
-            if pos > max_seq:
+            v = self._get_version_row(conn, subscription_id, version_no)
+            if v is None or v["status"] not in (V_ACTIVE, V_SUPERSEDED):
                 return 0
-            filt = json.loads(sub["filters_json"])
-            rows = self._scope_event_rows(conn, sub, pos, max_seq,
+            upper = self._version_upper_seq(v, seq_to)
+            pos = int(v["position_seq"])
+            if pos > upper:
+                return 0
+            filt = json.loads(v["filters_json"])
+            rows = self._scope_event_rows(conn, sub, pos, upper,
                                           limit=max_events)
-            window = min(max_seq, pos + max(1, max_events) - 1)
+            window = min(upper, pos + max(1, max_events) - 1)
+            is_active = v["status"] == V_ACTIVE
             with self._tx():
                 if not rows:
                     # 本窗口没有属于该作用域的事件：游标越过整个窗口。
-                    # 不能直接跳到 max_seq+1——后续窗口里可能还有属于
-                    # 该作用域的事件（其它资源的事件在全局序号上交错）。
+                    # 不能直接跳到上界——后续窗口里可能还有属于该作用域
+                    # 的事件（其它资源的事件在全局序号上交错）。
                     conn.execute(
-                        "UPDATE audit_subscriptions SET position_seq=?, "
-                        "updated_at_ms=? WHERE subscription_id=? AND status=?",
-                        (window + 1, now, subscription_id, SUB_ACTIVE))
+                        "UPDATE audit_subscription_versions "
+                        "SET position_seq=?, updated_at_ms=? "
+                        "WHERE version_id=?",
+                        (window + 1, now, v["version_id"]))
+                    if is_active:
+                        conn.execute(
+                            "UPDATE audit_subscriptions SET position_seq=?, "
+                            "updated_at_ms=? WHERE subscription_id=? AND status=?",
+                            (window + 1, now, subscription_id, SUB_ACTIVE))
                     return 0
 
-                sub_seq = int(sub["sub_seq"])
+                ver_seq = int(v["sub_seq"])
                 inserted = 0
                 for r in rows:
                     ev = event_dict(r)
                     if not event_passes_filters(ev, filt):
                         continue
-                    payload = self._build_payload(sub, r)
-                    # 订阅序号在同一事务内预先占位：严格按事件 seq 升序
-                    sub_seq += 1
-                    payload["subscription_seq"] = sub_seq
+                    payload = self._build_payload(sub, r, version_no)
+                    # 版本内订阅序号在同一事务内预先占位：按事件 seq 升序
+                    ver_seq += 1
+                    payload["subscription_seq"] = ver_seq
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO audit_subscription_deliveries"
                         "(delivery_id, subscription_id, event_seq, "
-                        "subscription_seq, status, attempts, "
+                        "subscription_seq, version_no, status, attempts, "
                         "next_retry_at_ms, payload_json, signature, "
                         "created_at_ms, updated_at_ms) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                         (uuid.uuid4().hex, subscription_id, r["seq"],
-                         sub_seq, D_PENDING, 0, 0,
+                         ver_seq, version_no, D_PENDING, 0, 0,
                          canonical_json(payload), None, now, now))
                     if cur.rowcount:
                         inserted += 1
                     else:
-                        # 重新开始/并发扫描导致的重复行：以既有行已落库的
+                        # 并发扫描/激活补扫导致的重复行：以既有行已落库的
                         # 订阅序号为准（绝不复用同一序号给两个不同事件），
                         # 本次预占的序号让回
                         prev = conn.execute(
@@ -759,16 +988,22 @@ class SubscriptionManager:
                             "audit_subscription_deliveries "
                             "WHERE subscription_id=? AND event_seq=?",
                             (subscription_id, r["seq"])).fetchone()
-                        sub_seq = (int(prev["subscription_seq"])
-                                   if prev is not None else sub_seq - 1)
+                        ver_seq = (int(prev["subscription_seq"])
+                                   if prev is not None else ver_seq - 1)
                 # 游标推进到本窗口末端（不是最后一条匹配事件：窗口内未匹配
                 # 或不属于本作用域的序号同样已经检视，不能再回头生成投递）
                 conn.execute(
-                    "UPDATE audit_subscriptions SET position_seq=?, "
-                    "sub_seq=?, updated_at_ms=? "
-                    "WHERE subscription_id=? AND status=?",
-                    (window + 1, sub_seq, now, subscription_id,
-                     SUB_ACTIVE))
+                    "UPDATE audit_subscription_versions SET position_seq=?, "
+                    "sub_seq=?, updated_at_ms=? WHERE version_id=?",
+                    (window + 1, ver_seq, now, v["version_id"]))
+                if is_active:
+                    # 订阅主行镜像当前版本游标/序号，维持订阅视图语义
+                    conn.execute(
+                        "UPDATE audit_subscriptions SET position_seq=?, "
+                        "sub_seq=?, updated_at_ms=? "
+                        "WHERE subscription_id=? AND status=?",
+                        (window + 1, ver_seq, now, subscription_id,
+                         SUB_ACTIVE))
                 return inserted
 
     def _scope_event_rows(self, conn, sub, seq_from: int, seq_to: int,
@@ -803,11 +1038,12 @@ class SubscriptionManager:
             "AND e.seq>=? AND e.seq<=? ORDER BY e.seq ASC",
             (index_id, seq_from, window)).fetchall()
 
-    def _build_payload(self, sub, ev_row) -> dict[str, Any]:
+    def _build_payload(self, sub, ev_row, version_no: int = 1) -> dict[str, Any]:
         summary = event_summary(ev_row)
         return {
             "schema_version": 1,
             "subscription_id": sub["subscription_id"],
+            "version_no": int(version_no),
             "scope": sub["scope"],
             "object": self._object_ref(sub),
             "event_seq": int(ev_row["seq"]),
@@ -911,15 +1147,23 @@ class SubscriptionManager:
                 return cur.rowcount
 
     def _claim_and_deliver(self, delivery_id: str, now: int) -> bool:
-        """认领一行 pending 投递，执行回调并按结果记录。返回是否处理过。"""
+        """认领一行 pending 投递，执行回调并按结果记录。返回是否处理过。
+
+        回调地址与签名密钥取**投递行所属版本**冻结的值：切换前已入队/
+        进行中的旧版本通知继续发往旧回调地址、用旧密钥签名；新版本通知
+        才使用新地址/新密钥。
+        """
         with self._lock:
             conn = self._conn
             row = conn.execute(
-                "SELECT d.*, s.status AS sub_status, s.callback_url AS url, "
-                "s.secret AS secret, s.max_attempts AS max_attempts, "
-                "s.subscription_id AS sid FROM "
-                "audit_subscription_deliveries d JOIN audit_subscriptions s "
+                "SELECT d.*, s.status AS sub_status, v.callback_url AS url, "
+                "v.secret AS secret, s.max_attempts AS max_attempts "
+                "FROM audit_subscription_deliveries d "
+                "JOIN audit_subscriptions s "
                 "ON s.subscription_id=d.subscription_id "
+                "JOIN audit_subscription_versions v "
+                "ON v.subscription_id=d.subscription_id "
+                "AND v.version_no=d.version_no "
                 "WHERE d.delivery_id=?", (delivery_id,)).fetchone()
             if row is None:
                 return False
@@ -1061,7 +1305,11 @@ class SubscriptionManager:
                     subscription_id=subscription_id, event_seq=seq)
 
             payload = json.loads(d["payload_json"])
-            if not verify_signature(sub["secret"], payload, signature):
+            # 密钥取投递行所属版本：旧版本通知必须仍能用旧版本密钥确认
+            vrow = self._get_version_row(conn, subscription_id,
+                                         int(d["version_no"]))
+            secret = vrow["secret"] if vrow is not None else sub["secret"]
+            if not verify_signature(secret, payload, signature):
                 raise InvalidSignature(
                     "确认签名校验失败：签名与通知载荷的 HMAC-SHA256 不一致，"
                     "状态未改变",
@@ -1139,6 +1387,7 @@ class SubscriptionManager:
 
         正在回调中的通知其迟到响应会被 _record_result 的订阅状态检查
         忽略（回收为 pending 后也不会被扫描，因为订阅已 cancelled）。
+        预创建但未激活的版本一并置 cancelled（永不生效）。
         """
         now = self._now()
         with self._lock:
@@ -1150,7 +1399,7 @@ class SubscriptionManager:
             with self._tx():
                 conn.execute(
                     "UPDATE audit_subscriptions SET status=?, blocked=0, "
-                    "cancelled_at_ms=?, updated_at_ms=? "
+                    "cancelled_at_ms=?, pending_version=NULL, updated_at_ms=? "
                     "WHERE subscription_id=?",
                     (SUB_CANCELLED, now, now, subscription_id))
                 conn.execute(
@@ -1158,6 +1407,16 @@ class SubscriptionManager:
                     "dispatch_token=NULL, updated_at_ms=? "
                     "WHERE subscription_id=? AND status IN (?,?,?)",
                     (D_DISCARDED, now, subscription_id, *D_OPEN))
+                conn.execute(
+                    "UPDATE audit_subscription_versions SET status=?, "
+                    "cancelled_at_ms=COALESCE(cancelled_at_ms, ?), "
+                    "updated_at_ms=? "
+                    "WHERE subscription_id=? AND status IN (?,?,?)",
+                    (V_CANCELLED, now, now, subscription_id,
+                     V_PREPARED, V_ACTIVE, V_SUPERSEDED))
+                self._audit_locked(
+                    conn, subscription_id, None,
+                    "subscription_cancelled", "ok", now=now)
             return self._view(self._get_row(conn, subscription_id))
 
     # ======================================================================
@@ -1174,6 +1433,9 @@ class SubscriptionManager:
           严格顺序恢复投递；
         - 重置后立即扫描 [from_seq, MAX(seq)] 重新补齐缺失的投递行
           （INSERT OR IGNORE，已有的不重建、订阅序号不重用）。
+        - 已发生过版本切换或存在预创建版本的订阅拒绝重新开始（409）：
+          跨版本重放会违反"旧版本按旧序号、生效序号后只进新版本"的
+          不可变边界，需要新回调/过滤请创建下一版本。
         """
         seq = _as_int(from_seq, "from_seq")
         if seq < 0:
@@ -1198,6 +1460,15 @@ class SubscriptionManager:
                     f"订阅 {subscription_id} 已取消，不能重新开始",
                     subscription_id=subscription_id,
                     status=SUB_CANCELLED)
+            vcount = conn.execute(
+                "SELECT COUNT(*) AS c FROM audit_subscription_versions "
+                "WHERE subscription_id=?", (subscription_id,)).fetchone()["c"]
+            if int(vcount) > 1:
+                raise SubscriptionVersionBadState(
+                    "订阅已创建过下一版本（含已激活/取消），版本边界不可变，"
+                    "不能跨版本重新开始；请创建新的订阅版本",
+                    subscription_id=subscription_id,
+                    versions=int(vcount))
             old_status = sub["status"]
             with self._tx():
                 # 未确认的旧投递（含死信/待确认/投递中/退避等待）复位重试；
@@ -1215,6 +1486,11 @@ class SubscriptionManager:
                     "error=NULL, status=?, updated_at_ms=? "
                     "WHERE subscription_id=?",
                     (seq, SUB_ACTIVE, now, subscription_id))
+                # 只有版本 1 时才允许走到这里：同步其游标
+                conn.execute(
+                    "UPDATE audit_subscription_versions SET position_seq=?, "
+                    "updated_at_ms=? WHERE subscription_id=? AND version_no=1",
+                    (seq, now, subscription_id))
 
         # 以 active 身份补齐区间内缺失的投递行，然后恢复原状态
         self.scan_and_enqueue(now_ms=now)
@@ -1237,24 +1513,29 @@ class SubscriptionManager:
     # 死信：查询 / 查看原因 / 重新放回队列
     # ======================================================================
     def list_dead_letters(self, *, subscription_id: Any = None,
+                          version_no: Any = None,
                           limit: Any = 100) -> dict[str, Any]:
         limit = _bounded_limit(limit)
+        ver = _as_int(version_no, "version_no") if version_no not in (
+            None, "") else None
         with self._lock:
             conn = self._conn
+            where, args = ["status=?"], [D_DEAD]
             if subscription_id not in (None, ""):
-                rows = conn.execute(
-                    "SELECT * FROM audit_subscription_deliveries "
-                    "WHERE status=? AND subscription_id=? "
-                    "ORDER BY event_seq ASC LIMIT ?",
-                    (D_DEAD, str(subscription_id), limit)).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM audit_subscription_deliveries "
-                    "WHERE status=? ORDER BY updated_at_ms ASC, event_seq ASC "
-                    "LIMIT ?", (D_DEAD, limit)).fetchall()
+                where.append("subscription_id=?")
+                args.append(str(subscription_id))
+            if ver is not None:
+                where.append("version_no=?")
+                args.append(ver)
+            args.append(limit)
+            rows = conn.execute(
+                "SELECT * FROM audit_subscription_deliveries WHERE "
+                + " AND ".join(where)
+                + " ORDER BY event_seq ASC LIMIT ?", tuple(args)).fetchall()
             conn.rollback()
             return {"dead_letters": [self._delivery_view(r) for r in rows],
-                    "limit": limit}
+                    "limit": limit,
+                    "version_no": ver}
 
     def requeue_dead_letter(self, subscription_id: str,
                             event_seq: Any | None = None,
@@ -1337,6 +1618,787 @@ class SubscriptionManager:
                 self._get_delivery_row(conn, d["delivery_id"]))
 
     # ======================================================================
+    # 订阅版本切换：预创建 / 激活（原子切换）/ 取消 / 查询 / 差异
+    # ======================================================================
+    def prepare_version(self, subscription_id: str, *,
+                        callback_url: Any = None,
+                        filters: Any = None,
+                        effective_seq: Any = None,
+                        idempotency_key: Any = None) -> tuple[dict, bool]:
+        """为活动订阅预创建下一版本（不影响任何在途通知）。
+
+        返回 (版本视图, 是否新建)。同一幂等键重复提交且规格一致 ->
+        回放同一版本（200 语义）；换回调地址/过滤条件/生效序号/目标订阅
+        -> 409（给出首个差异）；生效序号越过当前稳定历史上界 -> 416，
+        且原订阅与任何已有版本都不改变。
+        """
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise AuditBadRequest(
+                "idempotency_key 必填：版本创建必须携带幂等键")
+        if not isinstance(callback_url, str) or not callback_url.strip() \
+                or not callback_url.strip().lower().startswith(
+                    ("http://", "https://")):
+            raise AuditBadRequest(
+                "callback_url 必填且必须是 http(s) 地址")
+        url = callback_url.strip()
+        key = idempotency_key.strip()
+        filt = normalize_filters(filters)
+        eff = _as_int(effective_seq, "effective_seq")
+        if eff is None:
+            raise AuditBadRequest(
+                "effective_seq 必填：新版本从哪个历史序号（含）起生效")
+        if eff < 0:
+            raise AuditBadRequest("effective_seq 不能为负数",
+                                  effective_seq=eff)
+
+        # 稳定历史上界（与租约写入互斥地读取）
+        with self._store._lock:  # noqa: SLF001
+            sconn = self._store._conn  # noqa: SLF001
+            max_row = sconn.execute(
+                "SELECT MAX(seq) AS m FROM lease_events").fetchone()
+            max_seq = int(max_row["m"]) if max_row["m"] is not None else 0
+
+        now = self._now()
+        with self._lock:
+            conn = self._conn
+            sub = self._get_row(conn, subscription_id)
+            if sub is None:
+                raise SubscriptionNotFound(
+                    f"订阅 {subscription_id} 不存在，不能创建下一版本",
+                    subscription_id=subscription_id)
+
+            # 幂等先行：同键重放或冲突（先于状态/边界校验，保证重复提交
+            # 在订阅已变化后仍能稳定回放首次结果）
+            prev = conn.execute(
+                "SELECT * FROM audit_subscription_versions "
+                "WHERE idempotency_key=?", (key,)).fetchone()
+            spec = self._version_spec(subscription_id, url, filt, eff)
+            if prev is not None:
+                diff = self._first_version_spec_diff(prev, spec)
+                if diff is None:
+                    return self._version_view(prev), False
+                raise self._version_conflict(conn, key, diff,
+                                             version_id=prev["version_id"])
+            other = self._idempotency_row(conn, key)
+            if other is not None:
+                raise self._idempotency_taken(conn, key, other)
+
+            def reject_prepare(reason: str, *, code_event: str = "version_rejected",
+                               exc: SubscriptionError):
+                with self._tx():
+                    self._audit_locked(
+                        conn, subscription_id, None, code_event, "rejected",
+                        reason,
+                        detail_obj={"callback_url": url,
+                                    "filters": filt, "effective_seq": eff},
+                        now=now)
+                raise exc
+
+            if sub["status"] != SUB_ACTIVE:
+                reject_prepare(
+                    f"订阅当前状态为 {sub['status']}，只有 active 订阅可以"
+                    "预创建下一版本",
+                    exc=SubscriptionVersionBadState(
+                        "订阅不是 active，不能创建下一版本",
+                        subscription_id=subscription_id,
+                        status=sub["status"]))
+            existing = conn.execute(
+                "SELECT * FROM audit_subscription_versions "
+                "WHERE subscription_id=? AND status=?",
+                (subscription_id, V_PREPARED)).fetchone()
+            if existing is not None:
+                reject_prepare(
+                    f"已存在待激活版本 v{existing['version_no']}，"
+                    "请先激活或取消它",
+                    exc=SubscriptionVersionBadState(
+                        "同一订阅同时只能有一个待激活版本",
+                        subscription_id=subscription_id,
+                        pending_version=int(existing["version_no"])))
+
+            # 生效序号越过稳定历史上界：拒绝且不改变任何状态
+            if eff > max_seq:
+                reject_prepare(
+                    f"effective_seq={eff} 越过当前稳定历史上界 {max_seq}，"
+                    "该历史位置尚不存在",
+                    code_event="version_rejected",
+                    exc=SubscriptionVersionRangeError(
+                        f"effective_seq={eff} 越过当前稳定历史上界 "
+                        f"{max_seq}，原订阅未改变",
+                        effective_seq=eff, available_max_seq=max_seq))
+
+            cur_no = int(sub["current_version"])
+            current = self._get_version_row(conn, subscription_id, cur_no)
+            # 生效序号不得早于当前版本已经检视过的位置：否则边界前事件
+            # 已经按旧过滤条件跳过，无法在不重放的前提下交给新版本
+            min_eff = int(current["position_seq"])
+            if eff < min_eff:
+                reject_prepare(
+                    f"effective_seq={eff} 早于当前版本已检视位置 "
+                    f"{min_eff}，边界前事件已按旧过滤条件处理",
+                    exc=SubscriptionVersionBadState(
+                        f"effective_seq 不能早于当前版本扫描位置 {min_eff}",
+                        subscription_id=subscription_id,
+                        effective_seq=eff,
+                        min_effective_seq=min_eff))
+
+            # 新版本号取该订阅历史上最大版本号 + 1：取消的版本号不复用，
+            # 否则会与已取消版本行的 (subscription_id, version_no) 唯一
+            # 约束冲突，也避免旧审计记录的版本号被重新解释。
+            maxrow = conn.execute(
+                "SELECT MAX(version_no) AS m FROM audit_subscription_versions "
+                "WHERE subscription_id=?", (subscription_id,)).fetchone()
+            next_no = int(maxrow["m"] or cur_no) + 1
+            version_id = uuid.uuid4().hex
+            secret = new_secret()
+            try:
+                with self._tx():
+                    conn.execute(
+                        "INSERT INTO audit_subscription_versions(version_id, "
+                        "subscription_id, version_no, idempotency_key, "
+                        "callback_url, secret, filters_json, effective_seq, "
+                        "status, position_seq, sub_seq, snapshot_seq, "
+                        "created_at_ms, updated_at_ms) "
+                        "VALUES(?,?,?,?,?,?,?,?,'prepared',?,0,?,?,?)",
+                        (version_id, subscription_id, next_no, key, url,
+                         secret, canonical_json(filt), eff, eff, max_seq,
+                         now, now))
+                    conn.execute(
+                        "UPDATE audit_subscriptions SET pending_version=?, "
+                        "updated_at_ms=? WHERE subscription_id=?",
+                        (next_no, now, subscription_id))
+                    self._audit_locked(
+                        conn, subscription_id, next_no,
+                        "version_prepared", "ok",
+                        f"预创建版本 v{next_no}：effective_seq={eff}",
+                        detail_obj={"callback_url": url, "filters": filt,
+                                "effective_seq": eff},
+                        now=now)
+            except sqlite3.IntegrityError:
+                # 并发同键创建兜底
+                prev = conn.execute(
+                    "SELECT * FROM audit_subscription_versions "
+                    "WHERE idempotency_key=?", (key,)).fetchone()
+                if prev is not None:
+                    diff = self._first_version_spec_diff(prev, spec)
+                    if diff is None:
+                        return self._version_view(prev), False
+                    raise self._version_conflict(conn, key, diff,
+                                                 version_id=prev["version_id"])
+                raise
+            return self._version_view(
+                self._get_version_row(conn, subscription_id, next_no)), True
+
+    def activate_version(self, subscription_id: str, version_no: Any,
+                         *, idempotency_key: Any = None) -> tuple[dict, bool]:
+        """原子激活预创建版本：单事务完成新旧版本与订阅主行的切换。
+
+        - 切换前已入队/进行中的旧版本通知继续按旧版本回调地址、密钥与
+          订阅序号处理（投递行已冻结版本号，认领时按版本取地址/密钥）；
+        - 生效序号之后新匹配事件只能进入新版本；
+        - 同键重放回首次结果；换操作/目标订阅/版本 -> 409；
+        - 订阅已取消/暂停或版本不是 prepared（已激活/已取消）-> 409；
+          所有拒绝都写入订阅审计历史。
+        """
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise AuditBadRequest(
+                "idempotency_key 必填：版本激活必须携带幂等键")
+        key = idempotency_key.strip()
+        no = _as_int(version_no, "version_no")
+        now = self._now()
+        with self._lock:
+            conn = self._conn
+            sub = self._get_row(conn, subscription_id)
+            if sub is None:
+                raise SubscriptionNotFound(
+                    f"订阅 {subscription_id} 不存在",
+                    subscription_id=subscription_id)
+
+            prev_op = self._idempotency_row(conn, key)
+            if prev_op is not None:
+                self._check_idempotency_op(
+                    conn, key, prev_op, OP_ACTIVATE, subscription_id,
+                    str(no))
+                result = json.loads(prev_op["result_json"])
+                return result, False
+            # 创建版本的幂等键不能挪用于激活操作
+            vprev = conn.execute(
+                "SELECT version_id FROM audit_subscription_versions "
+                "WHERE idempotency_key=?", (key,)).fetchone()
+            if vprev is not None:
+                raise self._idempotency_taken(
+                    conn, key,
+                    {"operation": "prepare_version",
+                     "subscription_id": subscription_id,
+                     "target": vprev["version_id"]})
+
+            def reject_activate(reason: str, exc: SubscriptionError):
+                with self._tx():
+                    self._audit_locked(
+                        conn, subscription_id, no,
+                        "version_rejected", "rejected", reason,
+                        detail_obj={"operation": OP_ACTIVATE}, now=now)
+                raise exc
+
+            if sub["status"] != SUB_ACTIVE:
+                reject_activate(
+                    f"订阅当前状态为 {sub['status']}，不能激活新版本",
+                    SubscriptionVersionBadState(
+                        "订阅不是 active，不能激活新版本",
+                        subscription_id=subscription_id,
+                        status=sub["status"]))
+
+            v = self._get_version_row(conn, subscription_id, no)
+            if v is None:
+                # 找不到目标版本不审计（没有可归属的版本号），直接 404
+                raise SubscriptionVersionNotFound(
+                    f"订阅 {subscription_id} 不存在版本 v{no}",
+                    subscription_id=subscription_id, version_no=no)
+            if v["status"] == V_ACTIVE and int(sub["current_version"]) == no:
+                # 当前生效版本不能"再激活"：明确 409（真正的幂等重放必须
+                # 携带首次成功时使用的同一个幂等键，在前面回放分支处理），
+                # 拒绝原因写入订阅审计历史
+                reject_activate(
+                    f"版本 v{no} 已经是当前生效版本，无需也不能再次激活",
+                    SubscriptionVersionBadState(
+                        "版本已经生效，不能重复激活",
+                        subscription_id=subscription_id, version_no=no,
+                        status=V_ACTIVE))
+            if v["status"] != V_PREPARED:
+                reject_activate(
+                    f"版本 v{no} 状态为 {v['status']}，只有 prepared 版本"
+                    "可以激活",
+                    SubscriptionVersionBadState(
+                        "版本当前状态不允许激活",
+                        subscription_id=subscription_id, version_no=no,
+                        status=v["status"]))
+            if int(sub["pending_version"] or 0) != no:
+                reject_activate(
+                    f"订阅待激活版本为 v{sub['pending_version']}，"
+                    f"与请求的 v{no} 不一致",
+                    SubscriptionVersionBadState(
+                        "请求激活的版本不是订阅的待激活版本",
+                        subscription_id=subscription_id, version_no=no,
+                        pending_version=int(sub["pending_version"] or 0)))
+
+            cur_no = int(sub["current_version"])
+            cur = self._get_version_row(conn, subscription_id, cur_no)
+            # 原子切换：以下更新一次提交，要么全成要么全不成
+            with self._tx():
+                conn.execute(
+                    "UPDATE audit_subscription_versions SET status=?, "
+                    "scan_upper_seq=?, updated_at_ms=? WHERE version_id=? "
+                    "AND status=?",
+                    (V_SUPERSEDED, int(v["effective_seq"]) - 1, now,
+                     cur["version_id"], V_ACTIVE))
+                cur = conn.execute(
+                    "UPDATE audit_subscription_versions SET status=?, "
+                    "activated_at_ms=?, updated_at_ms=? WHERE version_id=? "
+                    "AND status=?",
+                    (V_ACTIVE, now, now, v["version_id"], V_PREPARED))
+                if cur.rowcount != 1:
+                    raise SubscriptionVersionBadState(
+                        "版本在激活过程中状态已变化（并发激活）",
+                        subscription_id=subscription_id, version_no=no)
+                switched = conn.execute(
+                    "UPDATE audit_subscriptions SET callback_url=?, "
+                    "secret=?, filters_json=?, current_version=?, "
+                    "pending_version=NULL, position_seq=?, sub_seq=?, "
+                    "updated_at_ms=? WHERE subscription_id=? "
+                    "AND current_version=? AND pending_version=?",
+                    (v["callback_url"], v["secret"], v["filters_json"],
+                     no, v["position_seq"], v["sub_seq"], now,
+                     subscription_id, cur_no, no))
+                if switched.rowcount != 1:
+                    raise SubscriptionVersionBadState(
+                        "订阅在切换过程中状态已变化（并发激活）",
+                        subscription_id=subscription_id, version_no=no)
+                self._audit_locked(
+                    conn, subscription_id, no,
+                    "version_activated", "ok",
+                    f"版本 v{no} 原子激活：v{cur_no} 置 superseded，"
+                    f"生效序号 {v['effective_seq']}（含）起按新版本投递",
+                    detail_obj={"superseded_version": cur_no,
+                            "effective_seq": int(v["effective_seq"]),
+                            "callback_url": v["callback_url"],
+                            "filters": json.loads(v["filters_json"])},
+                    now=now)
+                # 幂等成功记录与切换在同一事务。注意：视图（含投递统计
+                # SELECT）必须在事务提交后构建——视图辅助内部会 rollback
+                # 读事务快照，在写事务内调用会把整个切换回滚掉。
+                result_view = self._version_view_from_row(
+                    conn,
+                    self._get_version_row(conn, subscription_id, no))
+                conn.execute(
+                    "INSERT INTO audit_subscription_idempotency"
+                    "(idempotency_key, subscription_id, operation, target, "
+                    "result_json, created_at_ms) VALUES(?,?,?,?,?,?)",
+                    (key, subscription_id, OP_ACTIVATE, str(no),
+                     canonical_json(result_view), now))
+            return self.get_version(subscription_id, no), True
+
+    def cancel_version(self, subscription_id: str, version_no: Any,
+                       *, idempotency_key: Any = None) -> tuple[dict, bool]:
+        """取消预创建版本（只有 prepared 可取消；永不生效，记录保留）。"""
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise AuditBadRequest(
+                "idempotency_key 必填：版本取消必须携带幂等键")
+        key = idempotency_key.strip()
+        no = _as_int(version_no, "version_no")
+        now = self._now()
+        with self._lock:
+            conn = self._conn
+            sub = self._get_row(conn, subscription_id)
+            if sub is None:
+                raise SubscriptionNotFound(
+                    f"订阅 {subscription_id} 不存在",
+                    subscription_id=subscription_id)
+            prev_op = self._idempotency_row(conn, key)
+            if prev_op is not None:
+                self._check_idempotency_op(
+                    conn, key, prev_op, OP_CANCEL, subscription_id, str(no))
+                return json.loads(prev_op["result_json"]), False
+            vprev = conn.execute(
+                "SELECT version_id FROM audit_subscription_versions "
+                "WHERE idempotency_key=?", (key,)).fetchone()
+            if vprev is not None:
+                raise self._idempotency_taken(
+                    conn, key,
+                    {"operation": "prepare_version",
+                     "subscription_id": subscription_id,
+                     "target": vprev["version_id"]})
+
+            v = self._get_version_row(conn, subscription_id, no)
+            if v is None:
+                raise SubscriptionVersionNotFound(
+                    f"订阅 {subscription_id} 不存在版本 v{no}",
+                    subscription_id=subscription_id, version_no=no)
+            if v["status"] in (V_CANCELLED,):
+                # 无幂等记录的重复取消（如换了键）：明确状态冲突
+                raise SubscriptionVersionBadState(
+                    f"版本 v{no} 已取消",
+                    subscription_id=subscription_id, version_no=no,
+                    status=V_CANCELLED)
+            if v["status"] != V_PREPARED:
+                with self._tx():
+                    self._audit_locked(
+                        conn, subscription_id, no,
+                        "version_rejected", "rejected",
+                        f"取消被拒绝：版本 v{no} 状态为 {v['status']}",
+                        detail_obj={"operation": OP_CANCEL}, now=now)
+                raise SubscriptionVersionBadState(
+                    "只有 prepared（待激活）版本可以取消",
+                    subscription_id=subscription_id, version_no=no,
+                    status=v["status"])
+            with self._tx():
+                cur = conn.execute(
+                    "UPDATE audit_subscription_versions SET status=?, "
+                    "cancelled_at_ms=?, updated_at_ms=? WHERE version_id=? "
+                    "AND status=?",
+                    (V_CANCELLED, now, now, v["version_id"], V_PREPARED))
+                if cur.rowcount != 1:
+                    raise SubscriptionVersionBadState(
+                        "版本在取消过程中状态已变化",
+                        subscription_id=subscription_id, version_no=no)
+                conn.execute(
+                    "UPDATE audit_subscriptions SET pending_version=NULL, "
+                    "updated_at_ms=? WHERE subscription_id=? "
+                    "AND pending_version=?",
+                    (now, subscription_id, no))
+                self._audit_locked(
+                    conn, subscription_id, no,
+                    "version_cancelled", "ok",
+                    f"预创建版本 v{no} 已取消，永不生效", now=now)
+                result_view = self._version_view_from_row(
+                    conn,
+                    self._get_version_row(conn, subscription_id, no))
+                conn.execute(
+                    "INSERT INTO audit_subscription_idempotency"
+                    "(idempotency_key, subscription_id, operation, target, "
+                    "result_json, created_at_ms) VALUES(?,?,?,?,?,?)",
+                    (key, subscription_id, OP_CANCEL, str(no),
+                     canonical_json(result_view), now))
+            return self.get_version(subscription_id, no), True
+
+    def retry_version_dead_letters(self, subscription_id: str,
+                                   version_no: Any, *,
+                                   idempotency_key: Any = None
+                                   ) -> tuple[dict, bool]:
+        """只重试某个版本的全部死信（复位尝试次数，立即重试）。
+
+        幂等：同键重放回首次结果；换操作/目标订阅/版本 -> 409。重试只
+        改该版本的死信行，严格顺序仍由共享队首约束保证（旧版本未确认
+        通知与新版本通知不会互相越过）。
+        """
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise AuditBadRequest(
+                "idempotency_key 必填：版本死信重试必须携带幂等键")
+        key = idempotency_key.strip()
+        no = _as_int(version_no, "version_no")
+        now = self._now()
+        with self._lock:
+            conn = self._conn
+            sub = self._get_row(conn, subscription_id)
+            if sub is None:
+                raise SubscriptionNotFound(
+                    f"订阅 {subscription_id} 不存在",
+                    subscription_id=subscription_id)
+            prev_op = self._idempotency_row(conn, key)
+            if prev_op is not None:
+                self._check_idempotency_op(
+                    conn, key, prev_op, OP_RETRY_DEAD, subscription_id,
+                    str(no))
+                return json.loads(prev_op["result_json"]), False
+            vprev = conn.execute(
+                "SELECT version_id FROM audit_subscription_versions "
+                "WHERE idempotency_key=?", (key,)).fetchone()
+            if vprev is not None:
+                raise self._idempotency_taken(
+                    conn, key,
+                    {"operation": "prepare_version",
+                     "subscription_id": subscription_id,
+                     "target": vprev["version_id"]})
+
+            v = self._get_version_row(conn, subscription_id, no)
+            if v is None:
+                raise SubscriptionVersionNotFound(
+                    f"订阅 {subscription_id} 不存在版本 v{no}",
+                    subscription_id=subscription_id, version_no=no)
+            with self._tx():
+                cur = conn.execute(
+                    "UPDATE audit_subscription_deliveries SET status=?, "
+                    "attempts=0, next_retry_at_ms=0, dispatch_token=NULL, "
+                    "claimed_at_ms=NULL, last_error=NULL, "
+                    "dead_letter_reason=NULL, updated_at_ms=? "
+                    "WHERE subscription_id=? AND version_no=? AND status=?",
+                    (D_PENDING, now, subscription_id, no, D_DEAD))
+                requeued = cur.rowcount
+                self._clear_blocked_locked(conn, subscription_id, now)
+                self._audit_locked(
+                    conn, subscription_id, no,
+                    "version_retry", "ok",
+                    f"重试版本 v{no} 的 {requeued} 条死信",
+                    detail_obj={"requeued": requeued}, now=now)
+                result = {
+                    "subscription_id": subscription_id,
+                    "version_no": no,
+                    "requeued": requeued,
+                }
+                conn.execute(
+                    "INSERT INTO audit_subscription_idempotency"
+                    "(idempotency_key, subscription_id, operation, target, "
+                    "result_json, created_at_ms) VALUES(?,?,?,?,?,?)",
+                    (key, subscription_id, OP_RETRY_DEAD, str(no),
+                     canonical_json(result), now))
+            return result, True
+
+    # ---- 版本查询 / 差异 / 订阅审计历史 --------------------------------
+    def list_versions(self, subscription_id: str, *,
+                      status: Any = None, limit: Any = 100) -> dict[str, Any]:
+        limit = _bounded_limit(limit)
+        if status is not None and status not in (
+                V_PREPARED, V_ACTIVE, V_SUPERSEDED, V_CANCELLED):
+            raise AuditBadRequest("status 过滤值非法", status=status)
+        with self._lock:
+            conn = self._conn
+            conn.rollback()
+            self._require_sub(conn, subscription_id)
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM audit_subscription_versions "
+                    "WHERE subscription_id=? AND status=? "
+                    "ORDER BY version_no ASC LIMIT ?",
+                    (subscription_id, status, limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM audit_subscription_versions "
+                    "WHERE subscription_id=? ORDER BY version_no ASC LIMIT ?",
+                    (subscription_id, limit)).fetchall()
+            conn.rollback()
+            return {"subscription_id": subscription_id,
+                    "versions": [self._version_view(r) for r in rows],
+                    "limit": limit}
+
+    def get_version(self, subscription_id: str, version_no: Any) -> dict:
+        no = _as_int(version_no, "version_no")
+        with self._lock:
+            conn = self._conn
+            conn.rollback()
+            self._require_sub(conn, subscription_id)
+            v = self._get_version_row(conn, subscription_id, no)
+            conn.rollback()
+            if v is None:
+                raise SubscriptionVersionNotFound(
+                    f"订阅 {subscription_id} 不存在版本 v{no}",
+                    subscription_id=subscription_id, version_no=no)
+            return self._version_view(v)
+
+    def diff_version(self, subscription_id: str, version_no: Any,
+                     *, base_version: Any = None) -> dict[str, Any]:
+        """比较某版本与其基线版本（默认当前生效版本）的差异。"""
+        no = _as_int(version_no, "version_no")
+        with self._lock:
+            conn = self._conn
+            conn.rollback()
+            sub = self._require_sub(conn, subscription_id)
+            base_no = (int(sub["current_version"])
+                       if base_version in (None, "")
+                       else _as_int(base_version, "base_version"))
+            v = self._get_version_row(conn, subscription_id, no)
+            if v is None:
+                raise SubscriptionVersionNotFound(
+                    f"订阅 {subscription_id} 不存在版本 v{no}",
+                    subscription_id=subscription_id, version_no=no)
+            b = self._get_version_row(conn, subscription_id, base_no)
+            if b is None:
+                raise SubscriptionVersionNotFound(
+                    f"订阅 {subscription_id} 不存在基线版本 v{base_no}",
+                    subscription_id=subscription_id,
+                    version_no=base_no)
+            diffs = self._version_diff_fields(b, v)
+            conn.rollback()
+            return {
+                "subscription_id": subscription_id,
+                "base_version": base_no,
+                "target_version": no,
+                "identical": not diffs,
+                "differences": diffs,
+                "base": {"version_no": base_no,
+                         "callback_url": b["callback_url"],
+                         "filters": json.loads(b["filters_json"]),
+                         "effective_seq": int(b["effective_seq"])},
+                "target": {"version_no": no,
+                           "callback_url": v["callback_url"],
+                           "filters": json.loads(v["filters_json"]),
+                           "effective_seq": int(v["effective_seq"])},
+            }
+
+    def list_audit_history(self, subscription_id: str, *,
+                           after_id: Any = None, limit: Any = 100,
+                           event: Any = None) -> dict[str, Any]:
+        """分页读取该订阅自己的审计历史（只追加：版本创建/激活/拒绝/
+        取消/重试），游标是自增 id，升序。"""
+        limit = _bounded_limit(limit)
+        after = _as_int(after_id, "after_id", default=0)
+        if after < 0:
+            raise AuditBadRequest("after_id 不能为负数", after_id=after)
+        with self._lock:
+            conn = self._conn
+            conn.rollback()
+            self._require_sub(conn, subscription_id)
+            where = ["subscription_id=?"]
+            args: list[Any] = [subscription_id]
+            if after:
+                where.append("id>?")
+                args.append(after)
+            if event:
+                where.append("event=?")
+                args.append(str(event))
+            rows = conn.execute(
+                "SELECT * FROM audit_subscription_events WHERE "
+                + " AND ".join(where)
+                + " ORDER BY id ASC LIMIT ?", (*args, limit + 1)).fetchall()
+            conn.rollback()
+        page = rows[:limit]
+        has_more = len(rows) > limit
+        return {
+            "subscription_id": subscription_id,
+            "events": [self._audit_view(r) for r in page],
+            "limit": limit,
+            "next": page[-1]["id"] if has_more else None,
+            "reached_end": not has_more,
+        }
+
+    # ---- 版本辅助 -------------------------------------------------------
+    @staticmethod
+    def _get_version_row(conn, subscription_id: str, version_no: int):
+        return conn.execute(
+            "SELECT * FROM audit_subscription_versions "
+            "WHERE subscription_id=? AND version_no=?",
+            (subscription_id, int(version_no))).fetchone()
+
+    @staticmethod
+    def _idempotency_row(conn, key: str):
+        return conn.execute(
+            "SELECT * FROM audit_subscription_idempotency "
+            "WHERE idempotency_key=?", (key,)).fetchone()
+
+    def _check_idempotency_op(self, conn, key: str, prev, operation: str,
+                              subscription_id: str, target: str) -> None:
+        """命中操作幂等日志：规格一致回放，否则明确 409（给双方值）。"""
+        if (prev["operation"] == operation
+                and prev["subscription_id"] == subscription_id
+                and prev["target"] == target):
+            return
+        raise SubscriptionVersionConflict(
+            f"幂等键 {key} 已用于订阅 {prev['subscription_id']} 的 "
+            f"{prev['operation']} 操作（目标 {prev['target']}），"
+            "本次请求与首次不一致",
+            idempotency_key=key,
+            first_difference={
+                "path": "operation/target",
+                "existing": {"operation": prev["operation"],
+                             "subscription_id": prev["subscription_id"],
+                             "target": prev["target"]},
+                "requested": {"operation": operation,
+                              "subscription_id": subscription_id,
+                              "target": target}})
+
+    @staticmethod
+    def _idempotency_taken(conn, key: str, other) -> SubscriptionVersionConflict:
+        """幂等键被另一类订阅操作占用（如创建键用于激活）。"""
+        if isinstance(other, dict):
+            op = other.get("operation")
+            existing = other
+        else:
+            # sqlite3.Row（audit_subscription_idempotency 命中行）
+            op = other["operation"]
+            existing = {"operation": other["operation"],
+                        "subscription_id": other["subscription_id"],
+                        "target": other["target"]}
+        return SubscriptionVersionConflict(
+            f"幂等键 {key} 已用于订阅的 {op or '其它'} 操作，"
+            "不能复用于本次请求",
+            idempotency_key=key,
+            first_difference={"path": "operation",
+                              "existing": existing,
+                              "requested": {}})
+
+    @staticmethod
+    def _version_conflict(conn, key: str, diff: dict, *,
+                          version_id: str) -> SubscriptionVersionConflict:
+        return SubscriptionVersionConflict(
+            f"幂等键 {key} 已用于版本 {version_id}，本次请求与首次创建"
+            f"不一致：首个差异位于 {diff['path']}",
+            idempotency_key=key, version_id=version_id,
+            first_difference=diff)
+
+    @staticmethod
+    def _version_spec(subscription_id: str, url: str, filt: dict,
+                      eff: int) -> dict[str, Any]:
+        return {"subscription_id": subscription_id, "callback_url": url,
+                "filters": filt, "effective_seq": eff}
+
+    @staticmethod
+    def _first_version_spec_diff(prev, spec: dict) -> dict | None:
+        """逐个比较版本创建规格，返回首个差异字段（确定性顺序）。"""
+        fields = [
+            ("subscription_id", prev["subscription_id"],
+             spec["subscription_id"]),
+            ("callback_url", prev["callback_url"], spec["callback_url"]),
+            ("effective_seq", int(prev["effective_seq"]),
+             spec["effective_seq"]),
+        ]
+        for path, old, new in fields:
+            if old != new:
+                return {"path": path, "existing": old, "requested": new}
+        old_filters = json.loads(prev["filters_json"])
+        if old_filters != spec["filters"]:
+            return {"path": "filters", "existing": old_filters,
+                    "requested": spec["filters"]}
+        return None
+
+    @staticmethod
+    def _version_diff_fields(base, target) -> list[dict]:
+        """返回两个版本之间全部规格差异（确定性顺序）。"""
+        out: list[dict] = []
+        for path, old, new in (
+                ("callback_url", base["callback_url"],
+                 target["callback_url"]),
+                ("effective_seq", int(base["effective_seq"]),
+                 int(target["effective_seq"]))):
+            if old != new:
+                out.append({"path": path, "existing": old,
+                            "requested": new})
+        bf = json.loads(base["filters_json"])
+        tf = json.loads(target["filters_json"])
+        if bf != tf:
+            out.append({"path": "filters", "existing": bf,
+                        "requested": tf})
+        return out
+
+    def _version_view(self, v) -> dict[str, Any]:
+        """版本视图（自带取连接/锁，内部结束只读快照——禁止在写事务内调用）。"""
+        with self._lock:
+            conn = self._conn
+            view = self._version_view_from_row(conn, v)
+            conn.rollback()
+        return view
+
+    def _version_view_from_row(self, conn, v) -> dict[str, Any]:
+        """在给定连接/事务上构建版本视图（不提交、不回滚，可在写事务内调用）。"""
+        stats = conn.execute(
+            "SELECT "
+            "SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS confirmed, "
+            "SUM(CASE WHEN status=? THEN 1 ELSE 0 END) AS dead, "
+            "SUM(CASE WHEN status IN (?,?,?) THEN 1 ELSE 0 END) AS open, "
+            "MAX(CASE WHEN status IN (?,?,?) THEN event_seq ELSE NULL END) "
+            "AS max_open_seq "
+            "FROM audit_subscription_deliveries "
+            "WHERE subscription_id=? AND version_no=?",
+            (D_CONFIRMED, D_DEAD, *D_OPEN, *D_OPEN,
+             v["subscription_id"], v["version_no"])).fetchone()
+        open_seq = stats["max_open_seq"]
+        return {
+            "version_id": v["version_id"],
+            "subscription_id": v["subscription_id"],
+            "version_no": int(v["version_no"]),
+            "idempotency_key": v["idempotency_key"],
+            "status": v["status"],
+            "callback_url": v["callback_url"],
+            "filters": json.loads(v["filters_json"]),
+            "effective_seq": int(v["effective_seq"]),
+            "position_seq": int(v["position_seq"]),
+            "subscription_seq_next": int(v["sub_seq"]) + 1,
+            "snapshot_seq": int(v["snapshot_seq"]),
+            "deliveries": {
+                "confirmed": int(stats["confirmed"] or 0),
+                "dead_letter": int(stats["dead"] or 0),
+                "in_flight_or_pending": int(stats["open"] or 0),
+            },
+            # superseded 旧版本是否还有未完成通知：清空后旧版本收尾结束
+            "drained": int(stats["open"] or 0) == 0,
+            "last_open_event_seq": (int(open_seq)
+                                    if open_seq is not None else None),
+            "reject_reason": v["reject_reason"],
+            "created_at_ms": v["created_at_ms"],
+            "updated_at_ms": v["updated_at_ms"],
+            "activated_at_ms": v["activated_at_ms"],
+            "cancelled_at_ms": v["cancelled_at_ms"],
+        }
+
+    @staticmethod
+    def _audit_view(r) -> dict[str, Any]:
+        return {
+            "id": r["id"],
+            "subscription_id": r["subscription_id"],
+            "version_no": (int(r["version_no"])
+                           if r["version_no"] is not None else None),
+            "event": r["event"],
+            "outcome": r["outcome"],
+            "detail": r["detail"],
+            "detail_json": (json.loads(r["detail_json"])
+                            if r["detail_json"] else None),
+            "created_at_ms": r["created_at_ms"],
+        }
+
+    def _audit_locked(self, conn, subscription_id: str,
+                      version_no: int | None, event: str, outcome: str,
+                      detail: str | None = None, *,
+                      detail_obj: dict | None = None,
+                      now: int | None = None) -> None:
+        """在订阅自己的审计历史只追加一行（调用方已持锁/在事务内）。
+
+        绝不写 lease_events、租约、委托或投递记录。
+        """
+        conn.execute(
+            "INSERT INTO audit_subscription_events(subscription_id, "
+            "version_no, event, outcome, detail, detail_json, created_at_ms) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (subscription_id, version_no, event, outcome, detail,
+             canonical_json(detail_obj) if detail_obj is not None else None,
+             now if now is not None else self._now()))
+
+    # ======================================================================
     # 查询：订阅 / 投递历史（分页）
     # ======================================================================
     def get_subscription(self, subscription_id: str) -> dict[str, Any]:
@@ -1379,12 +2441,18 @@ class SubscriptionManager:
 
     def list_deliveries(self, subscription_id: str, *,
                         after_seq: Any = None, status: Any = None,
+                        version_no: Any = None,
                         limit: Any = 100) -> dict[str, Any]:
-        """分页读取订阅投递历史（按 event_seq 升序，游标是 event_seq）。"""
+        """分页读取订阅投递历史（按 event_seq 升序，游标是 event_seq）。
+
+        可传 ``version_no`` 只看某一版本（切换前后）的投递与失败记录。
+        """
         limit = _bounded_limit(limit)
         after = _as_int(after_seq, "after", default=0)
         if after < 0:
             raise AuditBadRequest("after 不能为负数", after=after)
+        ver = _as_int(version_no, "version_no") if version_no not in (
+            None, "") else None
         if status is not None and status not in (
                 D_PENDING, D_INFLIGHT, D_AWAITING, D_CONFIRMED, D_DEAD,
                 D_DISCARDED):
@@ -1401,6 +2469,9 @@ class SubscriptionManager:
             if status:
                 where.append("status=?")
                 args.append(status)
+            if ver is not None:
+                where.append("version_no=?")
+                args.append(ver)
             rows = conn.execute(
                 "SELECT * FROM audit_subscription_deliveries WHERE "
                 + " AND ".join(where)
@@ -1411,6 +2482,7 @@ class SubscriptionManager:
         has_more = len(rows) > limit
         return {
             "subscription_id": subscription_id,
+            "version_no": ver,
             "deliveries": [self._delivery_view(r) for r in page],
             "limit": limit,
             "next": page[-1]["event_seq"] if has_more else None,
@@ -1482,6 +2554,10 @@ class SubscriptionManager:
                 "FROM audit_subscription_deliveries WHERE subscription_id=?",
                 (D_CONFIRMED, D_DEAD, *D_OPEN, D_CONFIRMED,
                  row["subscription_id"])).fetchone()
+            versions = conn.execute(
+                "SELECT * FROM audit_subscription_versions "
+                "WHERE subscription_id=? ORDER BY version_no ASC",
+                (row["subscription_id"],)).fetchall()
             conn.rollback()
         return {
             "subscription_id": row["subscription_id"],
@@ -1498,6 +2574,11 @@ class SubscriptionManager:
                               else None),
             "subscription_seq_next": row["sub_seq"] + 1,
             "snapshot_seq": row["snapshot_seq"],
+            "current_version": int(row["current_version"]),
+            "pending_version": (int(row["pending_version"])
+                                if row["pending_version"] is not None
+                                else None),
+            "versions": [self._version_view(v) for v in versions],
             "status": row["status"],
             "blocked": bool(row["blocked"]),
             "max_attempts": row["max_attempts"],
@@ -1520,11 +2601,14 @@ class SubscriptionManager:
         next_abs = None
         if d["status"] == D_PENDING and (d["next_retry_at_ms"] or 0) > 0:
             next_abs = int(d["updated_at_ms"]) + int(d["next_retry_at_ms"])
+        keys = d.keys()
         return {
             "delivery_id": d["delivery_id"],
             "subscription_id": d["subscription_id"],
             "event_seq": d["event_seq"],
             "subscription_seq": d["subscription_seq"],
+            "version_no": (int(d["version_no"]) if "version_no" in keys
+                           else int(payload.get("version_no", 1))),
             "status": d["status"],
             "attempts": d["attempts"],
             "backoff_ms": d["next_retry_at_ms"] or None,

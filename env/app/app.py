@@ -167,7 +167,8 @@
                                                 从指定序号重新开始（保留
                                                 全部历史投递记录）
   GET    /audit/subscriptions/<id>/deliveries    分页投递历史
-                                                （?after=&status=&limit=）
+                                                （?after=&status=
+                                                 &version_no=&limit=）
   GET    /audit/subscriptions/<id>/deliveries/<event_seq>
                                                 单条投递（尝试次数/退避/
                                                 失败原因/死信原因/签名）
@@ -178,10 +179,32 @@
                                                 坏签名 401 不改状态）
   POST   /audit/subscriptions/<id>/deliveries/<event_seq>/retry
                                                 忽略退避立即重试一条投递
-  GET    /audit/subscriptions/dead-letters      列死信（?subscription_id=）
+  GET    /audit/subscriptions/dead-letters      列死信（?subscription_id=
+                                                &version_no=）
   POST   /audit/subscriptions/<id>/dead-letters/<event_seq>/requeue
                                                 死信重新放回队列（清空
                                                 尝试次数，立即重试）
+  订阅版本切换（原子切换；旧版本在途通知按旧回调/密钥/订阅序号收尾，生效
+  序号（含）后新匹配事件只进新版本；创建/激活/取消/重试各自幂等键，换规格
+  409、生效序号越过稳定历史上界 416 且原订阅不变）：
+  POST   /audit/subscriptions/<id>/versions      预创建下一版本
+                                                {callback_url, filters?,
+                                                 effective_seq,
+                                                 idempotency_key}
+  GET    /audit/subscriptions/<id>/versions      列版本（?status=&limit=）
+  GET    /audit/subscriptions/<id>/versions/<v>  查版本状态/位置/投递计数
+  GET    /audit/subscriptions/<id>/versions/<v>/diff
+                                                与基线版本差异
+                                                （?base_version=，默认当前）
+  POST   /audit/subscriptions/<id>/versions/<v>/activate
+                                                原子激活（{idempotency_key}）
+  POST   /audit/subscriptions/<id>/versions/<v>/cancel
+                                                取消预创建版本（幂等键）
+  POST   /audit/subscriptions/<id>/versions/<v>/retry-dead-letters
+                                                只重试该版本的死信（幂等键）
+  GET    /audit/subscriptions/<id>/history       该订阅自己的审计历史
+                                                （只追加；?after_id=
+                                                 &event=&limit=）
   POST   /audit/subscriptions/process           管理/演练：扫描入队+投递一轮
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
   POST   /debug/tick           手动推进逻辑钟
@@ -259,6 +282,10 @@ from .subscription import (
     SubscriptionManager,
     SubscriptionNotFound,
     SubscriptionRangeError,
+    SubscriptionVersionBadState,
+    SubscriptionVersionConflict,
+    SubscriptionVersionNotFound,
+    SubscriptionVersionRangeError,
 )
 from .audit import (
     AuditBadRequest,
@@ -1048,11 +1075,12 @@ def create_app(
 
     @app.get("/audit/subscriptions/<subscription_id>/deliveries")
     def subscription_deliveries(subscription_id):
-        # 分页读取投递历史（按事件序号升序；?after=&status=&limit=）
+        # 分页读取投递历史（按事件序号升序；?after=&status=&version_no=&limit=）
         return jsonify(subscriptions.list_deliveries(
             subscription_id,
             after_seq=request.args.get("after"),
             status=request.args.get("status"),
+            version_no=request.args.get("version_no"),
             limit=request.args.get("limit", 100),
         ))
 
@@ -1079,6 +1107,7 @@ def create_app(
     def subscription_dead_letters():
         return jsonify(subscriptions.list_dead_letters(
             subscription_id=request.args.get("subscription_id"),
+            version_no=request.args.get("version_no"),
             limit=request.args.get("limit", 100),
         ))
 
@@ -1087,6 +1116,83 @@ def create_app(
         # 死信重新放回队列：清空尝试次数，立即重试（严格顺序仍受队首约束）
         return jsonify(subscriptions.requeue_dead_letter(
             subscription_id, event_seq=event_seq))
+
+    # -- 订阅版本切换 -----------------------------------------------------
+    @app.post("/audit/subscriptions/<subscription_id>/versions")
+    def subscription_version_prepare(subscription_id):
+        # 为活动订阅预创建下一版本：新回调地址、新过滤条件、生效历史序号
+        # （含）。同键重放 200；换规格/目标订阅 409；生效序号越过稳定
+        # 历史上界 416 且原订阅不变。
+        data = body()
+        view, created = subscriptions.prepare_version(
+            subscription_id,
+            callback_url=data.get("callback_url"),
+            filters=data.get("filters"),
+            effective_seq=data.get("effective_seq"),
+            idempotency_key=data.get("idempotency_key"),
+        )
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/subscriptions/<subscription_id>/versions")
+    def subscription_version_list(subscription_id):
+        # 版本状态分页（?status=prepared/active/superseded/cancelled）
+        return jsonify(subscriptions.list_versions(
+            subscription_id,
+            status=request.args.get("status"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/subscriptions/<subscription_id>/versions/<int:version_no>")
+    def subscription_version_get(subscription_id, version_no):
+        return jsonify(subscriptions.get_version(
+            subscription_id, version_no))
+
+    @app.get("/audit/subscriptions/<subscription_id>/versions/<int:version_no>/diff")
+    def subscription_version_diff(subscription_id, version_no):
+        # 与基线版本（默认当前生效版本）的差异：回调/过滤/生效序号
+        return jsonify(subscriptions.diff_version(
+            subscription_id, version_no,
+            base_version=request.args.get("base_version")))
+
+    @app.post("/audit/subscriptions/<subscription_id>/versions/<int:version_no>/activate")
+    def subscription_version_activate(subscription_id, version_no):
+        # 原子切换（单事务）：旧版本 superseded、新版本 active、订阅主行
+        # 整体切换；同键重放 200。
+        data = body()
+        view, created = subscriptions.activate_version(
+            subscription_id, version_no,
+            idempotency_key=data.get("idempotency_key"))
+        return jsonify({**view, "replayed": not created}), \
+            200 if created else 200
+
+    @app.post("/audit/subscriptions/<subscription_id>/versions/<int:version_no>/cancel")
+    def subscription_version_cancel(subscription_id, version_no):
+        # 取消预创建版本（只有 prepared 可取消），永不生效
+        data = body()
+        view, created = subscriptions.cancel_version(
+            subscription_id, version_no,
+            idempotency_key=data.get("idempotency_key"))
+        return jsonify({**view, "replayed": not created}), 200
+
+    @app.post("/audit/subscriptions/<subscription_id>/versions/<int:version_no>/retry-dead-letters")
+    def subscription_version_retry_dead(subscription_id, version_no):
+        # 只重试某个版本的死信（复位尝试次数，立即重试，严格顺序不变）
+        data = body()
+        view, created = subscriptions.retry_version_dead_letters(
+            subscription_id, version_no,
+            idempotency_key=data.get("idempotency_key"))
+        return jsonify({**view, "replayed": not created}), 200
+
+    @app.get("/audit/subscriptions/<subscription_id>/history")
+    def subscription_audit_history(subscription_id):
+        # 该订阅自己的审计历史（只追加）：版本创建/激活/拒绝原因/取消/重试
+        return jsonify(subscriptions.list_audit_history(
+            subscription_id,
+            after_id=request.args.get("after_id"),
+            event=request.args.get("event"),
+            limit=request.args.get("limit", 100),
+        ))
 
     @app.post("/audit/subscriptions/process")
     def subscription_process():
@@ -1209,9 +1315,13 @@ def create_app(
     @app.errorhandler(SubscriptionBadState)
     @app.errorhandler(DeliveryBadState)
     @app.errorhandler(SubscriptionRangeError)
+    @app.errorhandler(SubscriptionVersionNotFound)
+    @app.errorhandler(SubscriptionVersionConflict)
+    @app.errorhandler(SubscriptionVersionBadState)
+    @app.errorhandler(SubscriptionVersionRangeError)
     def _subscription_error(exc):
-        # 订阅显式错误：订阅/投递不存在 404、幂等冲突/状态前提 409、
-        # 起始序号越过稳定视图上界 416
+        # 订阅显式错误：订阅/投递/版本不存在 404、幂等冲突/状态前提 409、
+        # 起始/生效序号越过稳定视图上界 416
         return jsonify(exc.to_response()), exc.status
 
     @app.errorhandler(GenerationTooSmall)
