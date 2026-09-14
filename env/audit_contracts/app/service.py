@@ -11,7 +11,9 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from . import contracts as C
+from . import provenance as P
 from .contracts import ContractError, VersionError
+from .provenance import ProvenanceIntegrityError
 from .store import Store
 
 
@@ -69,6 +71,35 @@ def _idem_replay(store: Store, scope: str, key: Optional[str],
             "first_request_fingerprint": rec["_fingerprint"],
             "request_fingerprint": fingerprint})
     return {"replayed": True, **rec["_response"]}
+
+
+def _idem_replay_attempt(store: Store, scope: str, key: Optional[str],
+                         fingerprint: str, operation: str) -> Optional[dict]:
+    """重试专用回放：成功结果回放为响应；失败结果回放为同状态拒绝。
+
+    失败的重试也会落尝试记录与来源说明，因此其结果必须被幂等记录冻结：
+    同键再次调用直接重放同一次失败，绝不再生成一份说明。
+    """
+    if not key:
+        return None
+    hit = store.idem_get(scope, key)
+    if hit is None:
+        return None
+    rec = _idem_cached(hit)
+    if rec.get("_fingerprint") is not None and rec["_fingerprint"] != fingerprint:
+        raise Reject(409, "idempotency_request_conflict", {
+            "operation": operation,
+            "idempotency_key": key,
+            "reason": "同一幂等键绑定的请求内容与首次提交不一致，"
+                      "不能沿用首次结果；请更换幂等键或保持请求内容一致",
+            "first_request_fingerprint": rec["_fingerprint"],
+            "request_fingerprint": fingerprint})
+    resp = rec["_response"]
+    if isinstance(resp, dict) and resp.get("_error"):
+        detail = dict(resp.get("detail") or {})
+        detail["replayed"] = True
+        raise Reject(resp["status"], resp["reason"], detail)
+    return {"replayed": True, **resp}
 
 
 class Service:
@@ -770,12 +801,15 @@ class Service:
                 if revoked_here:
                     # 契约在该位置已撤销：事件不再受契约约束，原样冻结并入队
                     self.store.begin()
+                    entries = P.build_entries(None, raw, raw, [], [],
+                                              ungoverned=True)
                     self._freeze_notification(
                         sub_id, ev, None, raw,
                         {"valid": True, "ungoverned": True,
                          "reason": "契约已撤销，事件不再受约束",
                          "errors": [], "infos": []},
-                        "queued")
+                        "queued", source_payload=raw, entries=entries,
+                        attempt_status="ungoverned", idem_key=None)
                     self.store.conn.execute(
                         "UPDATE subscriptions SET scan_seq=? WHERE id=?", (nxt, sub_id))
                     self.audit("notification_enqueued", {
@@ -791,10 +825,13 @@ class Service:
             normalized, errors, infos = C.check_and_normalize(contract["spec"], raw)
             if errors:
                 self.store.begin()
+                entries = P.build_entries(
+                    contract["spec"], raw, None, errors, infos)
                 notif_id = self._freeze_notification(
                     sub_id, ev, contract["version"], raw,
                     {"valid": False, "errors": errors, "infos": infos},
-                    "blocked")
+                    "blocked", source_payload=raw, entries=entries,
+                    attempt_status="blocked", idem_key=None)
                 self.store.conn.execute(
                     "INSERT INTO quarantines(sub_id, seq, notification_id, event_type, "
                     "expected_version, raw_digest, errors_json, status, created_at) "
@@ -810,9 +847,13 @@ class Service:
                 return  # HOL：scan_seq 不推进，后续通知全部挡住
 
             self.store.begin()
+            entries = P.build_entries(
+                contract["spec"], raw, normalized, [], infos)
             self._freeze_notification(
                 sub_id, ev, contract["version"], normalized,
-                {"valid": True, "errors": [], "infos": infos}, "queued")
+                {"valid": True, "errors": [], "infos": infos}, "queued",
+                source_payload=raw, entries=entries,
+                attempt_status="queued", idem_key=None)
             self.store.conn.execute(
                 "UPDATE subscriptions SET scan_seq=? WHERE id=?", (nxt, sub_id))
             self.audit("notification_enqueued", {
@@ -822,9 +863,16 @@ class Service:
             self.store.commit()
 
     def _freeze_notification(self, sub_id: str, ev, version: Optional[str],
-                             payload: Any, validation: dict, status: str) -> str:
+                             payload: Any, validation: dict, status: str,
+                             source_payload: Any = None,
+                             entries: Optional[List[dict]] = None,
+                             attempt_status: Optional[str] = None,
+                             idem_key: Optional[str] = None,
+                             applied: Optional[List[dict]] = None) -> str:
         notif_id = f"ntf_{uuid.uuid4().hex}"
         frozen = C.canonical_payload(payload)
+        origin_digest = C.digest(C.canonical_payload(
+            source_payload if source_payload is not None else payload))
         self.store.conn.execute(
             "INSERT INTO notifications(sub_id, seq, notification_id, event_type, "
             "contract_version, frozen_payload, digest, validation, status, created_at) "
@@ -832,7 +880,56 @@ class Service:
             (sub_id, ev["seq"], notif_id, ev["event_type"], version,
              frozen.decode("utf-8"), C.digest(frozen),
              json.dumps(validation, ensure_ascii=False), status, time.time()))
+        # 首次冻结 = attempt_no 1：同时落尝试记录与来源说明（只追加、不可变）
+        self._append_attempt_locked(
+            sub_id, ev["seq"], notif_id, ev["event_type"], 1, "initial_freeze",
+            attempt_status or status, version,
+            origin_digest if status == "blocked" else C.digest(frozen),
+            C.digest(frozen), entries or [], prev_digest=None,
+            idem_key=idem_key, applied=applied or [])
         return notif_id
+
+    def _append_attempt_locked(self, sub_id: str, seq: int, notif_id: str,
+                               event_type: str, attempt_no: int, kind: str,
+                               status: str, version: Optional[str],
+                               payload_digest: str, frozen_digest: Optional[str],
+                               entries: List[dict],
+                               prev_digest: Optional[str],
+                               idem_key: Optional[str] = None,
+                               applied: Optional[List[dict]] = None) -> None:
+        """原子追加一次尝试 + 一份来源说明（调用方须已 begin）。
+
+        说明的 record_digest 覆盖全部绑定与条目，prev 锚定上一尝试，
+        写入后任何后续契约/映射规则都不能再修改它。
+        """
+        origin_row = self.store.conn.execute(
+            "SELECT raw_payload FROM events WHERE sub_id=? AND seq=?",
+            (sub_id, seq)).fetchone()
+        origin_event_digest = C.digest(
+            C.canonical_payload(json.loads(origin_row["raw_payload"])))
+        now = time.time()
+        cur = self.store.conn.execute(
+            "INSERT INTO delivery_attempts(sub_id, seq, notification_id, event_type, "
+            "attempt_no, kind, status, contract_version, payload_digest, "
+            "frozen_digest, applied_json, idem_key, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (sub_id, seq, notif_id, event_type, attempt_no, kind, status,
+             version, payload_digest, frozen_digest,
+             json.dumps(applied or [], ensure_ascii=False), idem_key, now))
+        record_digest = P.explanation_record_digest(
+            sub_id=sub_id, seq=seq, attempt_no=attempt_no,
+            notification_id=notif_id, contract_version=version,
+            payload_digest=payload_digest,
+            origin_event_digest=origin_event_digest, entries=entries)
+        self.store.conn.execute(
+            "INSERT INTO provenance_explanations(sub_id, seq, attempt_no, "
+            "notification_id, contract_version, payload_digest, "
+            "origin_event_digest, entries_json, record_digest, "
+            "prev_record_digest, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (sub_id, seq, attempt_no, notif_id, version, payload_digest,
+             origin_event_digest,
+             json.dumps(entries, ensure_ascii=False), record_digest,
+             prev_digest, now))
 
     def list_notifications(self, sub_id: str) -> dict:
         rows = self.store.query(
@@ -868,11 +965,232 @@ class Service:
                 },
                 "failed_fields": json.loads(r["errors_json"]),
                 "current_contract": contract_now,
+                "provenance": self._provenance_summary(sub_id, r["seq"]),
                 "created_at": r["created_at"],
                 "recovered_at": r["recovered_at"],
             })
         head = next((i["seq"] for i in items if i["status"] == "blocked"), None)
         return {"sub_id": sub_id, "head_blocked_seq": head, "items": items}
+
+    # ------------------------------------------------------------------ #
+    # 来源说明查询 / 重试尝试列表 / 两次尝试比较（读取时强制完整性校验）
+    # ------------------------------------------------------------------ #
+    def _load_delivery(self, sub_id: str, seq: int):
+        notif = self.store.query_one(
+            "SELECT * FROM notifications WHERE sub_id=? AND seq=?",
+            (sub_id, seq))
+        if not notif:
+            raise Reject(404, "notification_not_found",
+                         {"sub_id": sub_id, "seq": seq,
+                          "reason": "该序号尚未冻结任何通知（无来源说明）"})
+        attempts = self.store.query(
+            "SELECT * FROM delivery_attempts WHERE sub_id=? AND seq=? "
+            "ORDER BY attempt_no", (sub_id, seq))
+        explanations = self.store.query(
+            "SELECT * FROM provenance_explanations WHERE sub_id=? AND seq=? "
+            "ORDER BY attempt_no", (sub_id, seq))
+        return notif, attempts, explanations
+
+    def _verify_provenance_locked(self, sub_id: str, seq: int,
+                                  notif, attempts, explanations) -> None:
+        """重算哈希链与绑定；任何不一致都抛完整性错误，绝不返回可信内容。"""
+        problems: List[dict] = []
+        try:
+            P.verify_chain(attempts, explanations)
+        except ProvenanceIntegrityError as e:
+            problems.extend(e.checks)
+        # 原始审计事件摘要绑定
+        ev = self.store.query_one(
+            "SELECT raw_payload FROM events WHERE sub_id=? AND seq=?",
+            (sub_id, seq))
+        if ev and explanations:
+            raw_digest = C.digest(
+                C.canonical_payload(json.loads(ev["raw_payload"])))
+            for exp in explanations:
+                if exp["origin_event_digest"] != raw_digest:
+                    problems.append({
+                        "check": "origin_event_digest", "ok": False,
+                        "attempt_no": exp["attempt_no"],
+                        "stored": exp["origin_event_digest"],
+                        "recomputed": raw_digest,
+                        "reason": "来源说明绑定的原始事件摘要与审计事件不一致"})
+        # 最新尝试的载荷摘要必须与冻结通知行一致
+        if explanations:
+            latest = explanations[-1]
+            if latest["notification_id"] != notif["notification_id"]:
+                problems.append({"check": "binding_notification_id", "ok": False,
+                                 "reason": "来源说明绑定的投递身份与通知行不一致"})
+            if notif["digest"] and notif["digest"] != latest["payload_digest"] \
+                    and notif["status"] != "blocked":
+                problems.append({
+                    "check": "frozen_digest", "ok": False,
+                    "attempt_no": latest["attempt_no"],
+                    "notification_digest": notif["digest"],
+                    "explanation_payload_digest": latest["payload_digest"],
+                    "reason": "最新来源说明的载荷摘要与冻结通知不一致"})
+        if problems:
+            raise Reject(422, "provenance_integrity_error",
+                         {"sub_id": sub_id, "seq": seq,
+                          "reason": "来源说明未通过完整性校验，结果不可信",
+                          "failed_checks": problems})
+
+    def get_provenance(self, sub_id: str, seq: int,
+                       attempt_no: Optional[int] = None) -> dict:
+        self._require_sub(sub_id)
+        notif, attempts, explanations = self._load_delivery(sub_id, seq)
+        with self.store.lock:
+            self._verify_provenance_locked(
+                sub_id, seq, notif, attempts, explanations)
+            if attempt_no is not None:
+                rows = [a for a in attempts if a["attempt_no"] == attempt_no]
+                if not rows:
+                    raise Reject(404, "attempt_not_found",
+                                 {"seq": seq, "attempt_no": attempt_no})
+                exp = next(e for e in explanations
+                           if e["attempt_no"] == attempt_no)
+                return self._provenance_view(sub_id, seq, notif, rows[0], exp)
+            latest_exp = explanations[-1]
+            return {
+                "sub_id": sub_id, "seq": seq,
+                "notification_id": notif["notification_id"],
+                "event_type": notif["event_type"],
+                "notification_status": notif["status"],
+                "latest_attempt_no": latest_exp["attempt_no"],
+                "attempt_count": len(attempts),
+                "integrity": {"trusted": True,
+                              "checks": ["record_digest", "hash_chain",
+                                         "bindings", "origin_event_digest",
+                                         "frozen_digest"]},
+                "latest": self._provenance_view(
+                    sub_id, seq, notif, attempts[-1], latest_exp),
+                "attempts": [
+                    {"attempt_no": a["attempt_no"], "kind": a["kind"],
+                     "status": a["status"],
+                     "contract_version": a["contract_version"],
+                     "payload_digest": a["payload_digest"],
+                     "frozen_digest": a["frozen_digest"],
+                     "record_digest": next(
+                         e["record_digest"] for e in explanations
+                         if e["attempt_no"] == a["attempt_no"])}
+                    for a in attempts],
+            }
+
+    def _provenance_view(self, sub_id, seq, notif, att, exp) -> dict:
+        entries = json.loads(exp["entries_json"])
+        return {
+            "sub_id": sub_id, "seq": seq,
+            "attempt_no": att["attempt_no"], "kind": att["kind"],
+            "status": att["status"],
+            "notification_id": att["notification_id"],
+            "event_type": att["event_type"],
+            "contract_version": att["contract_version"],
+            "payload_digest": att["payload_digest"],
+            "frozen_digest": att["frozen_digest"],
+            "origin_event_digest": exp["origin_event_digest"],
+            "record_digest": exp["record_digest"],
+            "prev_record_digest": exp["prev_record_digest"],
+            "applied_mappings": json.loads(att["applied_json"]),
+            "created_at": att["created_at"],
+            "entries": entries,
+            "integrity": {"trusted": True},
+        }
+
+    def list_retry_attempts(self, sub_id: str, seq: int) -> dict:
+        self._require_sub(sub_id)
+        notif, attempts, explanations = self._load_delivery(sub_id, seq)
+        with self.store.lock:
+            self._verify_provenance_locked(
+                sub_id, seq, notif, attempts, explanations)
+            exp_by_no = {e["attempt_no"]: e for e in explanations}
+            items = []
+            for a in attempts:
+                exp = exp_by_no[a["attempt_no"]]
+                entries = json.loads(exp["entries_json"])
+                invalid = [e["path"] for e in entries
+                           if e.get("validation", {}).get("valid") is False]
+                items.append({
+                    "attempt_no": a["attempt_no"], "kind": a["kind"],
+                    "status": a["status"],
+                    "contract_version": a["contract_version"],
+                    "payload_digest": a["payload_digest"],
+                    "frozen_digest": a["frozen_digest"],
+                    "record_digest": exp["record_digest"],
+                    "prev_record_digest": exp["prev_record_digest"],
+                    "applied_mappings": json.loads(a["applied_json"]),
+                    "idempotency_key": a["idem_key"],
+                    "failed_fields": invalid,
+                    "field_count": len(entries),
+                    "created_at": a["created_at"]})
+            return {"sub_id": sub_id, "seq": seq,
+                    "notification_id": notif["notification_id"],
+                    "notification_status": notif["status"],
+                    "attempt_count": len(items),
+                    "integrity": {"trusted": True},
+                    "attempts": items}
+
+    def compare_attempts(self, sub_id: str, seq: int,
+                         from_attempt: Optional[int] = None,
+                         to_attempt: Optional[int] = None) -> dict:
+        self._require_sub(sub_id)
+        notif, attempts, explanations = self._load_delivery(sub_id, seq)
+        with self.store.lock:
+            self._verify_provenance_locked(
+                sub_id, seq, notif, attempts, explanations)
+            available = [a["attempt_no"] for a in attempts]
+            # 默认比较最后两次尝试（修复前 -> 修复后）
+            if to_attempt is None:
+                to_attempt = available[-1]
+            if from_attempt is None:
+                from_attempt = available[-2] if len(available) >= 2 \
+                    else available[-1]
+            exp_by_no = {e["attempt_no"]: e for e in explanations}
+            if from_attempt not in exp_by_no or to_attempt not in exp_by_no:
+                raise Reject(404, "attempt_not_found", {
+                    "seq": seq, "from_attempt": from_attempt,
+                    "to_attempt": to_attempt,
+                    "available": available})
+            ea = json.loads(exp_by_no[from_attempt]["entries_json"])
+            eb = json.loads(exp_by_no[to_attempt]["entries_json"])
+            diff = P.compare_explanations(ea, eb)
+            return {
+                "sub_id": sub_id, "seq": seq,
+                "notification_id": notif["notification_id"],
+                "from_attempt": from_attempt, "to_attempt": to_attempt,
+                "from_record_digest": exp_by_no[from_attempt]["record_digest"],
+                "to_record_digest": exp_by_no[to_attempt]["record_digest"],
+                "from_contract_version":
+                    exp_by_no[from_attempt]["contract_version"],
+                "to_contract_version":
+                    exp_by_no[to_attempt]["contract_version"],
+                "integrity": {"trusted": True},
+                **diff}
+
+    def _provenance_summary(self, sub_id: str, seq: int) -> Optional[dict]:
+        """隔离列表用的轻量来源摘要（完整校验在专门的 provenance 端点进行）。"""
+        row = self.store.query_one(
+            "SELECT COUNT(*) c, MAX(attempt_no) latest FROM delivery_attempts "
+            "WHERE sub_id=? AND seq=?", (sub_id, seq))
+        if not row or row["c"] == 0:
+            return None
+        last = self.store.query_one(
+            "SELECT record_digest FROM provenance_explanations "
+            "WHERE sub_id=? AND seq=? ORDER BY attempt_no DESC LIMIT 1",
+            (sub_id, seq))
+        return {"attempt_count": row["c"], "latest_attempt_no": row["latest"],
+                "latest_record_digest": last["record_digest"] if last else None}
+
+    def _next_attempt_no(self, sub_id: str, seq: int) -> int:
+        row = self.store.query_one(
+            "SELECT COALESCE(MAX(attempt_no),0) m FROM delivery_attempts "
+            "WHERE sub_id=? AND seq=?", (sub_id, seq))
+        return row["m"] + 1
+
+    def _latest_record_digest(self, sub_id: str, seq: int) -> Optional[str]:
+        row = self.store.query_one(
+            "SELECT record_digest FROM provenance_explanations "
+            "WHERE sub_id=? AND seq=? ORDER BY attempt_no DESC LIMIT 1",
+            (sub_id, seq))
+        return row["record_digest"] if row else None
 
     # ------------------------------------------------------------------ #
     # 映射规则
@@ -1025,8 +1343,8 @@ class Service:
         scope = f"retry:{sub_id}:{seq}"
         fingerprint = _fingerprint({"sub_id": sub_id, "seq": seq, "op": "retry"})
         with self.store.lock:
-            replayed = _idem_replay(self.store, scope, idem_key,
-                                    fingerprint, "retry")
+            replayed = _idem_replay_attempt(self.store, scope, idem_key,
+                                            fingerprint, "retry")
             if replayed is not None:
                 return replayed
             q = self.store.query_one(
@@ -1069,40 +1387,51 @@ class Service:
                 (sub_id, ev["event_type"], version, seq))
 
             # 映射只作用于派生载荷；原始审计事件绝不改写（从事件表重读一份作为输入）
-            derived = _deepcopy(original)
-            applied: List[dict] = []
-            for r in rules:
-                if r["op"] == "rename":
-                    if _get_path(derived, r["src_path"], _MISSING) is not _MISSING:
-                        val = _pop_path(derived, r["src_path"])
-                        _set_path(derived, r["dst_path"], val)
-                    applied.append({"op": "rename", "src": r["src_path"], "dst": r["dst_path"]})
-                elif r["op"] == "default":
-                    if _get_path(derived, r["dst_path"], _MISSING) is _MISSING:
-                        _set_path(derived, r["dst_path"], json.loads(r["value"]))
-                    applied.append({"op": "default", "dst": r["dst_path"],
-                                    "value": json.loads(r["value"])})
-                elif r["op"] == "drop":
-                    if _get_path(derived, r["src_path"], _MISSING) is not _MISSING:
-                        _pop_path(derived, r["src_path"])
-                    applied.append({"op": "drop", "src": r["src_path"]})
+            derived, effects, applied = P.apply_mappings_tracked(original, rules)
 
             normalized, errors, infos = C.check_and_normalize(spec, derived)
+            attempt_no = self._next_attempt_no(sub_id, seq)
+            prev_digest = self._latest_record_digest(sub_id, seq)
+            origin_digest = C.digest(C.canonical_payload(original))
+            derived_digest = C.digest(C.canonical_payload(derived))
             if errors:
+                # 失败重试同样追加一份说明：逐字段记录失败原因与当时的规则，
+                # 绝不覆盖首次隔离说明
+                entries = P.build_entries(spec, derived, normalized,
+                                          errors, infos, effects=effects)
                 self.store.begin()
                 self.store.conn.execute(
                     "UPDATE quarantines SET retry_count=retry_count+1 WHERE sub_id=? AND seq=?",
                     (sub_id, seq))
+                self._append_attempt_locked(
+                    sub_id, seq, q["notification_id"], ev["event_type"],
+                    attempt_no, "retry", "retry_failed", version,
+                    derived_digest, None, entries, prev_digest,
+                    idem_key=idem_key, applied=applied)
                 self.audit("retry_failed", {
-                    "seq": seq, "expected_version": version,
+                    "seq": seq, "attempt_no": attempt_no,
+                    "expected_version": version,
                     "applied_mappings": applied, "errors": errors}, sub_id)
+                # 失败结果也冻结幂等记录：同键回放重放同一次失败，
+                # 绝不重复追加尝试/说明
+                if idem_key:
+                    self.store.idem_put(scope, idem_key, {
+                        "_error": True, "status": 422,
+                        "reason": "retry_still_invalid",
+                        "detail": {"seq": seq, "attempt_no": attempt_no,
+                                   "errors": errors,
+                                   "applied_mappings": applied}},
+                        fingerprint)
                 self.store.commit()
                 raise Reject(422, "retry_still_invalid",
-                             {"seq": seq, "errors": errors,
+                             {"seq": seq, "attempt_no": attempt_no,
+                              "errors": errors,
                               "applied_mappings": applied})
 
             # 恢复成功：复用同一 notification_id（身份不变）、顺序由 pump 保持
             self.store.begin()
+            entries = P.build_entries(spec, derived, normalized,
+                                      [], infos, effects=effects)
             frozen = C.canonical_payload(normalized)
             self.store.conn.execute(
                 "UPDATE notifications SET contract_version=?, frozen_payload=?, "
@@ -1116,19 +1445,27 @@ class Service:
                 "UPDATE quarantines SET status='recovered', recovered_at=?, "
                 "retry_count=retry_count+1 WHERE sub_id=? AND seq=?",
                 (time.time(), sub_id, seq))
+            self._append_attempt_locked(
+                sub_id, seq, q["notification_id"], ev["event_type"],
+                attempt_no, "retry", "recovered", version,
+                C.digest(frozen), C.digest(frozen), entries, prev_digest,
+                idem_key=idem_key, applied=applied)
             self.store.conn.execute(
                 "UPDATE subscriptions SET scan_seq=? WHERE id=?", (seq, sub_id))
             self.audit("retry_recovered", {
-                "seq": seq, "notification_id": q["notification_id"],
+                "seq": seq, "attempt_no": attempt_no,
+                "notification_id": q["notification_id"],
                 "contract_version": version, "applied_mappings": applied,
                 "digest": C.digest(frozen)}, sub_id)
             self.store.commit()
-            # 恢复队头后继续泵送后续被挡住的通知（保持顺序）
+            # 恢复队头后继续泵送后续被挡住的通知（保持顺序）。
+            # 泵送产生的是后续 seq 的首次冻结，不会为本 seq 再生成说明。
             self._pump_locked(sub_id)
 
         result = {"seq": seq, "status": "recovered",
                   "notification_id": q["notification_id"],
                   "contract_version": version,
+                  "attempt_no": attempt_no,
                   "frozen_payload": normalized,
                   "reason": "已保留原投递身份并恢复入队，未生成重复通知"}
         if idem_key:

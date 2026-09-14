@@ -94,6 +94,32 @@ python3 -m unittest discover -s tests -t . -v
   成功则 UPDATE 同一通知行（身份不变）并继续泵送后续被挡通知；
 - 已恢复事件再次重试：幂等返回既有结果，不新增通知。
 
+## 逐字段来源说明（provenance，只追加、可验证、不保存原值）
+
+每条冻结通知（含隔离事件与每次重试）都在**尝试发生的同一事务里**写一份不可变来源说明，
+随后的任何契约或映射规则都不能修改它；重试只能**追加**新的尝试记录：
+
+- 说明只记录：最终路径、原始来源路径、JSON 类型、**值内容摘要**（canonical sha256 +
+  字节数，绝不复制字段值）、规则标识（`source:direct` / `contract_default:<type>` /
+  `mapping:<id>` / `policy:unknown_strip|allow|strict` / `validation:*`）、改名前路径；
+- 来源类别覆盖：`direct_value`（直接取值）、`contract_default`（契约默认）、
+  `fixed_default`（default 映射固定值）、`renamed`（旧字段重命名）、`dropped`
+  （允许删除 ignorable 字段）、`unknown_stripped`（strip 剥离）、`unknown_allowed`、
+  `validation_failed` / `missing_required`（验证失败进隔离，保留路径与原因）、
+  `ungoverned_passthrough`（契约撤销后无约束）；
+- 每份说明绑定：**冻结契约版本 + 载荷摘要 + 原始审计事件摘要 + 投递身份**，
+  并有 `record_digest`（本行规范化 sha256）与 `prev_record_digest`（哈希链锚点）；
+- 查询时**强制重算**自校验摘要、哈希链、尝试序号连续性、与通知行/原始事件的摘要绑定：
+  任一缺失、断链或摘要不一致都返回 `422 provenance_integrity_error`（detail 给出
+  每项失败检查），**绝不把损坏结果当成可信说明**——直接篡改库（改条目/删说明/
+  删尝试/换绑定摘要/替换原始事件）都会被检出；
+- 同一幂等键回放：成功与**失败**的重试结果都被冻结，重放不再生成新说明，
+  也不改变通知顺序；尝试序号严格 `1,2,3…`，`(sub_id,seq,attempt_no)` 唯一。
+
+`compare` 端点逐字段对比两次尝试，按 `added_fields / removed_fields / renamed_fields /
+changed_fields / unchanged_fields` 给出新增、删除、改名（优先配对，含规则标识与
+值摘要是否变化）、来源/规则/校验变化及值摘要前后对比。
+
 ## 幂等
 
 所有写接口（契约登记、预演、生效、撤销、映射登记、重试）接受 `idempotency_key`；
@@ -129,7 +155,10 @@ python3 -m unittest discover -s tests -t . -v
 | POST | `/subscriptions/{s}/activations` | 生效（含 effective_seq/CAS/幂等键） |
 | GET | `/subscriptions/{s}/activations` | 当前生效版本 |
 | POST | `/subscriptions/{s}/revocations` | 撤销（记撤销点） |
-| GET | `/subscriptions/{s}/quarantine` | 隔离列表 |
+| GET | `/subscriptions/{s}/quarantine` | 隔离列表（含来源摘要） |
+| GET | `/subscriptions/{s}/notifications/{seq}/provenance` | 逐字段来源说明（`?attempt=N`） |
+| GET | `/subscriptions/{s}/notifications/{seq}/attempts` | 投递尝试列表（只追加） |
+| GET | `/subscriptions/{s}/notifications/{seq}/compare` | 两次尝试逐字段比较（`?from=&to=`，默认最后两次） |
 | POST | `/subscriptions/{s}/quarantine/{seq}/retry` | 映射重试 |
 | POST/GET | `/subscriptions/{s}/mappings` | 映射登记 / 查询 |
 | GET | `/subscriptions/{s}/audit-history`、`/audit-history` | 审计历史 |

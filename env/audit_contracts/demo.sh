@@ -87,11 +87,18 @@ req POST /subscriptions/hol/quarantine/2/retry '{}' | J
 show "   再重试一次：幂等，不产生重复通知"
 req POST /subscriptions/hol/quarantine/2/retry '{"idempotency_key":"R1"}' | J
 
-show "10) 隔离查询（原始事件摘要/失败字段/当前契约）与最终通知顺序"
+show "10) 隔离查询（原始事件摘要/失败字段/当前契约/来源摘要）与最终通知顺序"
 req GET /subscriptions/hol/quarantine | J
 req GET /subscriptions/hol/notifications | J
 
-show "11) 订阅审计历史（差异/拒绝/隔离/恢复全部可审计）"
+show "11) 逐字段来源说明：seq2 隔离尝试(1) 与 strip 恢复尝试(2)，只记录路径/类型/摘要/规则"
+req GET /subscriptions/hol/notifications/2/provenance | J
+show "    重试尝试列表（只追加，含哈希链锚点）"
+req GET /subscriptions/hol/notifications/2/attempts | J
+show "    修复前->修复后逐字段比较：junk 被 strip 剥离、值摘要/规则对比"
+req GET '/subscriptions/hol/notifications/2/compare?from=1&to=2' | J
+
+show "12) 订阅审计历史（差异/拒绝/隔离/恢复全部可审计）"
 req GET /subscriptions/demo/audit-history | J
 echo
 echo "演示完成。服务日志: /tmp/audit_demo_server.log"

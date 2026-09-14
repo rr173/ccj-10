@@ -6,6 +6,13 @@
   POST   /subscriptions/{sub}/events                    事件入库（推进稳定水位）
   POST   /subscriptions/{sub}/scan                      显式推进扫描
   GET    /subscriptions/{sub}/notifications             冻结通知列表
+  GET    /subscriptions/{sub}/notifications/{seq}/provenance
+         单条通知/隔离事件的逐字段来源说明（?attempt=N 取某次尝试；
+         读取时强制完整性校验，损坏返回 422 provenance_integrity_error）
+  GET    /subscriptions/{sub}/notifications/{seq}/attempts
+         重试尝试列表（只追加，含每次的规则/摘要/失败字段）
+  GET    /subscriptions/{sub}/notifications/{seq}/compare?from=1&to=2
+         两次尝试逐字段比较：新增/删除/改名/值摘要变化与对应规则
 
   PUT    /contracts/{event_type}/versions/{version}     契约登记（幂等键可选）
   GET    /contracts/{event_type}/versions               版本列表
@@ -37,7 +44,7 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs as urllib_parse_qs
 
 from .service import Reject, Service
 from .contracts import ContractError, VersionError
@@ -83,11 +90,12 @@ def _make_handler(svc: Service) -> type:
             try:
                 parsed = urlparse(self.path)
                 path = parsed.path.rstrip("/") or "/"
+                query = urllib_parse_qs(parsed.query)
                 body = self._read_json() if method in ("POST", "PUT") else {}
                 handler, kwargs = _match(method, path)
                 if handler is None:
                     raise Reject(404, "not_found", {"path": path, "method": method})
-                self._send(200, handler(self, body, **kwargs))
+                self._send(200, handler(self, body, query=query, **kwargs))
             except Reject as e:
                 self._send(e.status, {"error": e.reason, **({"detail": e.detail} if e.detail else {})})
             except (ContractError, VersionError) as e:
@@ -97,39 +105,63 @@ def _make_handler(svc: Service) -> type:
 
         # -- 端点实现 ------------------------------------------------------ #
         # 订阅 / 事件
-        def create_sub(self, body, sub):
+        def create_sub(self, body, sub, query=None):
             return svc.create_subscription(sub)
 
-        def sub_status(self, body, sub):
+        def sub_status(self, body, sub, query=None):
             return svc.subscription_status(sub)
 
-        def ingest(self, body, sub):
+        def ingest(self, body, sub, query=None):
             if "seq" not in body or "event_type" not in body or "payload" not in body:
                 raise Reject(400, "missing_fields",
                              {"required": ["seq", "event_type", "payload"]})
             return svc.ingest_event(sub, int(body["seq"]), body["event_type"],
                                     body["payload"])
 
-        def scan(self, body, sub):
+        def scan(self, body, sub, query=None):
             return svc.scan(sub)
 
-        def notifications(self, body, sub):
+        def notifications(self, body, sub, query=None):
             return svc.list_notifications(sub)
 
+        def provenance(self, body, sub, seq, query):
+            attempt = query.get("attempt", [None])[0]
+            try:
+                no = int(attempt) if attempt is not None else None
+            except ValueError:
+                raise Reject(400, "invalid_query_param",
+                             {"param": "attempt", "value": attempt})
+            return svc.get_provenance(sub, int(seq), no)
+
+        def attempts(self, body, sub, seq, query):
+            return svc.list_retry_attempts(sub, int(seq))
+
+        def compare(self, body, sub, seq, query):
+            def qint(name):
+                v = query.get(name, [None])[0]
+                if v is None:
+                    return None  # 缺省：比较最后两次尝试
+                try:
+                    return int(v)
+                except ValueError:
+                    raise Reject(400, "invalid_query_param",
+                                 {"param": name, "value": v})
+            return svc.compare_attempts(sub, int(seq), qint("from"), qint("to"))
+
         # 契约
-        def put_contract(self, body, etype, version):
+        def put_contract(self, body, etype, version, query=None):
             if "spec" not in body:
                 raise Reject(400, "missing_fields", {"required": ["spec"]})
             return svc.register_contract(etype, version, body["spec"],
                                          self._idempotency_key(body))
 
-        def get_contract(self, body, etype, version):
+        def get_contract(self, body, etype, version, query=None):
             return svc.get_contract(etype, version)
 
-        def list_contracts(self, body, etype):
+        def list_contracts(self, body, etype, query=None):
             return svc.list_contracts(etype)
 
-        def diff(self, body, etype):
+        def diff(self, body, etype, query=None):
             if "new_version" not in body:
                 raise Reject(400, "missing_fields", {"required": ["new_version"]})
             sub = body.get("sub_id")
@@ -137,7 +169,7 @@ def _make_handler(svc: Service) -> type:
                             body["new_version"], sub)
 
         # 预演
-        def start_dryrun(self, body, sub):
+        def start_dryrun(self, body, sub, query=None):
             missing = [f for f in ("event_type", "version") if f not in body]
             if missing:
                 raise Reject(400, "missing_fields", {"required": missing})
@@ -146,11 +178,11 @@ def _make_handler(svc: Service) -> type:
                 int(body.get("from_seq", 1)),
                 body.get("to_seq"), self._idempotency_key(body))
 
-        def get_dryrun(self, body, sub, drid):
+        def get_dryrun(self, body, sub, drid, query=None):
             return svc.get_dry_run(int(drid))
 
         # 生效 / 撤销
-        def activate(self, body, sub):
+        def activate(self, body, sub, query=None):
             missing = [f for f in ("event_type", "version") if f not in body]
             if missing:
                 raise Reject(400, "missing_fields", {"required": missing})
@@ -160,22 +192,22 @@ def _make_handler(svc: Service) -> type:
                 bool(body.get("expected_absent", False)),
                 self._idempotency_key(body))
 
-        def list_activations(self, body, sub):
+        def list_activations(self, body, sub, query=None):
             return {"sub_id": sub, "activations": svc.active_activation(sub)}
 
-        def revoke(self, body, sub):
+        def revoke(self, body, sub, query=None):
             if "event_type" not in body:
                 raise Reject(400, "missing_fields", {"required": ["event_type"]})
             return svc.revoke(sub, body["event_type"], self._idempotency_key(body))
 
         # 隔离 / 重试 / 映射
-        def quarantine(self, body, sub):
+        def quarantine(self, body, sub, query=None):
             return svc.list_quarantine(sub)
 
-        def retry(self, body, sub, seq):
+        def retry(self, body, sub, seq, query=None):
             return svc.retry(sub, int(seq), self._idempotency_key(body))
 
-        def add_mapping(self, body, sub):
+        def add_mapping(self, body, sub, query=None):
             for f in ("event_type", "op"):
                 if f not in body:
                     raise Reject(400, "missing_fields", {"required": f})
@@ -185,14 +217,14 @@ def _make_handler(svc: Service) -> type:
                 body.get("value"), body.get("seq"),
                 self._idempotency_key(body))
 
-        def list_mappings(self, body, sub):
+        def list_mappings(self, body, sub, query=None):
             return svc.list_mappings(sub, body.get("seq"))
 
         # 审计
-        def sub_audit(self, body, sub):
+        def sub_audit(self, body, sub, query=None):
             return {"sub_id": sub, "history": svc.audit_history(sub)}
 
-        def global_audit(self, body):
+        def global_audit(self, body, query=None):
             return {"history": svc.audit_history(None)}
 
     # ------------------------------------------------------------------ #
@@ -204,6 +236,9 @@ def _make_handler(svc: Service) -> type:
         ("POST", re.compile(r"^/subscriptions/(?P<sub>[^/]+)/events$"), "ingest", ["sub"]),
         ("POST", re.compile(r"^/subscriptions/(?P<sub>[^/]+)/scan$"), "scan", ["sub"]),
         ("GET",  re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notifications$"), "notifications", ["sub"]),
+        ("GET",  re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notifications/(?P<seq>\d+)/provenance$"), "provenance", ["sub", "seq"]),
+        ("GET",  re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notifications/(?P<seq>\d+)/attempts$"), "attempts", ["sub", "seq"]),
+        ("GET",  re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notifications/(?P<seq>\d+)/compare$"), "compare", ["sub", "seq"]),
 
         ("PUT",  re.compile(r"^/contracts/(?P<etype>[^/]+)/versions/(?P<version>[^/]+)$"),
          "put_contract", ["etype", "version"]),

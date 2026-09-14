@@ -135,6 +135,44 @@ CREATE TABLE IF NOT EXISTS idempotency (
     at          REAL NOT NULL,
     PRIMARY KEY (scope, idem_key)
 );
+
+-- 每次投递尝试（首次冻结 + 每次失败/成功的重试）。只追加：
+-- 重试绝不 UPDATE/删除历史尝试行；同一幂等键回放不产生新行。
+CREATE TABLE IF NOT EXISTS delivery_attempts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    sub_id            TEXT NOT NULL,
+    seq               INTEGER NOT NULL,
+    notification_id   TEXT NOT NULL,           -- 投递身份：整个生命周期保持不变
+    event_type        TEXT NOT NULL,
+    attempt_no        INTEGER NOT NULL,        -- 1 = 首次冻结；之后严格 +1
+    kind              TEXT NOT NULL,           -- initial_freeze / retry
+    status            TEXT NOT NULL,           -- queued / blocked / retry_failed / recovered / ungoverned
+    contract_version  TEXT,                    -- 该次尝试冻结时治理的契约版本
+    payload_digest    TEXT NOT NULL,           -- 该次尝试输入载荷的规范化摘要（原始/派生计份）
+    frozen_digest     TEXT,                    -- 最终冻结载荷摘要（失败尝试可能无冻结载荷）
+    applied_json      TEXT NOT NULL,           -- 本次作用的映射规则摘要（无映射为 []）
+    idem_key          TEXT,                    -- 触发本次尝试的幂等键（仅记录，不参与回放）
+    created_at        REAL NOT NULL,
+    UNIQUE (sub_id, seq, attempt_no)
+);
+
+-- 来源说明：每次尝试一份，写入后不可被任何后续契约/映射规则修改。
+-- 只记录路径、类型、规则标识、内容摘要（sha256），绝不复制原始字段值。
+CREATE TABLE IF NOT EXISTS provenance_explanations (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    sub_id             TEXT NOT NULL,
+    seq                INTEGER NOT NULL,
+    attempt_no         INTEGER NOT NULL,
+    notification_id    TEXT NOT NULL,          -- 绑定投递身份
+    contract_version   TEXT,                   -- 绑定当时冻结的契约版本
+    payload_digest     TEXT NOT NULL,          -- 绑定该次尝试的载荷摘要
+    origin_event_digest TEXT NOT NULL,         -- 绑定原始审计事件摘要
+    entries_json       TEXT NOT NULL,          -- 逐字段来源条目（路径/类型/规则/摘要）
+    record_digest      TEXT NOT NULL,          -- 本行内容的规范化 sha256（防篡改自校验）
+    prev_record_digest TEXT,                   -- 哈希链：上一尝试的 record_digest（attempt 1 为 NULL）
+    created_at         REAL NOT NULL,
+    UNIQUE (sub_id, seq, attempt_no)
+);
 """
 
 
