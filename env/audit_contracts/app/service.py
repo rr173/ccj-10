@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -22,6 +23,52 @@ class Reject(Exception):
         self.status = status
         self.reason = reason
         self.detail = detail or {}
+
+
+def _fingerprint(parts: dict) -> str:
+    """请求内容指纹：键排序的规范化 JSON 的 sha256。
+
+    幂等键只在请求内容完全一致时回放；版本、范围、序号、事件类型、
+    映射目标等任一变化都会得到不同指纹并显式报冲突。
+    """
+    canonical = json.dumps(parts, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _idem_cached(hit: Any) -> dict:
+    """幂等记录统一形态：{"_response": <首次结果>, "_fingerprint": <首次指纹>}。"""
+    if isinstance(hit, dict) and "_response" in hit:
+        return hit
+    # 兼容旧信封（曾直接把 {"response":...} 当作响应体存储）
+    if isinstance(hit, dict) and "response" in hit:
+        return {"_response": hit["response"],
+                "_fingerprint": hit.get("fingerprint")}
+    return {"_response": hit, "_fingerprint": None}
+
+
+def _idem_replay(store: Store, scope: str, key: Optional[str],
+                 fingerprint: str, operation: str) -> Optional[dict]:
+    """命中幂等键时：内容一致回放首次结果；不一致显式冲突（绝不沿用旧结果）。
+
+    返回 {"replayed": True, ...首次响应}；未命中返回 None。
+    历史记录可能没有指纹（旧库迁移），缺失指纹时退化为回放。
+    """
+    if not key:
+        return None
+    hit = store.idem_get(scope, key)
+    if hit is None:
+        return None
+    rec = _idem_cached(hit)
+    if rec.get("_fingerprint") is not None and rec["_fingerprint"] != fingerprint:
+        raise Reject(409, "idempotency_request_conflict", {
+            "operation": operation,
+            "idempotency_key": key,
+            "reason": "同一幂等键绑定的请求内容与首次提交不一致，"
+                      "不能沿用首次结果；请更换幂等键或保持请求内容一致",
+            "first_request_fingerprint": rec["_fingerprint"],
+            "request_fingerprint": fingerprint})
+    return {"replayed": True, **rec["_response"]}
 
 
 class Service:
@@ -176,12 +223,15 @@ class Service:
         except (ContractError, VersionError) as e:
             raise Reject(400, "invalid_contract", {"message": str(e)})
         scope = f"contract:{event_type}"
+        fingerprint = _fingerprint({
+            "event_type": event_type, "version": version, "spec": spec})
         with self.store.lock:
-            if idem_key:
-                hit = self.store.idem_get(scope, idem_key)
-                if hit is not None:
-                    cached = hit["response"] if "response" in hit else hit
-                    return {"replayed": True, **cached}
+            # 幂等回放/冲突优先：同键同内容回放；同键改版本/改 spec 一律显式冲突，
+            # 绝不沿用首次结果（即使目标版本尚未登记，也不借首次键把它登记进去）
+            replayed = _idem_replay(self.store, scope, idem_key,
+                                    fingerprint, "register_contract")
+            if replayed is not None:
+                return replayed
             existing = self.store.query_one(
                 "SELECT version FROM contracts WHERE event_type=? AND version=?",
                 (event_type, version))
@@ -195,7 +245,8 @@ class Service:
                                   "reason": "同版本号已登记不同契约"})
                 result = {"event_type": event_type, "version": version, "replayed": True}
                 if idem_key:
-                    self.store.idem_put(scope, idem_key, {"response": result})
+                    self.store.idem_put(scope, idem_key, result,
+                                        fingerprint)
                 return result
             self.store.begin()
             self.store.conn.execute(
@@ -206,7 +257,8 @@ class Service:
                        {"event_type": event_type, "version": version})
             result = {"event_type": event_type, "version": version, "registered": True}
             if idem_key:
-                self.store.idem_put(scope, idem_key, {"response": result})
+                self.store.idem_put(scope, idem_key, result,
+                                    fingerprint)
             self.store.commit()
         return result
 
@@ -263,6 +315,18 @@ class Service:
                       from_seq: int = 1, to_seq: Optional[int] = None,
                       idem_key: Optional[str] = None) -> dict:
         self._require_sub(sub_id)
+        scope = f"dryrun:{sub_id}"
+        fingerprint = _fingerprint({
+            "event_type": event_type, "version": version,
+            "from_seq": from_seq,
+            "to_seq": to_seq if to_seq is not None else "_stable_",
+        })
+        with self.store.lock:
+            replayed = _idem_replay(self.store, scope, idem_key,
+                                    fingerprint, "dry_run")
+            if replayed is not None:
+                dr_id = replayed["dry_run_id"]
+                return {**self.get_dry_run(dr_id), "replayed": True}
         crow = self.store.query_one(
             "SELECT spec_json FROM contracts WHERE event_type=? AND version=?",
             (event_type, version))
@@ -280,14 +344,7 @@ class Service:
                 422, "dryrun_range_beyond_stable",
                 {"to_seq": to_seq, "stable_seq": stable,
                  "reason": "预演范围不能越过稳定历史：未来事件尚不可变，结论会失效"})
-        scope = f"dryrun:{sub_id}"
         with self.store.lock:
-            if idem_key:
-                hit = self.store.idem_get(scope, idem_key)
-                if hit is not None:
-                    dr_id = hit["response"]["dry_run_id"]
-                    cached = self.get_dry_run(dr_id)
-                    return {"replayed": True, **cached}
             self.store.begin()
             cur = self.store.conn.execute(
                 "INSERT INTO dry_runs(sub_id, event_type, version, spec_json, "
@@ -300,7 +357,8 @@ class Service:
                 "from_seq": from_seq, "to_seq": to_seq}, sub_id)
             if idem_key:
                 self.store.idem_put(scope, idem_key,
-                                    {"response": {"dry_run_id": dr_id}})
+                                    {"dry_run_id": dr_id},
+                                    fingerprint)
             self.store.commit()
             self._run_dry_run_locked(dr_id)
         return self.get_dry_run(dr_id)
@@ -420,6 +478,19 @@ class Service:
         if effective_seq is None:
             effective_seq = scan_seq + 1
 
+        scope = f"activate:{sub_id}"
+        fingerprint = _fingerprint({
+            "event_type": event_type, "version": version,
+            "effective_seq": effective_seq,
+            "expected_version": expected_version,
+            "expected_absent": expected_absent,
+        })
+        with self.store.lock:
+            replayed = _idem_replay(self.store, scope, idem_key,
+                                    fingerprint, "activate")
+            if replayed is not None:
+                return replayed
+
         checks: List[str] = []
         # 门禁 1：必须存在覆盖生效点、且无阻断错误的已完成预演
         gate = self.store.query_one(
@@ -464,11 +535,6 @@ class Service:
 
         scope = f"activate:{sub_id}"
         with self.store.lock:
-            if idem_key:
-                hit = self.store.idem_get(scope, idem_key)
-                if hit is not None:
-                    cached = hit["response"] if "response" in hit else hit
-                    return {"replayed": True, **cached}
             try:
                 self.store.begin()
                 # CAS：并发激活只允许一个版本成功
@@ -519,7 +585,8 @@ class Service:
                     "version": version, "previous_version": current_version,
                     "effective_seq": effective_seq, "activated": True}
                 if idem_key:
-                    self.store.idem_put(scope, idem_key, {"response": result})
+                    self.store.idem_put(scope, idem_key, result,
+                                        fingerprint)
                 self.store.commit()
             except Reject:
                 raise
@@ -544,12 +611,12 @@ class Service:
         """撤销生效契约。撤销点之后（未扫描）的事件不再受该契约约束。"""
         self._require_sub(sub_id)
         scope = f"revoke:{sub_id}"
+        fingerprint = _fingerprint({"event_type": event_type})
         with self.store.lock:
-            if idem_key:
-                hit = self.store.idem_get(scope, idem_key)
-                if hit is not None:
-                    cached = hit["response"] if "response" in hit else hit
-                    return {"replayed": True, **cached}
+            replayed = _idem_replay(self.store, scope, idem_key,
+                                    fingerprint, "revoke")
+            if replayed is not None:
+                return replayed
             self.store.begin()
             cur = self.store.conn.execute(
                 "SELECT * FROM activations WHERE sub_id=? AND event_type=? AND active=1",
@@ -572,7 +639,8 @@ class Service:
                       "version": cur["version"], "revoke_seq": revoke_seq,
                       "revoked": True}
             if idem_key:
-                self.store.idem_put(scope, idem_key, {"response": result})
+                self.store.idem_put(scope, idem_key, result,
+                                    fingerprint)
             self.store.commit()
         return result
 
@@ -598,6 +666,54 @@ class Service:
             (event_type, row["version"]))
         return {"version": row["version"], "spec": json.loads(crow["spec_json"]),
                 "revoked": row["revoked_at"] is not None}
+
+    def _resolve_legacy_leaf_type(self, sub_id: str, event_type: str,
+                                  norm_path: str,
+                                  seq: Optional[int]) -> Optional[str]:
+        """解析已不在当前契约中的旧叶子字段类型（用于旧字段 rename）。
+
+        隔离事件保留的是旧字段：它在隔离时冻结的旧契约版本里仍是声明叶子。
+        解析顺序：
+        1. 指定 seq 的隔离行冻结版本（隔离修复登记映射的典型路径）；
+        2. 该订阅该事件类型激活历史中的所有版本（含已撤销/已换约）；
+        3. 指定 seq 的隔离原始事件中按 JSON 标量推断（兜底，旧生产者误送字段）。
+        """
+        versions: List[str] = []
+        if seq is not None:
+            qrow = self.store.query_one(
+                "SELECT expected_version FROM quarantines "
+                "WHERE sub_id=? AND seq=? AND event_type=?",
+                (sub_id, seq, event_type))
+            if qrow and qrow["expected_version"]:
+                versions.append(qrow["expected_version"])
+        for r in self.store.query(
+                "SELECT DISTINCT version FROM activations "
+                "WHERE sub_id=? AND event_type=? ORDER BY id DESC",
+                (sub_id, event_type)):
+            if r["version"] not in versions:
+                versions.append(r["version"])
+        for ver in versions:
+            crow = self.store.query_one(
+                "SELECT spec_json FROM contracts WHERE event_type=? AND version=?",
+                (event_type, ver))
+            if not crow:
+                continue
+            leaf = C.flatten(json.loads(crow["spec_json"])).get(norm_path)
+            if leaf and leaf["kind"] == "leaf":
+                return leaf["type"]
+        # 兜底：旧生产者可能误送一个任何契约都未声明过的字段，
+        # 按隔离原始事件中的 JSON 标量类型推断（结构字段不允许作为 rename 源）。
+        if seq is not None:
+            ev = self.store.query_one(
+                "SELECT raw_payload FROM events WHERE sub_id=? AND seq=?",
+                (sub_id, seq))
+            if ev:
+                val = _get_path(json.loads(ev["raw_payload"]), norm_path, _MISSING)
+                if val is not _MISSING:
+                    inferred = _json_leaf_type(val)
+                    if inferred is not None:
+                        return inferred
+        return None
 
     def active_activation(self, sub_id: str, event_type: Optional[str] = None) -> Any:
         if event_type is None:
@@ -785,20 +901,34 @@ class Service:
         if op == "rename":
             if not src_path or not dst_path:
                 raise Reject(400, "mapping_need_paths", {"op": "rename"})
-            s = leaves.get(_norm_path(src_path))
-            d = leaves.get(_norm_path(dst_path))
-            if not s or s["kind"] != "leaf":
-                raise Reject(404, "mapping_src_unknown",
-                             {"path": src_path,
-                              "reason": "源字段必须是当前契约中的已知叶子字段"})
+            norm_src = _norm_path(src_path)
+            norm_dst = _norm_path(dst_path)
+            d = leaves.get(norm_dst)
             if not d or d["kind"] != "leaf":
                 raise Reject(404, "mapping_dst_unknown",
                              {"path": dst_path,
                               "reason": "目标字段必须是当前契约中的已知叶子字段"})
-            if s["type"] != d["type"]:
+            # 源字段优先取当前契约；隔离事件保留的是旧字段时，允许源字段已不在
+            # 当前契约中——从隔离时冻结的旧契约/该订阅激活过的历史版本解析类型。
+            s = leaves.get(norm_src)
+            if s is not None and s["kind"] != "leaf":
+                raise Reject(409, "mapping_src_not_leaf",
+                             {"path": src_path,
+                              "reason": "重命名源必须是叶子字段，不能是结构节点"})
+            if s is None:
+                src_type = self._resolve_legacy_leaf_type(
+                    sub_id, event_type, norm_src, seq)
+                if src_type is None:
+                    raise Reject(404, "mapping_src_unknown",
+                                 {"path": src_path,
+                                  "reason": "源字段既不在当前契约中，也无法从该订阅"
+                                            "隔离事件保留的旧契约或历史版本中解析"})
+            else:
+                src_type = s["type"]
+            if src_type != d["type"]:
                 raise Reject(409, "mapping_type_mismatch",
                              {"src": src_path, "dst": dst_path,
-                              "src_type": s["type"], "dst_type": d["type"],
+                              "src_type": src_type, "dst_type": d["type"],
                               "reason": "重命名只能改字段名，不能改类型"})
         elif op == "default":
             if not dst_path:
@@ -825,15 +955,17 @@ class Service:
                               "reason": "映射只能删除明确标记 ignorable（允许忽略）的字段"})
 
         scope = f"mapping:{sub_id}"
+        norm_src = _norm_path(src_path) if src_path else None
+        norm_dst = _norm_path(dst_path) if dst_path else None
+        fingerprint = _fingerprint({
+            "event_type": event_type, "seq": seq, "op": op,
+            "src_path": norm_src, "dst_path": norm_dst, "value": value})
         with self.store.lock:
-            if idem_key:
-                hit = self.store.idem_get(scope, idem_key)
-                if hit is not None:
-                    cached = hit["response"] if "response" in hit else hit
-                    return {"replayed": True, **cached}
+            replayed = _idem_replay(self.store, scope, idem_key,
+                                    fingerprint, "register_mapping")
+            if replayed is not None:
+                return replayed
             # 幂等冲突：同一 (事件类型,序号,op,src,dst) 已存在（路径先规范化）
-            norm_src = _norm_path(src_path) if src_path else None
-            norm_dst = _norm_path(dst_path) if dst_path else None
             dup = self.store.query_one(
                 "SELECT id FROM mappings WHERE sub_id=? AND event_type=? "
                 "AND COALESCE(seq,-1)=COALESCE(?, -1) AND op=? "
@@ -845,7 +977,8 @@ class Service:
                           "replayed": True,
                           "reason": "相同映射规则已存在，幂等返回既有规则"}
                 if idem_key:
-                    self.store.idem_put(scope, idem_key, {"response": result})
+                    self.store.idem_put(scope, idem_key, result,
+                                        fingerprint)
                 return result
             self.store.begin()
             cur = self.store.conn.execute(
@@ -853,8 +986,7 @@ class Service:
                 "value, contract_version, created_at, idem_key) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (sub_id, event_type, seq, op,
-                 _norm_path(src_path) if src_path else None,
-                 _norm_path(dst_path) if dst_path else None,
+                 norm_src, norm_dst,
                  json.dumps(value, ensure_ascii=False) if value is not None else None,
                  version, time.time(), idem_key))
             mid = cur.lastrowid
@@ -864,7 +996,8 @@ class Service:
                 "value": value, "contract_version": version}, sub_id)
             result = {"mapping_id": mid, "registered": True}
             if idem_key:
-                self.store.idem_put(scope, idem_key, {"response": result})
+                self.store.idem_put(scope, idem_key, result,
+                                    fingerprint)
             self.store.commit()
         return result
 
@@ -890,12 +1023,12 @@ class Service:
               idem_key: Optional[str] = None) -> dict:
         self._require_sub(sub_id)
         scope = f"retry:{sub_id}:{seq}"
+        fingerprint = _fingerprint({"sub_id": sub_id, "seq": seq, "op": "retry"})
         with self.store.lock:
-            if idem_key:
-                hit = self.store.idem_get(scope, idem_key)
-                if hit is not None:
-                    cached = hit["response"] if "response" in hit else hit
-                    return {"replayed": True, **cached}
+            replayed = _idem_replay(self.store, scope, idem_key,
+                                    fingerprint, "retry")
+            if replayed is not None:
+                return replayed
             q = self.store.query_one(
                 "SELECT * FROM quarantines WHERE sub_id=? AND seq=?", (sub_id, seq))
             if not q:
@@ -914,7 +1047,8 @@ class Service:
                           "notification_id": q["notification_id"],
                           "reason": "该事件已恢复，重试不生成重复通知"}
                 if idem_key:
-                    self.store.idem_put(scope, idem_key, {"response": result})
+                    self.store.idem_put(scope, idem_key, result,
+                                        fingerprint)
                 return result
 
             ev = self.store.query_one(
@@ -1000,12 +1134,28 @@ class Service:
         if idem_key:
             with self.store.lock:
                 self.store.begin()
-                self.store.idem_put(scope, idem_key, {"response": result})
+                self.store.idem_put(scope, idem_key, result,
+                                    fingerprint)
                 self.store.commit()
         return result
 
 
 _MISSING = object()
+
+
+def _json_leaf_type(val: Any) -> Optional[str]:
+    """按 JSON 标量推断契约叶子类型；dict/list/None 不能作为 rename 源。"""
+    if isinstance(val, bool):
+        return "bool"
+    if isinstance(val, int):
+        return "int"
+    if isinstance(val, float):
+        return "number"
+    if isinstance(val, str):
+        return "string"
+    if val is None:
+        return "null"
+    return None
 
 
 def _norm_path(p: str) -> str:

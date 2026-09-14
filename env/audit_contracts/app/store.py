@@ -128,10 +128,11 @@ CREATE TABLE IF NOT EXISTS audit_history (
 );
 
 CREATE TABLE IF NOT EXISTS idempotency (
-    scope   TEXT NOT NULL,
-    idem_key TEXT NOT NULL,
-    response TEXT NOT NULL,
-    at      REAL NOT NULL,
+    scope       TEXT NOT NULL,
+    idem_key    TEXT NOT NULL,
+    response    TEXT NOT NULL,
+    fingerprint TEXT,                          -- 首次请求的规范化内容指纹（不一致即冲突）
+    at          REAL NOT NULL,
     PRIMARY KEY (scope, idem_key)
 );
 """
@@ -156,6 +157,11 @@ class Store:
         if "revoke_seq" not in cols:
             self.conn.execute(
                 "ALTER TABLE activations ADD COLUMN revoke_seq INTEGER")
+        idem_cols = {r["name"] for r in self.conn.execute(
+            "PRAGMA table_info(idempotency)").fetchall()}
+        if "fingerprint" not in idem_cols:
+            self.conn.execute(
+                "ALTER TABLE idempotency ADD COLUMN fingerprint TEXT")
 
     # -- 基础工具 ----------------------------------------------------------- #
     def begin(self) -> sqlite3.Connection:
@@ -184,16 +190,22 @@ class Store:
     # -- 幂等缓存 ----------------------------------------------------------- #
     def idem_get(self, scope: str, key: str) -> Optional[Any]:
         row = self.query_one(
-            "SELECT response FROM idempotency WHERE scope=? AND idem_key=?",
+            "SELECT response, fingerprint FROM idempotency "
+            "WHERE scope=? AND idem_key=?",
             (scope, key),
         )
-        return json.loads(row["response"]) if row else None
+        if not row:
+            return None
+        # 信封键用下划线前缀，避免与响应体自身字段碰撞
+        return {"_response": json.loads(row["response"]),
+                "_fingerprint": row["fingerprint"]}
 
-    def idem_put(self, scope: str, key: str, response: Any) -> None:
+    def idem_put(self, scope: str, key: str, response: Any,
+                 fingerprint: Optional[str] = None) -> None:
         self.conn.execute(
-            "INSERT OR REPLACE INTO idempotency(scope, idem_key, response, at) "
-            "VALUES (?,?,?,strftime('%s','now'))",
-            (scope, key, json.dumps(response, ensure_ascii=False)),
+            "INSERT OR REPLACE INTO idempotency(scope, idem_key, response, "
+            "fingerprint, at) VALUES (?,?,?,?,strftime('%s','now'))",
+            (scope, key, json.dumps(response, ensure_ascii=False), fingerprint),
         )
 
     def close(self) -> None:
