@@ -202,6 +202,32 @@
                                                 取消预创建版本（幂等键）
   POST   /audit/subscriptions/<id>/versions/<v>/retry-dead-letters
                                                 只重试该版本的死信（幂等键）
+  通知签名密钥轮换与验证（预登记/生效/撤销/重签各自幂等键；生效前旧密钥、
+  生效序号（含）后新密钥，旧通知宽限期内仍可旧密钥确认；换指纹/生效序号/
+  宽限期/目标订阅 409，越过稳定历史 416 且当前密钥不变）：
+  POST   /audit/subscriptions/<id>/signing-keys
+                                                预登记下一把签名密钥
+                                                {secret?, fingerprint?,
+                                                 effective_seq, grace_ms,
+                                                 idempotency_key}
+  GET    /audit/subscriptions/<id>/signing-keys 列密钥（?status=&limit=）
+  GET    /audit/subscriptions/<id>/signing-keys/<kid>
+                                                查密钥状态/指纹/投递计数
+  GET    /audit/subscriptions/<id>/signing-keys/<kid>/progress
+                                                轮换进度与新旧密钥投递计数
+  GET    /audit/subscriptions/<id>/signing-keys/<kid>/deliveries
+                                                受影响投递分页（?after=&status=）
+  POST   /audit/subscriptions/<id>/signing-keys/<kid>/activate
+                                                原子生效（{idempotency_key}）
+  POST   /audit/subscriptions/<id>/signing-keys/<kid>/revoke
+                                                撤销预登记密钥（幂等键）
+  GET    /audit/subscriptions/<id>/signature-verifications
+                                                按密钥/时间范围分页验证结果
+                                                （?key_id=&result=&from_ms=
+                                                 &to_ms=&after=&limit=）
+  POST   /audit/subscriptions/<id>/deliveries/<event_seq>/resign
+                                                只重签验证失败的指定密钥投递
+                                                {key_id?, idempotency_key}
   GET    /audit/subscriptions/<id>/history       该订阅自己的审计历史
                                                 （只追加；?after_id=
                                                  &event=&limit=）
@@ -287,6 +313,15 @@ from .subscription import (
     SubscriptionVersionNotFound,
     SubscriptionVersionRangeError,
 )
+from .key_rotation import (
+    KeyRotationBadState,
+    KeyRotationConflict,
+    KeyRotationIdConflict,
+    KeyRotationManager,
+    KeyRotationNotFound,
+    KeyRotationRangeError,
+    KeyVerificationNotFound,
+)
 from .audit import (
     AuditBadRequest,
     AuditError,
@@ -366,6 +401,14 @@ def create_app(
         claim_lease_ms=_env_int("SUBSCRIPTION_CLAIM_LEASE_MS", 60_000),
     )
     app.extensions["subscriptions"] = subscriptions
+    # 订阅通知签名密钥轮换与验证：只写 audit_subscription_signing_keys /
+    # audit_subscription_key_idempotency /
+    # audit_subscription_signature_verifications 自有表（投递表只追加
+    # signing_key_id 列与重签 signature），绝不修改租约、委托、原始历史、
+    # 版本行或已有投递状态。
+    key_rotation = KeyRotationManager(store, subscriptions)
+    subscriptions.attach_key_rotation(key_rotation)
+    app.extensions["key_rotation"] = key_rotation
     if enable_debug_api is None:
         enable_debug_api = os.environ.get("ENABLE_DEBUG_API", "1") == "1"
 
@@ -1194,6 +1237,96 @@ def create_app(
             limit=request.args.get("limit", 100),
         ))
 
+    # -- 签名密钥轮换与验证 -----------------------------------------------
+    @app.post("/audit/subscriptions/<subscription_id>/signing-keys")
+    def signing_key_prepare(subscription_id):
+        # 为活动订阅预登记下一把签名密钥：指纹/生效历史序号（含）/宽限期。
+        # 同键重放 200；换指纹/生效序号/宽限期/目标订阅 409；生效序号越过
+        # 稳定历史 416、早于已扫描位置 409，拒绝时当前密钥不变。
+        data = body()
+        view, created = key_rotation.prepare_key(
+            subscription_id,
+            secret=data.get("secret"),
+            fingerprint=data.get("fingerprint"),
+            effective_seq=data.get("effective_seq"),
+            grace_ms=data.get("grace_ms", 0),
+            idempotency_key=data.get("idempotency_key"),
+        )
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/subscriptions/<subscription_id>/signing-keys")
+    def signing_key_list(subscription_id):
+        # 密钥状态（?status=prepared/active/grace/retired/revoked）
+        return jsonify(key_rotation.list_keys(
+            subscription_id,
+            status=request.args.get("status"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.get("/audit/subscriptions/<subscription_id>/signing-keys/<key_id>")
+    def signing_key_get(subscription_id, key_id):
+        # 单把密钥状态
+        return jsonify(key_rotation.get_key(subscription_id, key_id))
+
+    @app.get("/audit/subscriptions/<subscription_id>/signing-keys/<key_id>/progress")
+    def signing_key_progress(subscription_id, key_id):
+        # 轮换进度：旧密钥待收尾投递数、新密钥投递计数、受影响投递分页
+        return jsonify(key_rotation.rotation_progress(subscription_id, key_id))
+
+    @app.get("/audit/subscriptions/<subscription_id>/signing-keys/<key_id>/deliveries")
+    def signing_key_affected(subscription_id, key_id):
+        # 受轮换影响的投递（边界前未终态旧密钥尾巴 + 边界后新密钥投递）
+        return jsonify(key_rotation.affected_deliveries(
+            subscription_id, key_id,
+            after_seq=request.args.get("after"),
+            status=request.args.get("status"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.post("/audit/subscriptions/<subscription_id>/signing-keys/<key_id>/activate")
+    def signing_key_activate(subscription_id, key_id):
+        # 原子生效：生效序号（含）起新通知必须用新密钥；旧密钥进入宽限/
+        # 立即退役；生效前在途通知继续按旧密钥完成确认
+        data = body()
+        view, created = key_rotation.activate_key(
+            subscription_id, key_id,
+            idempotency_key=data.get("idempotency_key"))
+        return jsonify({**view, "replayed": not created}), 200
+
+    @app.post("/audit/subscriptions/<subscription_id>/signing-keys/<key_id>/revoke")
+    def signing_key_revoke(subscription_id, key_id):
+        # 撤销预登记密钥（只有 prepared 可撤销，永不生效，记录保留）
+        data = body()
+        view, created = key_rotation.revoke_key(
+            subscription_id, key_id,
+            idempotency_key=data.get("idempotency_key"))
+        return jsonify({**view, "replayed": not created}), 200
+
+    @app.get("/audit/subscriptions/<subscription_id>/signature-verifications")
+    def signing_key_verifications(subscription_id):
+        # 按密钥与时间范围分页查询投递签名验证结果
+        # （?key_id=&result=ok/failed/old_key_grace/resigned&from_ms=&to_ms=）
+        return jsonify(key_rotation.list_verifications(
+            subscription_id,
+            key_id=request.args.get("key_id"),
+            result=request.args.get("result"),
+            from_ms=request.args.get("from_ms"),
+            to_ms=request.args.get("to_ms"),
+            after_seq=request.args.get("after"),
+            limit=request.args.get("limit", 100),
+        ))
+
+    @app.post("/audit/subscriptions/<subscription_id>/deliveries/<int:event_seq>/resign")
+    def signing_key_resign(subscription_id, event_seq):
+        # 只对验证失败的指定密钥投递重新签名（不重置状态/不重复确认）
+        data = body()
+        view, created = key_rotation.resign_failed_delivery(
+            subscription_id, event_seq,
+            key_id=data.get("key_id"),
+            idempotency_key=data.get("idempotency_key"))
+        return jsonify({**view, "replayed": not created}), 200
+
     @app.post("/audit/subscriptions/process")
     def subscription_process():
         # 管理/演练入口：先扫描入队再投递到点通知
@@ -1324,6 +1457,17 @@ def create_app(
         # 起始/生效序号越过稳定视图上界 416
         return jsonify(exc.to_response()), exc.status
 
+    @app.errorhandler(KeyRotationNotFound)
+    @app.errorhandler(KeyVerificationNotFound)
+    @app.errorhandler(KeyRotationIdConflict)
+    @app.errorhandler(KeyRotationConflict)
+    @app.errorhandler(KeyRotationBadState)
+    @app.errorhandler(KeyRotationRangeError)
+    def _key_rotation_error(exc):
+        # 签名密钥轮换显式错误：密钥/验证不存在 404、幂等冲突/跨命名空间
+        # 409、状态前提 409、生效序号越过稳定历史 416
+        return jsonify(exc.to_response()), exc.status
+
     @app.errorhandler(GenerationTooSmall)
     def _gen_conflict(exc):
         return jsonify({"error": "generation_fence", "message": str(exc)}), 409
@@ -1402,6 +1546,7 @@ def create_app(
             try:
                 # 订阅：先把新历史事件入队，再投递到点通知
                 # （回调在数据库事务之外执行，失败退避/死信均落库）
+                key_rotation.recover_interruptions()  # 宽限到期退役旧密钥
                 subscriptions.scan_and_enqueue()
                 subscriptions.process_due()
             except Exception:  # noqa: BLE001
@@ -1414,6 +1559,7 @@ def create_app(
         derivation.process_pending()  # 同步续跑未完成的增量派生
         releases.process_due()  # 中断恢复：错过生效时间的计划立即发布
         try:
+            key_rotation.recover_interruptions()  # 重启即收敛宽限到期密钥
             subscriptions.scan_and_enqueue()
             subscriptions.process_due()
         except Exception:  # noqa: BLE001

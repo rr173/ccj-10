@@ -227,6 +227,9 @@ SCAN_BATCH = 500
 SIGNATURE_VERSION = "v1"
 SIGNATURE_ALGORITHM = "HMAC-SHA256"
 
+# 签名验证结果（与 key_rotation 模块共享取值；无轮换时确认恒为 ok）
+V_OK = "ok"
+
 
 def new_secret() -> str:
     """生成订阅签名密钥：32 字节随机值的十六进制表示。"""
@@ -382,8 +385,13 @@ class SubscriptionManager:
         base_backoff_ms: int = DEFAULT_BASE_BACKOFF_MS,
         max_backoff_ms: int = DEFAULT_MAX_BACKOFF_MS,
         claim_lease_ms: int = DEFAULT_CLAIM_LEASE_MS,
+        key_rotation: Any = None,
     ):
         self._store = store
+        # 签名密钥轮换管理器（可选，正交于版本切换）。由 app 装配后通过
+        # attach_key_rotation 注入；为 None 时签名/确认完全沿用版本冻结
+        # 密钥（轮换特性引入前的历史行为）。
+        self._key_rotation = key_rotation
         import sqlite3 as _sqlite3
 
         self._lock = threading.RLock()
@@ -479,10 +487,19 @@ class SubscriptionManager:
             self._conn.execute(
                 "ALTER TABLE audit_subscription_deliveries "
                 "ADD COLUMN version_no INTEGER NOT NULL DEFAULT 1")
+        # 签名密钥轮换特性增量列：投递行冻结的签名密钥代际。NULL（含轮换
+        # 特性前的旧行）表示回退到版本冻结密钥。
+        if "signing_key_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE audit_subscription_deliveries "
+                "ADD COLUMN signing_key_id TEXT")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_delivery_version "
             "ON audit_subscription_deliveries(subscription_id, "
             "version_no, event_seq)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_signkey "
+            "ON audit_subscription_deliveries(subscription_id, signing_key_id)")
         scolumns = {r["name"] for r in self._conn.execute(
             "PRAGMA table_info(audit_subscriptions)").fetchall()}
         if "current_version" not in scolumns:
@@ -593,6 +610,10 @@ class SubscriptionManager:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    def attach_key_rotation(self, key_rotation: Any) -> None:
+        """注入签名密钥轮换管理器（解决两个管理器相互引用的构造顺序）。"""
+        self._key_rotation = key_rotation
 
     # ======================================================================
     # 创建（幂等 + 冲突显式化）
@@ -887,8 +908,21 @@ class SubscriptionManager:
                         "audit_subscription_versions "
                         "WHERE subscription_id=? AND status=?",
                         (sid, V_PREPARED)).fetchall()
+                    # 已预登记但尚未生效的签名密钥同样钉住边界：否则生效
+                    # 序号之后的事件会在生效前就用旧密钥入队（投递行一旦
+                    # 写入即冻结签名密钥代际，无法回头改判）。
+                    if self._key_rotation is not None:
+                        prepared_keys = conn.execute(
+                            "SELECT effective_seq FROM "
+                            "audit_subscription_signing_keys "
+                            "WHERE subscription_id=? AND status=?",
+                            (sid, "prepared")).fetchall()
+                    else:
+                        prepared_keys = []
                     conn.rollback()
                 pending_caps = [int(r["effective_seq"]) - 1 for r in prepared]
+                pending_caps += [int(r["effective_seq"]) - 1
+                                 for r in prepared_keys]
                 for v in versions:
                     upper = self._version_upper_seq(v, max_seq)
                     if v["status"] == V_ACTIVE and pending_caps:
@@ -967,16 +1001,25 @@ class SubscriptionManager:
                     # 版本内订阅序号在同一事务内预先占位：按事件 seq 升序
                     ver_seq += 1
                     payload["subscription_seq"] = ver_seq
+                    # 签名密钥代际：生效序号（含）起的事件钉住新轮换密钥，
+                    # 否则钉住 None（回退版本冻结密钥）。投递行一旦写入就
+                    # 不再随后续轮换改变——旧通知永远按旧密钥签名/确认。
+                    sign_key_id = None
+                    if self._key_rotation is not None:
+                        _, sign_key_id = \
+                            self._key_rotation.signing_secret_for_delivery(
+                                subscription_id, int(r["seq"]),
+                                version_no=version_no, conn=conn)
                     cur = conn.execute(
                         "INSERT OR IGNORE INTO audit_subscription_deliveries"
                         "(delivery_id, subscription_id, event_seq, "
                         "subscription_seq, version_no, status, attempts, "
                         "next_retry_at_ms, payload_json, signature, "
-                        "created_at_ms, updated_at_ms) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "signing_key_id, created_at_ms, updated_at_ms) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (uuid.uuid4().hex, subscription_id, r["seq"],
                          ver_seq, version_no, D_PENDING, 0, 0,
-                         canonical_json(payload), None, now, now))
+                         canonical_json(payload), None, sign_key_id, now, now))
                     if cur.rowcount:
                         inserted += 1
                     else:
@@ -1064,6 +1107,25 @@ class SubscriptionManager:
             "index_id": sub["index_id"],
             "release_id": sub["release_id"],
         }
+
+    def _delivery_signing_secret(self, row) -> str:
+        """投递行签名用的密钥明文（调用方已持锁）。
+
+        优先投递行冻结的轮换签名密钥（``signing_key_id``）；该列为 NULL
+        （轮换特性前的旧行/未轮换）时回退所属版本冻结的密钥。
+        """
+        version_secret = row["secret"]
+        kr = self._key_rotation
+        if kr is None:
+            return version_secret
+        keys = row.keys()
+        sign_key_id = row["signing_key_id"] if "signing_key_id" in keys \
+            else None
+        if not sign_key_id:
+            return version_secret
+        secret = kr.secret_for_key_id(
+            self._conn, row["subscription_id"], sign_key_id)
+        return secret if secret is not None else version_secret
 
     # ======================================================================
     # 投递：认领（带令牌的条件 UPDATE）→ 锁外回调 → 条件记录结果
@@ -1182,7 +1244,11 @@ class SubscriptionManager:
                 if cur.rowcount != 1:
                     return False
                 payload = json.loads(row["payload_json"])
-                signature = sign_payload(row["secret"], payload)
+                # 签名密钥优先级：投递行冻结的轮换签名密钥 → 所属版本冻结
+                # 密钥（旧行/无轮换时）。生效前入队的旧通知在此仍用旧
+                # 密钥签名，绝不被后续轮换改写。
+                secret = self._delivery_signing_secret(row)
+                signature = sign_payload(secret, payload)
                 conn.execute(
                     "UPDATE audit_subscription_deliveries SET signature=? "
                     "WHERE delivery_id=?", (signature, delivery_id))
@@ -1290,6 +1356,9 @@ class SubscriptionManager:
         seq = _as_int(event_seq, "event_seq")
         with self._lock:
             conn = self._conn
+            # 刷新读视图：密钥轮换可能已在另一连接（KeyRotationManager）把
+            # 投递行冻结密钥置为 retired，停在旧 WAL 快照会误判它仍有效。
+            conn.rollback()
             sub = self._get_row(conn, subscription_id)
             if sub is None:
                 raise SubscriptionNotFound(
@@ -1305,18 +1374,51 @@ class SubscriptionManager:
                     subscription_id=subscription_id, event_seq=seq)
 
             payload = json.loads(d["payload_json"])
-            # 密钥取投递行所属版本：旧版本通知必须仍能用旧版本密钥确认
-            vrow = self._get_version_row(conn, subscription_id,
-                                         int(d["version_no"]))
-            secret = vrow["secret"] if vrow is not None else sub["secret"]
-            if not verify_signature(secret, payload, signature):
-                raise InvalidSignature(
-                    "确认签名校验失败：签名与通知载荷的 HMAC-SHA256 不一致，"
-                    "状态未改变",
-                    subscription_id=subscription_id, event_seq=seq)
+            # 密钥取投递行所属版本：旧版本通知必须仍能用旧版本密钥确认。
+            # 若启用签名密钥轮换，则再叠加轮换语义：投递行冻结的轮换密钥
+            # 优先；旧通知在旧密钥宽限期内仍可用旧密钥确认。
+            kr = self._key_rotation
+            if kr is not None:
+                accepted, result_code, info = kr.verify_ack_signature(
+                    subscription_id, d, payload, signature, conn=conn)
+                if not accepted:
+                    # 验证失败也只追加一条 failed 验证记录（不改投递状态、
+                    # 不推进队列），随后 401。失败记录归属投递行本应使用的
+                    # 密钥（expected_key_id），便于"按密钥查验证失败投递"。
+                    fail_info = {
+                        "used_key_id": info.get("expected_key_id") or "",
+                        "expected_key_id": info.get("expected_key_id")}
+                    now0 = self._now()
+                    with self._tx():
+                        kr.record_verification(
+                            subscription_id, d, result_code, fail_info,
+                            conn=conn, now=now0)
+                    raise InvalidSignature(
+                        "确认签名校验失败：签名与当前（或宽限期旧）密钥的 "
+                        "HMAC-SHA256 均不一致，状态未改变",
+                        subscription_id=subscription_id, event_seq=seq,
+                        verification=result_code)
+            else:
+                vrow = self._get_version_row(conn, subscription_id,
+                                             int(d["version_no"]))
+                secret = vrow["secret"] if vrow is not None else sub["secret"]
+                result_code = V_OK
+                info = {"expected_key_id": None}
+                if not verify_signature(secret, payload, signature):
+                    raise InvalidSignature(
+                        "确认签名校验失败：签名与通知载荷的 HMAC-SHA256 不一致，"
+                        "状态未改变",
+                        subscription_id=subscription_id, event_seq=seq)
 
             if d["status"] == D_CONFIRMED:
-                # 重复确认：幂等回放，绝不推进两次
+                # 重复确认：幂等回放，绝不推进两次。验证结论（若启用轮换）
+                # 以唯一约束幂等落库，不重复计数。
+                if kr is not None:
+                    now0 = self._now()
+                    with self._tx():
+                        kr.record_verification(
+                            subscription_id, d, result_code, info,
+                            conn=conn, now=now0)
                 return self._delivery_view(d, replayed=True)
             if d["status"] not in (D_INFLIGHT, D_AWAITING):
                 raise DeliveryBadState(
@@ -1333,6 +1435,12 @@ class SubscriptionManager:
                     (D_CONFIRMED, now, now, d["delivery_id"],
                      D_INFLIGHT, D_AWAITING))
                 self._clear_blocked_locked(conn, subscription_id, now)
+                if kr is not None:
+                    # 验证记录与确认在同一事务：不重复确认（delivery 唯一
+                    # 验证行 + 条件 UPDATE），也不跳过通知。
+                    kr.record_verification(
+                        subscription_id, d, result_code, info,
+                        conn=conn, now=now)
             return self._delivery_view(
                 self._get_delivery_row(conn, d["delivery_id"]))
 
@@ -1414,6 +1522,15 @@ class SubscriptionManager:
                     "WHERE subscription_id=? AND status IN (?,?,?)",
                     (V_CANCELLED, now, now, subscription_id,
                      V_PREPARED, V_ACTIVE, V_SUPERSEDED))
+                # 预登记但未生效的签名密钥一并撤销（永不生效）；已生效/
+                # 宽限/退役密钥保留状态作为历史（其投递已随取消弃置）。
+                if self._key_rotation is not None:
+                    conn.execute(
+                        "UPDATE audit_subscription_signing_keys SET status=?, "
+                        "revoked_at_ms=COALESCE(revoked_at_ms, ?), "
+                        "updated_at_ms=? "
+                        "WHERE subscription_id=? AND status='prepared'",
+                        ("revoked", now, now, subscription_id))
                 self._audit_locked(
                     conn, subscription_id, None,
                     "subscription_cancelled", "ok", now=now)
@@ -2609,6 +2726,8 @@ class SubscriptionManager:
             "subscription_seq": d["subscription_seq"],
             "version_no": (int(d["version_no"]) if "version_no" in keys
                            else int(payload.get("version_no", 1))),
+            "signing_key_id": (d["signing_key_id"]
+                               if "signing_key_id" in keys else None),
             "status": d["status"],
             "attempts": d["attempts"],
             "backoff_ms": d["next_retry_at_ms"] or None,

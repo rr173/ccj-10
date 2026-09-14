@@ -879,13 +879,60 @@ POST /audit/index-releases
   自有表 `audit_subscription_events`，绝不改写租约、委托、
   `lease_events` 原始审计事件或已有投递记录。
 
+### 通知签名密钥轮换与验证
+
+管理员可以为一个**活动**订阅预登记下一把通知签名密钥（密钥指纹、生效
+历史序号 `effective_seq`、宽限期 `grace_ms`），再原子生效。密钥轮换与
+版本切换是两条**正交**能力：版本切换更换回调地址/过滤/版本密钥并按版本
+分段，密钥轮换则在投递行上叠加一层"签名密钥代际"（`signing_key_id`）。
+
+| 接口 | 语义 |
+|---|---|
+| `POST /audit/subscriptions/<id>/signing-keys` | 预登记下一把密钥 `{secret?, fingerprint?, effective_seq, grace_ms, idempotency_key}`（201；同键 200 回放）。`secret` 省略时服务端生成 32 字节随机密钥；`fingerprint` 为 `sha256(secret)`（给定时必须吻合）。同键换指纹/生效序号/宽限期/目标订阅 409（`first_difference` 给首个差异）；生效序号越过稳定历史上界 416（**当前密钥不变**）、早于当前已扫描位置或订阅非 active/已有待生效密钥 409 |
+| `GET /audit/subscriptions/<id>/signing-keys` | 列密钥（`?status=prepared/active/grace/retired/revoked&limit=`），只返回指纹不返回明文 |
+| `GET /audit/subscriptions/<id>/signing-keys/<key_id>` | 单把密钥状态（含指纹、生效序号、宽限到点、`grace_active` 与投递计数） |
+| `GET .../signing-keys/<key_id>/progress` | 轮换进度：旧密钥未终态尾巴（含 awaiting 确认数）、新密钥投递 confirmed/open/dead/钉章计数、`drained` |
+| `GET .../signing-keys/<key_id>/deliveries?after=&status=&limit=` | 分页查询受影响投递（`side=old_key_tail/new_key`，游标为 event_seq） |
+| `POST .../signing-keys/<key_id>/activate` | **原子生效**（幂等键）：旧密钥进入 `grace`（宽限 >0）或立即 `retired`；同键回放，换目标/操作 409 |
+| `POST .../signing-keys/<key_id>/revoke` | 撤销预登记密钥（只有 prepared 可撤销；幂等键，永不生效，记录保留） |
+| `GET /audit/subscriptions/<id>/signature-verifications` | 按密钥与时间范围分页查验证结果（`?key_id=&result=ok/failed/old_key_grace/resigned&from_ms=&to_ms=&after=<ms>:<rowid>&limit=`） |
+| `POST /audit/subscriptions/<id>/deliveries/<event_seq>/resign` | **只对验证失败的指定密钥投递**重新签名 `{key_id?, idempotency_key}`：更新签名并追加 `resigned` 验证记录，不改投递状态/尝试次数、不重复确认 |
+
+语义与不变量：
+
+- **生效前旧密钥、生效后新密钥**：预登记（prepared）即钉住扫描边界，
+  生效序号之后的事件在生效前不会被错误地用旧密钥入队；每个投递行在入队
+  事务内冻结 `signing_key_id`，生效序号（含）起的新通知必须用新密钥
+  HMAC 签名，之前已入队/认领中的旧通知继续用旧密钥；
+- **旧通知宽限确认**：等待显式确认（202）的旧通知在旧密钥宽限期内仍可
+  按旧密钥完成确认，验证结果记为 `old_key_grace`；宽限到点旧密钥置
+  `retired`（后台/查询惰性收敛），此后旧密钥确认一律 401 且不改变状态；
+- **幂等与冲突**：预登记/生效/撤销/重签都带幂等键；同键改变密钥指纹、
+  生效序号、宽限期或目标订阅返回 409 并给出首个差异字段；操作幂等键与
+  预登记键、订阅版本命名空间互不可复用；
+- **验证与重签**：每次显式确认（成功/失败/宽限）只追加验证记录
+  （`(delivery,result,used,expected)` 去重，重复确认不重复计数）；
+  重签只针对最新验证为 `failed` 的投递（无失败记录 409、密钥不符 404），
+  重签只换 `signature`，严格顺序与确认状态不变；
+- **重启续跑**：密钥状态、生效序号、宽限到点、投递行冻结的密钥代际全部
+  持久化；新管理器构造即收敛到期宽限密钥，从已保存状态继续，不重复确认、
+  不跳过通知；
+- **只追加审计 / 只读边界**：`key_prepared`/`key_activated`/
+  `key_revoked`/`key_retired`/`key_resigned` 与所有拒绝原因只追加进该订阅
+  自己的审计历史（`version_no` 列为 NULL）；密钥轮换只写
+  `audit_subscription_signing_keys` /
+  `audit_subscription_key_idempotency` /
+  `audit_subscription_signature_verifications` 三张自有表（投递表只追加
+  `signing_key_id` 列与重签时的 `signature`），绝不改写租约、委托、
+  `lease_events` 原始审计事件、版本行或已有投递状态。
+
 ### 暂停、恢复、取消与重新开始
 
 | 接口 | 语义 |
 |---|---|
 | `POST /audit/subscriptions/<id>/pause` | 暂停扫描与新投递（幂等）；已取消的订阅 409 |
 | `POST /audit/subscriptions/<id>/resume` | 恢复（幂等） |
-| `POST /audit/subscriptions/<id>/cancel` | 取消（幂等）：未终态投递置 `discarded` 但保留历史；取消后迟到的回调响应被令牌/状态检查忽略，**不会再发送任何通知** |
+| `POST /audit/subscriptions/<id>/cancel` | 取消（幂等）：未终态投递置 `discarded` 但保留历史，预创建版本与**预登记签名密钥一并取消/撤销（永不生效）**；取消后迟到的回调响应被令牌/状态检查忽略，**不会再发送任何通知** |
 | `POST /audit/subscriptions/<id>/restart-from` `{"from_seq": N}` | 从指定序号重新开始：**已有投递记录全部保留**，已确认行不重置（同一事件不重复确认），其余非终态/死信行复位为 pending 并立即补齐区间；已取消 409、越界 416 |
 | `GET /audit/subscriptions/<id>/deliveries?after=&status=&version_no=&limit=` | 分页读取投递历史（游标为 event_seq，升序；可按版本过滤切换前后的投递/失败记录） |
 | `POST /audit/subscriptions/process` | 管理/演练入口：扫描入队 + 到点投递各跑一轮 |

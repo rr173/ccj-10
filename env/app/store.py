@@ -614,6 +614,74 @@ CREATE TABLE IF NOT EXISTS audit_subscription_idempotency (
     result_json       TEXT NOT NULL,
     created_at_ms     INTEGER NOT NULL
 );
+-- 订阅通知签名密钥轮换：管理员为活动订阅预登记下一把签名密钥（指纹、
+-- 生效历史序号 effective_seq、宽限期 grace_ms），随后原子生效。
+-- 生效序号之前已入队/认领中的投递在投递表上钉死旧 signing_key_id，继续
+-- 按旧密钥签名/确认；生效序号（含）起的新投递使用新密钥。旧密钥在宽限
+-- 期内处于 grace（旧通知仍可用旧密钥完成确认），到点退役为 retired；
+-- 预登记密钥可撤销（revoked，永不生效）。密钥轮换只写本表与
+-- audit_subscription_key_idempotency /
+-- audit_subscription_signature_verifications 三张自有表（投递表只追加
+-- signing_key_id 列与重签时的 signature），绝不改写租约、委托、
+-- lease_events 原始审计事件、版本行或已有投递状态。
+CREATE TABLE IF NOT EXISTS audit_subscription_signing_keys (
+    key_id            TEXT PRIMARY KEY,
+    subscription_id   TEXT NOT NULL,
+    key_no            INTEGER NOT NULL,
+    idempotency_key   TEXT NOT NULL,
+    secret            TEXT NOT NULL,               -- 签名密钥明文（只在服务端保存）
+    fingerprint       TEXT NOT NULL,               -- sha256(secret) 十六进制
+    effective_seq     INTEGER NOT NULL,            -- 该序号（含）起新通知用新密钥
+    grace_ms          INTEGER NOT NULL DEFAULT 0,  -- 旧密钥宽限时长（墙钟毫秒）
+    status            TEXT NOT NULL DEFAULT 'prepared',
+    replaces_key_id   TEXT,
+    snapshot_seq      INTEGER NOT NULL,
+    activated_at_ms   INTEGER,
+    grace_until_ms    INTEGER,
+    retired_at_ms     INTEGER,
+    revoked_at_ms     INTEGER,
+    reject_reason     TEXT,
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signkey_no
+    ON audit_subscription_signing_keys(subscription_id, key_no);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signkey_idem
+    ON audit_subscription_signing_keys(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_signkey_status
+    ON audit_subscription_signing_keys(subscription_id, status);
+-- 密钥轮换操作（生效/撤销/重签）的幂等日志：同键重复提交回放首次结果，
+-- 同键换操作类型/目标订阅/目标即 409 冲突。预登记键由密钥行唯一索引承载。
+CREATE TABLE IF NOT EXISTS audit_subscription_key_idempotency (
+    idempotency_key   TEXT PRIMARY KEY,
+    subscription_id   TEXT NOT NULL,
+    operation         TEXT NOT NULL,   -- activate_key / revoke_key / resign_delivery
+    target            TEXT NOT NULL,   -- key_id 或 event_seq（冻结的操作目标）
+    result_json       TEXT NOT NULL,
+    created_at_ms     INTEGER NOT NULL
+);
+-- 投递签名验证结果（只追加）：显式确认时按当前密钥/宽限旧密钥验证的结论。
+-- 同一投递可保留多条轨迹（先 failed 后 ok/old_key_grace）；dedupe_key
+-- (delivery_id|result|used|expected) 唯一使完全相同的重复确认不重复计数。
+-- 重签追加 result=resigned 的新行（失败与重签轨迹都保留，按 created_at
+-- 排序）。
+CREATE TABLE IF NOT EXISTS audit_subscription_signature_verifications (
+    verification_id   TEXT PRIMARY KEY,
+    subscription_id   TEXT NOT NULL,
+    delivery_id       TEXT NOT NULL,
+    event_seq         INTEGER NOT NULL,
+    key_id            TEXT NOT NULL,         -- 确认时实际使用的密钥（'' 表示版本密钥）
+    expected_key_id   TEXT,                  -- 投递行冻结的应使用密钥
+    result            TEXT NOT NULL,         -- ok / failed / old_key_grace / resigned
+    detail            TEXT,
+    created_at_ms     INTEGER NOT NULL,
+    dedupe_key        TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sigver_dedupe
+    ON audit_subscription_signature_verifications(dedupe_key);
+CREATE INDEX IF NOT EXISTS idx_sigver_key_time
+    ON audit_subscription_signature_verifications(
+        subscription_id, key_id, created_at_ms, event_seq);
 """
 
 
@@ -691,11 +759,21 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE audit_subscription_deliveries "
                 "ADD COLUMN version_no INTEGER NOT NULL DEFAULT 1")
+        # 签名密钥轮换特性增量列：投递行冻结的签名密钥代际（NULL 回退版本
+        # 冻结密钥，轮换特性前的旧行历史行为不变）。
+        if delivery_cols and "signing_key_id" not in delivery_cols:
+            self._conn.execute(
+                "ALTER TABLE audit_subscription_deliveries "
+                "ADD COLUMN signing_key_id TEXT")
         if delivery_cols:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_delivery_version "
                 "ON audit_subscription_deliveries(subscription_id, "
                 "version_no, event_seq)")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_delivery_signkey "
+                "ON audit_subscription_deliveries(subscription_id, "
+                "signing_key_id)")
 
     def close(self) -> None:
         with self._lock:
