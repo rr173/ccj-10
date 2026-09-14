@@ -341,6 +341,66 @@ def test_prepare_idempotent_replay_and_conflicts(seven_events, client, cb):
     assert len(st["keys"]) == 1 and st["keys"][0]["fingerprint"] == fp
 
 
+def test_prepare_server_generated_secret_idempotent_replay(seven_events,
+                                                           client, cb):
+    """不传 secret/fingerprint、由服务端生成密钥：完全相同的幂等请求第二次
+    必须回放第一次的密钥记录（同一 key_id/指纹），不能因重新生成随机密钥而
+    误报指纹冲突；只有调用方改变指纹/生效序号/宽限期/订阅才 409。"""
+    sub_a = create_sub(client, key="sub-sg-a")
+    sub_b = create_sub(client, key="sub-sg-b",
+                       callback_url="http://other.test/hook")
+    sid = sub_a["subscription_id"]
+    w = seven_events["writes"]
+
+    body = {"effective_seq": w[1], "grace_ms": 1000,
+            "idempotency_key": "sg-same"}
+    r1 = client.post(f"/audit/subscriptions/{sid}/signing-keys", json=body)
+    assert r1.status_code == 201, r1.get_json()
+    k1 = r1.get_json()
+    assert k1.get("secret") is None  # 密钥明文永不回传
+    # 完全相同的请求重放 -> 200，回放同一密钥记录
+    r2 = client.post(f"/audit/subscriptions/{sid}/signing-keys", json=body)
+    assert r2.status_code == 200, r2.get_json()
+    k2 = r2.get_json()
+    assert k2["replayed"] is True
+    assert k2["key_id"] == k1["key_id"]
+    assert k2["fingerprint"] == k1["fingerprint"]
+    # 再放一次：仍回放同一条
+    r3 = client.post(f"/audit/subscriptions/{sid}/signing-keys", json=body)
+    assert r3.status_code == 200
+    assert r3.get_json()["key_id"] == k1["key_id"]
+    # 库里只有一把密钥（没有因冲突外的重放插入新行）
+    assert len(client.get(
+        f"/audit/subscriptions/{sid}/signing-keys").get_json()["keys"]) == 1
+
+    def conflict(payload, *, path_substring):
+        rv = client.post(f"/audit/subscriptions/{sid}/signing-keys",
+                         json=payload)
+        assert rv.status_code == 409, rv.get_json()
+        assert rv.get_json()["error"] == "key_rotation_id_conflict"
+        assert path_substring in \
+            rv.get_json()["first_difference"]["path"]
+
+    # 显式带不同密钥 -> 指纹冲突
+    conflict({**body, "secret": "c" * 64}, path_substring="fingerprint")
+    # 换生效序号
+    conflict({**body, "effective_seq": w[2]},
+             path_substring="effective_seq")
+    # 换宽限期
+    conflict({**body, "grace_ms": 2000}, path_substring="grace_ms")
+    # 换目标订阅
+    rv = client.post(
+        f"/audit/subscriptions/{sub_b['subscription_id']}/signing-keys",
+        json=body)
+    assert rv.status_code == 409
+    assert "subscription_id" in rv.get_json()["first_difference"]["path"]
+    # 冲突不改变状态
+    st = client.get(
+        f"/audit/subscriptions/{sid}/signing-keys").get_json()
+    assert len(st["keys"]) == 1 and \
+        st["keys"][0]["fingerprint"] == k1["fingerprint"]
+
+
 def test_fingerprint_mismatch_secret_rejected(seven_events, client, cb):
     sub = create_sub(client)
     sid = sub["subscription_id"]
@@ -532,8 +592,9 @@ def test_old_and_new_key_routing(seven_events, client, cb):
 
 def test_grace_period_allows_old_key_ack_then_rejects(seven_events, client,
                                                       cb):
-    """在途旧通知 202 停在 awaiting：生效后宽限期内仍按旧密钥确认；
-    宽限期结束后旧密钥确认被拒。"""
+    """在途旧通知 202 停在 awaiting：首次轮换生效后宽限期内仍可按版本密钥
+    确认（old_key_grace）；宽限结束并完成恢复后旧版本密钥签名被拒（401，
+    不标记为已确认）。"""
     sub = create_sub(client, filters={"event_types": ["write"]})
     sid = sub["subscription_id"]
     w = seven_events["writes"]
@@ -554,10 +615,9 @@ def test_grace_period_allows_old_key_ack_then_rejects(seven_events, client,
     kv = client.get(
         f"/audit/subscriptions/{sid}/signing-keys/{k['key_id']}"
     ).get_json()
-    # 宽限期为 0 时旧密钥直接退役；这里给了宽限 -> active，旧密钥在 grace
-    # （首把密钥无前置 active 轮换密钥，grace 列表为空——见下用第二把轮换
-    # 验证宽限；此处先验证新密钥确认旧通知不被接受，旧密钥仍可确认）
     assert kv["status"] == K_ACTIVE
+    # 版本密钥处于隐式宽限窗口（首次轮换）
+    assert kv["version_key_grace_active"] is True
 
     old_secret = version_secret(client, sid, 1)
     # 用新密钥签旧通知 -> 401
@@ -571,13 +631,14 @@ def test_grace_period_allows_old_key_ack_then_rejects(seven_events, client,
     failed = verifications(client, sid, result="failed")
     assert failed and failed[-1]["event_seq"] == w[0]
 
-    # 旧密钥确认 -> 200（首把轮换：投递行无 signing_key_id，回退版本密钥，
-    # 即旧密钥本身，验证为 ok）
+    # 宽限期内旧版本密钥确认 -> 200，验证结果 old_key_grace（不再是 ok）
     good = client.post(
         f"/audit/subscriptions/{sid}/deliveries/{w[0]}/ack",
         json={"signature": sig(old_secret, old_payload)})
     assert good.status_code == 200
     assert good.get_json()["status"] == D_CONFIRMED
+    grace_v = verifications(client, sid, result="old_key_grace")
+    assert [v["event_seq"] for v in grace_v] == [w[0]]
 
     # 放行后队首继续：w[1] 旧密钥，w[2:] 新密钥
     tick(client, n=6)
@@ -587,6 +648,67 @@ def test_grace_period_allows_old_key_ack_then_rejects(seven_events, client,
     for seq in w[2:]:
         assert hmac.compare_digest(sig(new_secret, by_seq[seq]["payload"]),
                                    by_seq[seq]["signature"])
+
+
+def test_first_rotation_old_ack_rejected_with_no_grace(seven_events, client,
+                                                       cb):
+    """首次轮换、宽限为 0：生效后版本密钥立即退役，旧签名确认 401 且不改
+    状态（宽限为 0 时连窗口都没有）。"""
+    sub = create_sub(client, filters={"event_types": ["write"]})
+    sid = sub["subscription_id"]
+    w = seven_events["writes"]
+    new_secret = "31" * 32
+
+    k = prepare_key(client, sid, key="zprep", secret=new_secret,
+                    effective_seq=w[2], grace_ms=0)
+    cb.set_script({w[0]: [cb.ack_pending()]})
+    tick(client, n=2)
+    payload0 = next(c["payload"] for c in cb.calls
+                    if c["payload"]["event_seq"] == w[0])
+    activate_key(client, sid, k["key_id"], key="zact")
+
+    old_secret = version_secret(client, sid, 1)
+    rv = client.post(
+        f"/audit/subscriptions/{sid}/deliveries/{w[0]}/ack",
+        json={"signature": sig(old_secret, payload0)})
+    assert rv.status_code == 401
+    assert deliveries(client, sid)[0]["status"] == D_AWAITING
+
+
+def test_first_rotation_grace_retire_rejects_old_ack(seven_events, client,
+                                                     cb):
+    """首次轮换给了宽限：旧通知在宽限期内可确认；拨表越过宽限并完成恢复
+    处理后，版本密钥退役，旧签名确认一律 401 且投递不被标记为已确认。"""
+    sub = create_sub(client, filters={"event_types": ["write"]})
+    sid = sub["subscription_id"]
+    w = seven_events["writes"]
+    new_secret = "32" * 32
+
+    k = prepare_key(client, sid, key="fgprep", secret=new_secret,
+                    effective_seq=w[2], grace_ms=10_000)
+    cb.set_script({w[0]: [cb.ack_pending()]})
+    tick(client, n=2)
+    payload0 = next(c["payload"] for c in cb.calls
+                    if c["payload"]["event_seq"] == w[0])
+    activate_key(client, sid, k["key_id"], key="fgact")
+    old_secret = version_secret(client, sid, 1)
+
+    # 拨表超过宽限并收敛：版本密钥退役（退役计数挂在版本密钥上）
+    client.post("/debug/wall-shift", json={"delta_ms": 60_000})
+    rec = kmgr(client).recover_interruptions()
+    assert rec["version_key_retired"] == 1
+
+    # 旧签名确认 -> 401，投递仍 awaiting（不丢通知，之后可重签）
+    rv = client.post(
+        f"/audit/subscriptions/{sid}/deliveries/{w[0]}/ack",
+        json={"signature": sig(old_secret, payload0)})
+    assert rv.status_code == 401
+    assert deliveries(client, sid)[0]["status"] == D_AWAITING
+    failed = verifications(client, sid, result="failed")
+    assert failed[-1]["event_seq"] == w[0]
+    # 退役事件入审计历史（版本密钥退役）
+    assert any(e["event"] == "key_retired" and e["outcome"] == "ok"
+               for e in history(client, sid))
 
 
 def test_second_rotation_grace_old_key_ack(seven_events, client, cb):
@@ -848,6 +970,13 @@ def test_failed_verification_resign(seven_events, client, cb):
     assert rv.status_code == 409
 
     # 正确重签：用当前应使用的密钥（k 的新密钥）重算签名
+    # 先拍快照应有的所有投递行字段：重签不得改写任何一个
+    m = mgr(client)
+    before_row = dict(m._conn.execute(
+        "SELECT * FROM audit_subscription_deliveries "
+        "WHERE subscription_id=? AND event_seq=?",
+        (sid, w[0])).fetchone())
+    m._conn.rollback()
     rv = client.post(
         f"/audit/subscriptions/{sid}/deliveries/{w[0]}/resign",
         json={"idempotency_key": "resign-ok"})
@@ -855,22 +984,33 @@ def test_failed_verification_resign(seven_events, client, cb):
     body = rv.get_json()
     assert body["result"] == "resigned" and body["key_id"] == k["key_id"]
     assert body["replayed"] is False
-    # 重签幂等回放
+    # 重签幂等回放（连首次算出的新签名一起回放）
     rv2 = client.post(
         f"/audit/subscriptions/{sid}/deliveries/{w[0]}/resign",
         json={"idempotency_key": "resign-ok"})
     assert rv2.status_code == 200 and rv2.get_json()["replayed"] is True
+    assert rv2.get_json()["signature"] == body["signature"]
     # 重签不改变投递状态（仍 awaiting）、不增加 attempts
     d2 = deliveries(client, sid)[0]
     assert d2["status"] == D_AWAITING
     assert d2["attempts"] == 1
-    # resigned 验证记录可查
+    # 已有投递记录的所有字段保持原值（含 signature 与 updated_at_ms）
+    after_row = dict(m._conn.execute(
+        "SELECT * FROM audit_subscription_deliveries "
+        "WHERE subscription_id=? AND event_seq=?",
+        (sid, w[0])).fetchone())
+    m._conn.rollback()
+    assert set(after_row.items()) == set(before_row.items())
+    # resigned 验证记录可查，新签名只挂在验证记录上
     rv3 = verifications(client, sid, result="resigned")
     assert [v["event_seq"] for v in rv3] == [w[0]]
-    # 用重签后的签名（从投递视图取 signature）确认成功
+    assert rv3[0]["new_signature"] == body["signature"]
+    # 投递视图的签名仍是原值（重签不改写投递行）
+    assert d2["signature"] == before_row["signature"]
+    # 用重签后的签名（验证记录里的新签名）确认成功
     good = client.post(
         f"/audit/subscriptions/{sid}/deliveries/{w[0]}/ack",
-        json={"signature": d2["signature"]})
+        json={"signature": rv3[0]["new_signature"]})
     assert good.status_code == 200
     assert good.get_json()["status"] == D_CONFIRMED
     # 审计历史记录重签

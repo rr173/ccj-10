@@ -622,7 +622,7 @@ CREATE TABLE IF NOT EXISTS audit_subscription_idempotency (
 -- 预登记密钥可撤销（revoked，永不生效）。密钥轮换只写本表与
 -- audit_subscription_key_idempotency /
 -- audit_subscription_signature_verifications 三张自有表（投递表只追加
--- signing_key_id 列与重签时的 signature），绝不改写租约、委托、
+-- signing_key_id 列；重签的新签名只写验证表自有行），绝不改写租约、委托、
 -- lease_events 原始审计事件、版本行或已有投递状态。
 CREATE TABLE IF NOT EXISTS audit_subscription_signing_keys (
     key_id            TEXT PRIMARY KEY,
@@ -641,6 +641,8 @@ CREATE TABLE IF NOT EXISTS audit_subscription_signing_keys (
     retired_at_ms     INTEGER,
     revoked_at_ms     INTEGER,
     reject_reason     TEXT,
+    version_key_grace_until_ms INTEGER,
+    version_key_retired_at_ms  INTEGER,
     created_at_ms     INTEGER NOT NULL,
     updated_at_ms     INTEGER NOT NULL
 );
@@ -674,6 +676,7 @@ CREATE TABLE IF NOT EXISTS audit_subscription_signature_verifications (
     expected_key_id   TEXT,                  -- 投递行冻结的应使用密钥
     result            TEXT NOT NULL,         -- ok / failed / old_key_grace / resigned
     detail            TEXT,
+    new_signature     TEXT,                  -- 重签产生的新签名（只追加，投递行不改写）
     created_at_ms     INTEGER NOT NULL,
     dedupe_key        TEXT NOT NULL
 );

@@ -9,18 +9,26 @@
 2. **生效序号之后的新通知必须使用新密钥**：生效（activated）后，所有
    ``event_seq >= effective_seq`` 的新投递都以新密钥签名。
 3. **宽限期（grace）**：宽限窗口内收到的、用**旧密钥**做的显式确认仍然
-   接受（旧通知宽限确认）；窗口结束后旧密钥确认一律拒绝。新密钥确认不受
-   宽限期影响。
+   接受（旧通知宽限确认）；窗口结束（并完成恢复收敛）后旧密钥确认一律
+   拒绝。首次轮换被替换的是版本冻结密钥（没有自己的密钥行，窗口挂在
+   key_no=1 的行上，宽限为 0 立即退役）。新密钥确认不受宽限期影响。
 4. **幂等**：预登记/生效/撤销/重签都带幂等键。同一幂等键改变密钥指纹、
    生效序号、宽限期或目标订阅必须返回明确冲突（409，给出首个差异）；
-   生效序号越过稳定历史或早于已扫描位置时拒绝且不改变当前密钥。
+   省略密钥材料由服务端生成密钥时，完全相同的幂等请求回放第一次的密钥
+   记录（服务端只在确认是新请求时生成一次随机密钥）；生效序号越过稳定
+   历史或早于已扫描位置时拒绝且不改变当前密钥。
 5. **验证与重签**：管理员可按密钥与时间范围分页查询投递签名验证结果；
-   只对验证失败的**指定密钥**投递执行重新签名（幂等，重签只换签名，
-   不重置确认、不产生重复投递、不改变严格顺序）。
+   只对验证失败的**指定密钥**投递执行重新签名（幂等）。重签不改写已有
+   投递记录的任何字段（签名、updated_at_ms、状态、尝试次数全部保持
+   原值）：新签名只追加进验证表自有行（resigned 记录的 new_signature），
+   不重置确认、不产生重复投递、不改变严格顺序。
 6. **可恢复**：重启或轮换中断后从已保存状态继续，不重复确认、不跳过
-   通知。所有轮换事件与拒绝原因只追加进订阅自己的审计历史
+   通知。宽限到期（含首次轮换被替换的版本冻结密钥——它没有自己的密钥
+   行，宽限窗口挂在 key_no=1 的轮换密钥上）在构造、确认路径与显式恢复
+   时惰性收敛退役。所有轮换事件与拒绝原因只追加进订阅自己的审计历史
    （``audit_subscription_events``），绝不改写租约、委托、原始审计事件、
-   版本行或已有投递记录（除重签行的签名字段与验证表自有行）。
+   版本行或已有投递记录（投递表只追加 signing_key_id 列；重签的新签名
+   只写验证表自有行）。
 
 密钥轮换与订阅版本切换是两条**正交**的能力：版本切换更换回调地址/过滤/
 版本密钥并按版本分段，密钥轮换则在当前版本密钥之外叠加一层"签名密钥
@@ -200,6 +208,8 @@ class KeyRotationManager:
                 retired_at_ms     INTEGER,
                 revoked_at_ms     INTEGER,
                 reject_reason     TEXT,
+                version_key_grace_until_ms INTEGER,
+                version_key_retired_at_ms  INTEGER,
                 created_at_ms     INTEGER NOT NULL,
                 updated_at_ms     INTEGER NOT NULL
             );
@@ -226,6 +236,7 @@ class KeyRotationManager:
                 expected_key_id   TEXT,
                 result            TEXT NOT NULL,
                 detail            TEXT,
+                new_signature     TEXT,
                 created_at_ms     INTEGER NOT NULL,
                 dedupe_key        TEXT NOT NULL
             );
@@ -246,6 +257,28 @@ class KeyRotationManager:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_delivery_signkey "
             "ON audit_subscription_deliveries(subscription_id, signing_key_id)")
+        # 既有密钥行增量列：首次轮换时版本冻结密钥的宽限窗口与退役时刻。
+        # 首次轮换把版本密钥替换为第一把轮换密钥；这两列只挂在 key_no=1
+        # 的行上，到期由 recover_interruptions 置退役标记。
+        kcols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(audit_subscription_signing_keys)").fetchall()}
+        if "version_key_grace_until_ms" not in kcols:
+            conn.execute(
+                "ALTER TABLE audit_subscription_signing_keys "
+                "ADD COLUMN version_key_grace_until_ms INTEGER")
+        if "version_key_retired_at_ms" not in kcols:
+            conn.execute(
+                "ALTER TABLE audit_subscription_signing_keys "
+                "ADD COLUMN version_key_retired_at_ms INTEGER")
+        # 既有验证行增量列：重签产生的新签名只追加在自有验证表，绝不改写
+        # 已有投递记录的任何字段。
+        vcols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(audit_subscription_signature_verifications)"
+        ).fetchall()}
+        if "new_signature" not in vcols:
+            conn.execute(
+                "ALTER TABLE audit_subscription_signature_verifications "
+                "ADD COLUMN new_signature TEXT")
         conn.commit()
 
     def _now(self) -> int:
@@ -280,7 +313,9 @@ class KeyRotationManager:
         - 密钥来源：``secret`` 给定则用它（必须为非空十六进制/字符串），
           省略时由服务端生成 32 字节随机密钥（API 永不回传密钥明文，
           只回传 SHA-256 指纹）；可同时给 ``fingerprint`` 做一致性校验，
-          指纹必须等于 ``sha256(secret)``，否则 400；
+          指纹必须等于 ``sha256(secret)``，否则 400。服务端生成只发生在
+          确认是新请求之后，因此省略密钥材料的完全相同幂等请求重放第一
+          次的密钥记录，只有显式改变指纹/序号/宽限期/订阅才冲突；
         - ``effective_seq``（含）必填，不能越过当前稳定历史上界（416），
           也不能早于当前版本已扫描位置（409），拒绝时当前密钥不变；
         - 同一幂等键改变指纹/生效序号/宽限期/目标订阅 → 409 明确冲突。
@@ -303,9 +338,29 @@ class KeyRotationManager:
         if grace < 0:
             raise AuditBadRequest("grace_ms 不能为负数", grace_ms=grace)
 
-        # 解析密钥与指纹：密钥由调用方提供或服务端生成；指纹始终服务端
-        # 计算（不接受外部指纹作为"真相"），外部给的 fingerprint 仅做校验
-        secret_val, fp = self._resolve_secret_fingerprint(secret, fingerprint)
+        # 先解析调用方显式提供的密钥材料：只给 fingerprint 不给 secret 永远
+        # 无法服务端签名（400）；给了 secret 则此刻算出指纹用于规格比较。
+        # 省略 secret/fingerprint 时密钥由服务端生成——必须**延迟到幂等回放
+        # 判定之后**，否则完全相同的幂等请求第二次会生成另一把随机密钥，
+        # 指纹不一致而误报 409（应回放首次的密钥记录）。
+        sec_in = secret.strip() if isinstance(
+            secret, str) and secret.strip() else None
+        fp_in = fingerprint.strip() if isinstance(
+            fingerprint, str) and fingerprint.strip() else None
+        if sec_in is None and fp_in is not None:
+            raise AuditBadRequest(
+                "只提供 fingerprint 而不提供 secret 时无法签名：通知"
+                "签名必须由服务端持有密钥；请同时提供与 "
+                "sha256(secret) 一致的 fingerprint，或省略二者由服务端"
+                "生成密钥")
+        provided_fp = secret_fingerprint(sec_in) if sec_in is not None else None
+        if sec_in is not None and fp_in is not None and not hmac.compare_digest(
+                provided_fp, fp_in):
+            raise AuditBadRequest(
+                "fingerprint 与提供的 secret 不一致：指纹必须是 "
+                "sha256(secret) 的十六进制",
+                provided_fingerprint=fp_in,
+                actual_fingerprint=provided_fp)
 
         # 稳定历史上界（与租约写入互斥读取）
         with self._store._lock:  # noqa: SLF001
@@ -321,13 +376,18 @@ class KeyRotationManager:
             sub = self._require_subscription(conn, sid)
 
             # 幂等先行（先于状态/边界校验），保证订阅状态变化后同键仍稳定
-            # 回放首次结果
+            # 回放首次结果；也先于服务端密钥生成（见上）。
             prev = conn.execute(
                 "SELECT * FROM audit_subscription_signing_keys "
                 "WHERE idempotency_key=?", (key,)).fetchone()
-            spec = {"subscription_id": sid, "fingerprint": fp,
-                    "effective_seq": eff, "grace_ms": grace}
             if prev is not None:
+                # 同键重放：调用方省略密钥材料时直接回放首次密钥记录；
+                # 显式给了 secret 才比较指纹，指纹/生效序号/宽限期/订阅
+                # 任一不同即 409 明确冲突。
+                spec_fp = provided_fp if provided_fp is not None \
+                    else prev["fingerprint"]
+                spec = {"subscription_id": sid, "fingerprint": spec_fp,
+                        "effective_seq": eff, "grace_ms": grace}
                 diff = self._first_prepare_diff(prev, spec)
                 if diff is None:
                     conn.rollback()
@@ -354,6 +414,15 @@ class KeyRotationManager:
                 raise KeyRotationConflict(
                     f"幂等键 {key} 已用于订阅版本创建，不能复用",
                     idempotency_key=key)
+
+            # 确认是新请求后再生成服务端密钥（只会发生一次）
+            if sec_in is None:
+                secret_val = new_secret()
+                fp = secret_fingerprint(secret_val)
+            else:
+                secret_val, fp = sec_in, provided_fp
+            spec = {"subscription_id": sid, "fingerprint": fp,
+                    "effective_seq": eff, "grace_ms": grace}
 
             def reject_prepare(reason: str, exc: KeyRotationError):
                 with self._tx():
@@ -462,38 +531,6 @@ class KeyRotationManager:
                                                  key_id=prev["key_id"])
                 raise
             return self.get_key(sid, key_id), True
-
-    @staticmethod
-    def _resolve_secret_fingerprint(secret: Any,
-                                    fingerprint: Any) -> tuple[str, str]:
-        """返回 (密钥明文, 服务端计算的指纹)。
-
-        - ``secret`` 给定：必须是非空字符串；``fingerprint`` 同时给定时
-          必须等于 ``sha256(secret)``，否则 400；
-        - ``secret`` 省略：``fingerprint`` 必须一并省略（服务端无法凭指纹
-          还原密钥，而通知签名必须由服务端持有密钥）；服务端生成 32 字节
-          随机密钥。
-        """
-        sec_in = secret.strip() if isinstance(
-            secret, str) and secret.strip() else None
-        fp_in = fingerprint.strip() if isinstance(
-            fingerprint, str) and fingerprint.strip() else None
-        if sec_in is None:
-            if fp_in is not None:
-                raise AuditBadRequest(
-                    "只提供 fingerprint 而不提供 secret 时无法签名：通知"
-                    "签名必须由服务端持有密钥；请同时提供与 "
-                    "sha256(secret) 一致的 fingerprint，或省略二者由服务端"
-                    "生成密钥")
-            generated = new_secret()
-            return generated, secret_fingerprint(generated)
-        fp = secret_fingerprint(sec_in)
-        if fp_in is not None and not hmac.compare_digest(fp, fp_in):
-            raise AuditBadRequest(
-                "fingerprint 与提供的 secret 不一致：指纹必须是 "
-                "sha256(secret) 的十六进制",
-                provided_fingerprint=fp_in, actual_fingerprint=fp)
-        return sec_in, fp
 
     # ======================================================================
     # 生效（原子切换）
@@ -616,6 +653,18 @@ class KeyRotationManager:
                     raise KeyRotationBadState(
                         "密钥在生效过程中状态已变化（并发生效）",
                         subscription_id=sid, key_id=key_id)
+                # 首次轮换（key_no=1）：被替换的是版本冻结密钥，而版本密钥
+                # 没有自己的密钥行。把它的宽限窗口/退役时刻挂在首把轮换密钥
+                # 上：宽限 >0 时版本密钥在窗口内隐式 grace（旧通知仍可按它
+                # 确认），宽限为 0 立即退役。没有这两列，宽限结束并完成恢复
+                # 处理后旧版本密钥签名仍会被回退逻辑当作 ok 接受。
+                if int(krow["key_no"]) == 1:
+                    conn.execute(
+                        "UPDATE audit_subscription_signing_keys SET "
+                        "version_key_grace_until_ms=?, "
+                        "version_key_retired_at_ms=? WHERE key_id=?",
+                        (now + grace if grace > 0 else None,
+                         now if grace == 0 else None, key_id))
                 self._audit_locked(
                     conn, sid, int(krow["key_no"]), "key_activated", "ok",
                     f"签名密钥 #{krow['key_no']} 原子生效：历史序号 {eff}"
@@ -716,13 +765,15 @@ class KeyRotationManager:
     def recover_interruptions(self, *, now_ms: int | None = None) -> dict:
         """从已保存状态恢复：宽限到期退役旧密钥。
 
-        生效本身是单事务原子切换，不存在"半切换"；崩溃可能留下的唯一
-        待收敛状态是宽限到期但还没置 retired 的旧密钥。该方法幂等，
-        构造时与每次扫描/查询前调用都安全；不触碰任何投递行，因此不会
-        重复确认或跳过通知。
+        生效本身是单事务原子切换，不存在"半切换"；崩溃可能留下的待收敛
+        状态有两种：宽限到期但还没置 retired 的轮换旧密钥，以及首次轮换时
+        被替换的版本冻结密钥（宽限窗口挂在 key_no=1 的行上，没有自己的
+        密钥行）。该方法幂等，构造时与每次扫描/查询前调用都安全；不触碰
+        任何投递行，因此不会重复确认或跳过通知。
         """
         now = now_ms if now_ms is not None else self._now()
         retired = 0
+        version_retired = 0
         with self._lock:
             conn = self._conn
             with self._tx():
@@ -744,8 +795,34 @@ class KeyRotationManager:
                         detail_obj={"grace_until_ms": r["grace_until_ms"]},
                         now=now)
                     retired += 1
+                # 首次轮换：被首把轮换密钥替换掉的版本冻结密钥宽限到期。
+                # 版本密钥没有自己的行，退役标记挂在 key_no=1 的轮换密钥上；
+                # 标记落下后旧版本密钥签名一律拒绝（不改变任何投递状态）。
+                vrows = conn.execute(
+                    "SELECT * FROM audit_subscription_signing_keys "
+                    "WHERE version_key_grace_until_ms IS NOT NULL "
+                    "AND version_key_retired_at_ms IS NULL "
+                    "AND version_key_grace_until_ms<=? "
+                    "AND status!=?",
+                    (now, K_REVOKED)).fetchall()
+                for r in vrows:
+                    conn.execute(
+                        "UPDATE audit_subscription_signing_keys SET "
+                        "version_key_retired_at_ms=?, updated_at_ms=? "
+                        "WHERE key_id=?",
+                        (now, now, r["key_id"]))
+                    self._audit_locked(
+                        conn, r["subscription_id"], 1,
+                        "key_retired", "ok",
+                        "签名密钥 #1 宽限期结束，其替换掉的版本冻结密钥退役",
+                        detail_obj={"version_key": True,
+                                    "grace_until_ms":
+                                    r["version_key_grace_until_ms"]},
+                        now=now)
+                    version_retired += 1
             conn.rollback()
-        return {"retired": retired, "now_ms": now}
+        return {"retired": retired, "version_key_retired": version_retired,
+                "now_ms": now}
 
     # ======================================================================
     # 签名密钥选择（供 SubscriptionManager 入队/签名/确认调用）
@@ -803,8 +880,9 @@ class KeyRotationManager:
 
         用于"等待确认的旧通知在宽限期内仍可按旧密钥完成确认"。投递行冻结
         的 ``signing_key_id`` 即它本应使用的密钥代际：该密钥在被下一把密钥
-        替换后进入 grace，宽限期内旧通知仍可按它确认；此外兼容
-        signing_key_id 缺失但存在更晚生效序号宽限密钥的历史行。
+        替换后进入 grace，宽限期内旧通知仍可按它确认。``signing_key_id``
+        为 NULL 的行（首把轮换密钥生效前已入队）由
+        :meth:`version_key_grace_info` 单独处理版本冻结密钥的宽限。
         """
         keys = delivery_row.keys()
         sign_key_id = delivery_row["signing_key_id"] if "signing_key_id" \
@@ -816,21 +894,29 @@ class KeyRotationManager:
                 (sign_key_id, subscription_id, K_GRACE)).fetchone()
             if row is not None:
                 return row["secret"]
-            return None
-        event_seq = int(delivery_row["event_seq"])
-        row = conn.execute(
-            "SELECT secret FROM audit_subscription_signing_keys "
-            "WHERE subscription_id=? AND status=? AND effective_seq>? "
-            "ORDER BY key_no ASC LIMIT 1",
-            (subscription_id, K_GRACE, event_seq)).fetchone()
-        return row["secret"] if row is not None else None
+        return None
+
+    def version_key_grace_info(self, conn, subscription_id: str):
+        """返回首把轮换密钥对版本冻结密钥的宽限状态行（key_no=1）。
+
+        首次轮换时被替换的版本冻结密钥没有自己的密钥行，其宽限窗口挂在
+        key_no=1 的轮换密钥上。返回该行（含
+        ``version_key_grace_until_ms`` / ``version_key_retired_at_ms``），
+        没有首把轮换密钥时返回 None。
+        """
+        return conn.execute(
+            "SELECT * FROM audit_subscription_signing_keys "
+            "WHERE subscription_id=? AND key_no=1",
+            (subscription_id,)).fetchone()
 
     # ======================================================================
     # 显式确认：在订阅管理器确认路径上叠加宽限旧密钥语义 + 验证落库
     # ======================================================================
     def verify_ack_signature(self, subscription_id: str, delivery_row,
                              payload: dict, signature: str | None,
-                             *, conn: Any) -> tuple[bool, str, dict]:
+                             *, conn: Any,
+                             now_ms: int | None = None
+                             ) -> tuple[bool, str, dict]:
         """判定显式确认签名是否可接受，并返回验证结论。
 
         ``conn`` 为订阅管理器的连接（同一 WAL 库）。返回
@@ -842,9 +928,11 @@ class KeyRotationManager:
         - 都不对 → ``failed``（拒绝，不改变状态）。
 
         该方法只读密钥表；验证落库由 :meth:`record_verification` 完成。
+        ``now_ms`` 缺省用管理器墙钟；订阅管理器在同一确认请求里会传入它
+        已取的时刻，保证宽限判定与验证落库同一瞬间。
         """
+        vnow = now_ms if now_ms is not None else self._now()
         d = delivery_row
-        event_seq = int(d["event_seq"])
         key_id = d["signing_key_id"] if (
             "signing_key_id" in d.keys()) else None
 
@@ -857,7 +945,40 @@ class KeyRotationManager:
                 (kid, subscription_id)).fetchone()
             return r["status"] if r is not None else None
 
-        # 投递行冻结的当前应使用密钥：轮换密钥优先，否则版本密钥
+        # ---- 版本冻结密钥行（signing_key_id IS NULL）----
+        # 首次轮换前：版本密钥恒可用（ok）。首次轮换后：它是被首把轮换
+        # 密钥替换掉的"旧密钥"，只在宽限窗口内可做 old_key_grace 确认；
+        # 宽限为 0（立即退役）或窗口结束并完成恢复后，旧签名一律 failed，
+        # 绝不回退成 ok，也不改变投递状态。
+        if key_id is None:
+            vno = int(d["version_no"]) if "version_no" in \
+                d.keys() else int(payload.get("version_no", 1))
+            vrow = conn.execute(
+                "SELECT secret FROM audit_subscription_versions "
+                "WHERE subscription_id=? AND version_no=?",
+                (subscription_id, vno)).fetchone()
+            version_secret = vrow["secret"] if vrow is not None else None
+            first = self.version_key_grace_info(conn, subscription_id)
+            if first is None or first["status"] == K_PREPARED:
+                # 首次轮换尚未生效：版本密钥仍是当前密钥
+                if version_secret is not None and verify_signature(
+                        version_secret, payload, signature):
+                    return True, V_OK, {"used_key_id": None,
+                                        "expected_key_id": None}
+                return False, V_FAILED, {"expected_key_id": None}
+            retired_at = first["version_key_retired_at_ms"]
+            grace_until = first["version_key_grace_until_ms"]
+            in_grace = (retired_at is None and grace_until is not None
+                        and vnow < int(grace_until))
+            if in_grace and version_secret is not None and verify_signature(
+                    version_secret, payload, signature):
+                return True, V_OLD_KEY_GRACE, {"used_key_id": None,
+                                              "expected_key_id": None}
+            return False, V_FAILED, {"expected_key_id": None}
+
+        # ---- 钉住轮换密钥的行 ----
+        # 投递行冻结的当前应使用密钥：轮换密钥优先，密钥行缺失时回退版本
+        # 冻结密钥。
         cur_secret = self.secret_for_key_id(conn, subscription_id, key_id)
         cur_status = _key_status(key_id)
         if cur_secret is None:
@@ -874,9 +995,8 @@ class KeyRotationManager:
             return True, V_OLD_KEY_GRACE, {"used_key_id": key_id,
                                           "expected_key_id": key_id}
         # 密钥仍生效：轮换密钥必须处于 active（retired/revoked/prepared 都
-        # 不是当前可用密钥），key_id 为 None 时回退版本冻结密钥（恒可用）
-        cur_usable = cur_status in (None, K_ACTIVE)
-        if (cur_usable and cur_secret is not None
+        # 不是当前可用密钥）
+        if (cur_status == K_ACTIVE and cur_secret is not None
                 and verify_signature(cur_secret, payload, signature)):
             return True, V_OK, {"used_key_id": key_id,
                                 "expected_key_id": key_id}
@@ -1008,10 +1128,12 @@ class KeyRotationManager:
 
         - 只处理验证结果为 ``failed`` 的投递；指定 ``key_id`` 时还要求
           该验证记录确实属于这把密钥，否则 404/409；
-        - 重签只更新投递行的 ``signature``（与验证表追加 resigned 记录），
-          **不重置投递状态/尝试次数、不重复确认、不产生重复投递、不改变
-          严格顺序**；
-        - 同幂等键重放回首次结果；换投递/密钥/订阅 → 409。
+        - 重签**完全不修改已有投递记录**（signature、updated_at_ms、状态、
+          尝试次数等所有字段保持原值）：新签名只作为 ``resigned`` 验证记录
+          的 ``new_signature`` 追加进验证表，验证查询即可看到；不重置确认、
+          不重复确认、不产生重复投递、不改变严格顺序；
+        - 同幂等键重放回首次结果（含首次算出的新签名）；换投递/密钥/订阅
+          → 409。
         """
         sid = str(require_value(subscription_id, "subscription_id"))
         seq = _as_int(event_seq, "event_seq")
@@ -1073,33 +1195,34 @@ class KeyRotationManager:
                     subscription_id=sid, event_seq=seq)
             new_sig = sign_payload(secret, payload)
             with self._tx():
-                conn.execute(
-                    "UPDATE audit_subscription_deliveries SET signature=?, "
-                    "updated_at_ms=? WHERE delivery_id=?",
-                    (new_sig, now, d["delivery_id"]))
+                # 绝不 UPDATE 投递行：已有投递记录的所有字段（signature、
+                # updated_at_ms、状态、尝试次数、dispatch_token 等）保持
+                # 原值。新签名只追加进验证表自有行，查询验证结果即可看到。
                 conn.execute(
                     "INSERT OR IGNORE INTO "
                     "audit_subscription_signature_verifications"
                     "(verification_id, subscription_id, delivery_id, "
                     "event_seq, key_id, expected_key_id, result, detail, "
-                    "created_at_ms, dedupe_key) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "new_signature, created_at_ms, dedupe_key) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (uuid.uuid4().hex, sid, d["delivery_id"], seq,
                      used_key_id or "", used_key_id, V_RESIGNED,
                      canonical_json({"resigned_from_key_id": ver["key_id"],
-                                     "event_seq": seq}), now,
+                                     "event_seq": seq}), new_sig, now,
                      "|".join([d["delivery_id"], V_RESIGNED,
                                used_key_id or "", used_key_id or ""])))
                 self._audit_locked(
                     conn, sid, None, "key_resigned", "ok",
                     f"投递 seq={seq} 用密钥 {used_key_id or 'version-key'}"
-                    " 重新签名（验证失败后重签，状态不变）",
+                    " 重新签名（验证失败后重签，投递记录不改动）",
                     detail_obj={"event_seq": seq,
                                 "resigned_from_key_id": ver["key_id"],
                                 "used_key_id": used_key_id},
                     now=now)
                 result = {"subscription_id": sid, "event_seq": seq,
                           "delivery_id": d["delivery_id"],
-                          "key_id": used_key_id, "result": V_RESIGNED}
+                          "key_id": used_key_id, "result": V_RESIGNED,
+                          "signature": new_sig}
                 conn.execute(
                     "INSERT INTO audit_subscription_key_idempotency"
                     "(idempotency_key, subscription_id, operation, target, "
@@ -1401,6 +1524,14 @@ class KeyRotationManager:
         now = self._now()
         grace_active = (k["status"] == K_GRACE and k["grace_until_ms"]
                         is not None and now < int(k["grace_until_ms"]))
+        # 首次轮换：被替换掉的版本冻结密钥的宽限窗口挂在 key_no=1 的行上
+        vk_grace_until = k["version_key_grace_until_ms"] if (
+            "version_key_grace_until_ms" in k.keys()) else None
+        vk_retired = k["version_key_retired_at_ms"] if (
+            "version_key_retired_at_ms" in k.keys()) else None
+        version_key_grace_active = (
+            int(k["key_no"]) == 1 and vk_retired is None
+            and vk_grace_until is not None and now < int(vk_grace_until))
         return {
             "key_id": k["key_id"],
             "subscription_id": k["subscription_id"],
@@ -1414,6 +1545,9 @@ class KeyRotationManager:
             "snapshot_seq": int(k["snapshot_seq"]),
             "grace_until_ms": k["grace_until_ms"],
             "grace_active": grace_active,
+            "version_key_grace_until_ms": vk_grace_until,
+            "version_key_retired_at_ms": vk_retired,
+            "version_key_grace_active": version_key_grace_active,
             "activated_at_ms": k["activated_at_ms"],
             "retired_at_ms": k["retired_at_ms"],
             "revoked_at_ms": k["revoked_at_ms"],
@@ -1442,6 +1576,10 @@ class KeyRotationManager:
             "expected_key_id": r["expected_key_id"],
             "result": r["result"],
             "detail": (json.loads(r["detail"]) if r["detail"] else None),
+            # 重签产生的新签名只在这里可见；投递行自身的 signature 等全部
+            # 字段保持原值，绝不被重签改写。
+            "new_signature": r["new_signature"] if "new_signature" in r.keys()
+            else None,
             "created_at_ms": r["created_at_ms"],
         }
 

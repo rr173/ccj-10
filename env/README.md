@@ -896,7 +896,7 @@ POST /audit/index-releases
 | `POST .../signing-keys/<key_id>/activate` | **原子生效**（幂等键）：旧密钥进入 `grace`（宽限 >0）或立即 `retired`；同键回放，换目标/操作 409 |
 | `POST .../signing-keys/<key_id>/revoke` | 撤销预登记密钥（只有 prepared 可撤销；幂等键，永不生效，记录保留） |
 | `GET /audit/subscriptions/<id>/signature-verifications` | 按密钥与时间范围分页查验证结果（`?key_id=&result=ok/failed/old_key_grace/resigned&from_ms=&to_ms=&after=<ms>:<rowid>&limit=`） |
-| `POST /audit/subscriptions/<id>/deliveries/<event_seq>/resign` | **只对验证失败的指定密钥投递**重新签名 `{key_id?, idempotency_key}`：更新签名并追加 `resigned` 验证记录，不改投递状态/尝试次数、不重复确认 |
+| `POST /audit/subscriptions/<id>/deliveries/<event_seq>/resign` | **只对验证失败的指定密钥投递**重新签名 `{key_id?, idempotency_key}`：**完全不修改已有投递记录**，新签名只追加为 `resigned` 验证记录的 `new_signature`，不改投递状态/尝试次数、不重复确认 |
 
 语义与不变量：
 
@@ -906,14 +906,21 @@ POST /audit/index-releases
   HMAC 签名，之前已入队/认领中的旧通知继续用旧密钥；
 - **旧通知宽限确认**：等待显式确认（202）的旧通知在旧密钥宽限期内仍可
   按旧密钥完成确认，验证结果记为 `old_key_grace`；宽限到点旧密钥置
-  `retired`（后台/查询惰性收敛），此后旧密钥确认一律 401 且不改变状态；
+  `retired`（后台/查询/确认路径惰性收敛），此后旧密钥确认一律 401 且不
+  改变状态。首次轮换时被替换的是版本冻结密钥（它没有自己的密钥行，宽限
+  窗口挂在 key_no=1 的轮换密钥上，宽限为 0 立即退役），语义与后续轮换
+  完全一致；
 - **幂等与冲突**：预登记/生效/撤销/重签都带幂等键；同键改变密钥指纹、
   生效序号、宽限期或目标订阅返回 409 并给出首个差异字段；操作幂等键与
-  预登记键、订阅版本命名空间互不可复用；
+  预登记键、订阅版本命名空间互不可复用。**省略 `secret`/`fingerprint`
+  由服务端生成密钥时，完全相同的幂等请求回放第一次的密钥记录（同一
+  key_id/指纹），服务端不会在重放时重新生成密钥**；
 - **验证与重签**：每次显式确认（成功/失败/宽限）只追加验证记录
   （`(delivery,result,used,expected)` 去重，重复确认不重复计数）；
   重签只针对最新验证为 `failed` 的投递（无失败记录 409、密钥不符 404），
-  重签只换 `signature`，严格顺序与确认状态不变；
+  重签**不改写已有投递记录的任何字段**（`signature`、`updated_at_ms`、
+  状态、尝试次数等全部保持原值），新签名只作为验证表 `resigned` 行的
+  `new_signature` 保存并在验证查询中返回，严格顺序与确认状态不变；
 - **重启续跑**：密钥状态、生效序号、宽限到点、投递行冻结的密钥代际全部
   持久化；新管理器构造即收敛到期宽限密钥，从已保存状态继续，不重复确认、
   不跳过通知；
@@ -923,8 +930,8 @@ POST /audit/index-releases
   `audit_subscription_signing_keys` /
   `audit_subscription_key_idempotency` /
   `audit_subscription_signature_verifications` 三张自有表（投递表只追加
-  `signing_key_id` 列与重签时的 `signature`），绝不改写租约、委托、
-  `lease_events` 原始审计事件、版本行或已有投递状态。
+  `signing_key_id` 列，重签的新签名只写验证表，投递行任何字段都不改写），
+  绝不改写租约、委托、`lease_events` 原始审计事件、版本行或已有投递状态。
 
 ### 暂停、恢复、取消与重新开始
 

@@ -1379,8 +1379,14 @@ class SubscriptionManager:
             # 优先；旧通知在旧密钥宽限期内仍可用旧密钥确认。
             kr = self._key_rotation
             if kr is not None:
+                # 宽限到点的旧密钥（含首次轮换被替换的版本冻结密钥）先惰性
+                # 收敛退役，保证"超过宽限期后旧签名一律拒绝"不依赖外部先调
+                # 一次恢复；recover 幂等，不触碰任何投递行。
+                kr.recover_interruptions()
+                now_verify = self._now()
                 accepted, result_code, info = kr.verify_ack_signature(
-                    subscription_id, d, payload, signature, conn=conn)
+                    subscription_id, d, payload, signature, conn=conn,
+                    now_ms=now_verify)
                 if not accepted:
                     # 验证失败也只追加一条 failed 验证记录（不改投递状态、
                     # 不推进队列），随后 401。失败记录归属投递行本应使用的
@@ -1388,11 +1394,10 @@ class SubscriptionManager:
                     fail_info = {
                         "used_key_id": info.get("expected_key_id") or "",
                         "expected_key_id": info.get("expected_key_id")}
-                    now0 = self._now()
                     with self._tx():
                         kr.record_verification(
                             subscription_id, d, result_code, fail_info,
-                            conn=conn, now=now0)
+                            conn=conn, now=now_verify)
                     raise InvalidSignature(
                         "确认签名校验失败：签名与当前（或宽限期旧）密钥的 "
                         "HMAC-SHA256 均不一致，状态未改变",
@@ -1414,11 +1419,10 @@ class SubscriptionManager:
                 # 重复确认：幂等回放，绝不推进两次。验证结论（若启用轮换）
                 # 以唯一约束幂等落库，不重复计数。
                 if kr is not None:
-                    now0 = self._now()
                     with self._tx():
                         kr.record_verification(
                             subscription_id, d, result_code, info,
-                            conn=conn, now=now0)
+                            conn=conn, now=now_verify)
                 return self._delivery_view(d, replayed=True)
             if d["status"] not in (D_INFLIGHT, D_AWAITING):
                 raise DeliveryBadState(
