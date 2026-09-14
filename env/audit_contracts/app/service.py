@@ -1,0 +1,1047 @@
+"""核心服务：契约登记、差异、预演、生效门禁、扫描泵、冻结通知、
+隔离/HOL、映射重试、撤销、幂等冲突与审计历史。重启后由 __init__ 恢复。"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+from . import contracts as C
+from .contracts import ContractError, VersionError
+from .store import Store
+
+
+class Reject(Exception):
+    """业务拒绝：携带 HTTP 状态码与机器可读 reason。"""
+
+    def __init__(self, status: int, reason: str, detail: Any = None):
+        super().__init__(reason)
+        self.status = status
+        self.reason = reason
+        self.detail = detail or {}
+
+
+class Service:
+    def __init__(self, db_path: str = ":memory:"):
+        self.store = Store(db_path)
+        # 测试钩子：预演在处理第一条事件后中止（模拟进程崩溃，验证重启续跑）
+        self.dryrun_interrupt = False
+        self._resume_on_startup()
+
+    # ------------------------------------------------------------------ #
+    # 重启恢复：恢复中断的预演；其余状态（冻结版本/映射/隔离位置）均在表里
+    # ------------------------------------------------------------------ #
+    def _resume_on_startup(self) -> None:
+        rows = self.store.query(
+            "SELECT * FROM dry_runs WHERE status='running'"
+        )
+        for row in rows:
+            try:
+                self._resume_dry_run(row["id"])
+            except Exception:  # pragma: no cover - 续跑失败保留 running，等下次重试
+                pass
+
+    # ------------------------------------------------------------------ #
+    # 审计
+    # ------------------------------------------------------------------ #
+    def audit(self, category: str, detail: Any, sub_id: Optional[str] = None) -> None:
+        self.store.conn.execute(
+            "INSERT INTO audit_history(sub_id, at, category, detail_json) VALUES (?,?,?,?)",
+            (sub_id, time.time(), category, json.dumps(detail, ensure_ascii=False)),
+        )
+
+    def audit_history(self, sub_id: Optional[str] = None, limit: int = 100) -> List[dict]:
+        if sub_id is None:
+            rows = self.store.query(
+                "SELECT * FROM audit_history ORDER BY id DESC LIMIT ?", (limit,))
+        else:
+            rows = self.store.query(
+                "SELECT * FROM audit_history WHERE sub_id=? ORDER BY id DESC LIMIT ?",
+                (sub_id, limit))
+        return [{
+            "id": r["id"], "sub_id": r["sub_id"], "at": r["at"],
+            "category": r["category"], "detail": json.loads(r["detail_json"]),
+        } for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # 订阅与事件
+    # ------------------------------------------------------------------ #
+    def create_subscription(self, sub_id: str) -> dict:
+        with self.store.lock:
+            try:
+                self.store.begin()
+                row = self.store.conn.execute(
+                    "SELECT id FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
+                if row:
+                    self.store.rollback()
+                    raise Reject(409, "subscription_exists", {"sub_id": sub_id})
+                self.store.conn.execute(
+                    "INSERT INTO subscriptions(id, created_at) VALUES (?,?)",
+                    (sub_id, time.time()))
+                self.audit("subscription_created", {"sub_id": sub_id}, sub_id)
+                self.store.commit()
+            except Reject:
+                raise
+            except Exception as e:
+                self.store.rollback()
+                raise Reject(500, "internal_error", {"error": str(e)})
+        return {"sub_id": sub_id}
+
+    def ingest_event(self, sub_id: str, seq: int, event_type: str, payload: Any) -> dict:
+        self._require_sub(sub_id)
+        with self.store.lock:
+            try:
+                self.store.begin()
+                dup = self.store.conn.execute(
+                    "SELECT seq FROM events WHERE sub_id=? AND seq=?", (sub_id, seq)).fetchone()
+                if dup:
+                    self.store.rollback()
+                    raise Reject(409, "event_seq_conflict", {"seq": seq})
+                self.store.conn.execute(
+                    "INSERT INTO events(sub_id, seq, event_type, raw_payload, ingested_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (sub_id, seq, event_type,
+                     json.dumps(payload, ensure_ascii=False), time.time()))
+                # 单调推进稳定水位（测试/接入层负责无空洞提交）
+                sub = self.store.conn.execute(
+                    "SELECT stable_seq FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
+                if seq == sub["stable_seq"] + 1:
+                    self.store.conn.execute(
+                        "UPDATE subscriptions SET stable_seq=? WHERE id=?", (seq, sub_id))
+                elif seq > sub["stable_seq"] + 1:
+                    self.store.rollback()
+                    raise Reject(409, "event_seq_gap",
+                                 {"seq": seq, "expected": sub["stable_seq"] + 1})
+                self.audit("event_ingested",
+                           {"seq": seq, "event_type": event_type}, sub_id)
+                self.store.commit()
+            except Reject:
+                raise
+            except Exception as e:
+                self.store.rollback()
+                raise Reject(500, "internal_error", {"error": str(e)})
+        return {"sub_id": sub_id, "seq": seq, "accepted": True}
+
+    def scan(self, sub_id: str) -> dict:
+        """显式推进订阅扫描位置（操作员/投递循环驱动）。
+
+        入库只推进稳定水位；扫描与入库解耦，从而在 scan_seq 与 stable_seq
+        之间留出激活窗口。激活与重试成功后也会自动续扫。
+        """
+        self._require_sub(sub_id)
+        with self.store.lock:
+            before = self.store.query_one(
+                "SELECT scan_seq, stable_seq FROM subscriptions WHERE id=?",
+                (sub_id,))
+            self._pump_locked(sub_id)
+            after = self.store.query_one(
+                "SELECT scan_seq, stable_seq FROM subscriptions WHERE id=?",
+                (sub_id,))
+        head = self.store.query_one(
+            "SELECT seq FROM quarantines WHERE sub_id=? AND status='blocked' "
+            "ORDER BY seq LIMIT 1", (sub_id,))
+        return {"sub_id": sub_id,
+                "scan_seq_before": before["scan_seq"],
+                "scan_seq_after": after["scan_seq"],
+                "stable_seq": after["stable_seq"],
+                "head_blocked_seq": head["seq"] if head else None}
+
+    def subscription_status(self, sub_id: str) -> dict:
+        self._require_sub(sub_id)
+        sub = self.store.query_one(
+            "SELECT scan_seq, stable_seq FROM subscriptions WHERE id=?", (sub_id,))
+        head = self.store.query_one(
+            "SELECT seq FROM quarantines WHERE sub_id=? AND status='blocked' "
+            "ORDER BY seq LIMIT 1", (sub_id,))
+        return {"sub_id": sub_id, "scan_seq": sub["scan_seq"],
+                "stable_seq": sub["stable_seq"],
+                "head_blocked_seq": head["seq"] if head else None,
+                "activations": self.active_activation(sub_id)}
+
+    def _require_sub(self, sub_id: str) -> None:
+        if not self.store.query_one("SELECT 1 FROM subscriptions WHERE id=?", (sub_id,)):
+            raise Reject(404, "subscription_not_found", {"sub_id": sub_id})
+
+    # ------------------------------------------------------------------ #
+    # 契约登记
+    # ------------------------------------------------------------------ #
+    def register_contract(self, event_type: str, version: str,
+                          spec: dict, idem_key: Optional[str] = None) -> dict:
+        try:
+            C.validate_version(version)
+            C.validate_spec(spec)
+        except (ContractError, VersionError) as e:
+            raise Reject(400, "invalid_contract", {"message": str(e)})
+        scope = f"contract:{event_type}"
+        with self.store.lock:
+            if idem_key:
+                hit = self.store.idem_get(scope, idem_key)
+                if hit is not None:
+                    cached = hit["response"] if "response" in hit else hit
+                    return {"replayed": True, **cached}
+            existing = self.store.query_one(
+                "SELECT version FROM contracts WHERE event_type=? AND version=?",
+                (event_type, version))
+            if existing:
+                row = self.store.query_one(
+                    "SELECT spec_json FROM contracts WHERE event_type=? AND version=?",
+                    (event_type, version))
+                if json.loads(row["spec_json"]) != spec:
+                    raise Reject(409, "contract_version_conflict",
+                                 {"event_type": event_type, "version": version,
+                                  "reason": "同版本号已登记不同契约"})
+                result = {"event_type": event_type, "version": version, "replayed": True}
+                if idem_key:
+                    self.store.idem_put(scope, idem_key, {"response": result})
+                return result
+            self.store.begin()
+            self.store.conn.execute(
+                "INSERT INTO contracts(event_type, version, spec_json, created_at) "
+                "VALUES (?,?,?,?)",
+                (event_type, version, json.dumps(spec, ensure_ascii=False), time.time()))
+            self.audit("contract_registered",
+                       {"event_type": event_type, "version": version})
+            result = {"event_type": event_type, "version": version, "registered": True}
+            if idem_key:
+                self.store.idem_put(scope, idem_key, {"response": result})
+            self.store.commit()
+        return result
+
+    def get_contract(self, event_type: str, version: str) -> dict:
+        row = self.store.query_one(
+            "SELECT spec_json FROM contracts WHERE event_type=? AND version=?",
+            (event_type, version))
+        if not row:
+            raise Reject(404, "contract_not_found",
+                         {"event_type": event_type, "version": version})
+        return {"event_type": event_type, "version": version, "spec": json.loads(row["spec_json"])}
+
+    def list_contracts(self, event_type: str) -> dict:
+        rows = self.store.query(
+            "SELECT version FROM contracts WHERE event_type=? ORDER BY version", (event_type,))
+        return {"event_type": event_type, "versions": [r["version"] for r in rows]}
+
+    # ------------------------------------------------------------------ #
+    # 差异
+    # ------------------------------------------------------------------ #
+    def diff(self, event_type: str, old_version: Optional[str],
+             new_version: str, sub_id: Optional[str] = None) -> dict:
+        new_row = self.store.query_one(
+            "SELECT spec_json FROM contracts WHERE event_type=? AND version=?",
+            (event_type, new_version))
+        if not new_row:
+            raise Reject(404, "contract_not_found", {"version": new_version})
+        old_spec: Optional[dict] = None
+        if old_version:
+            old_row = self.store.query_one(
+                "SELECT spec_json FROM contracts WHERE event_type=? AND version=?",
+                (event_type, old_version))
+            if not old_row:
+                raise Reject(404, "contract_not_found", {"version": old_version})
+            old_spec = json.loads(old_row["spec_json"])
+        result = C.diff_contracts(old_spec, json.loads(new_row["spec_json"]))
+        result.update({"event_type": event_type,
+                       "old_version": old_version, "new_version": new_version})
+        if sub_id:
+            with self.store.lock:
+                self.store.begin()
+                self.audit("contract_diff", {
+                    "event_type": event_type, "old_version": old_version,
+                    "new_version": new_version, "verdict": result["verdict"],
+                    "counts": result["counts"],
+                }, sub_id)
+                self.store.commit()
+        return result
+
+    # ------------------------------------------------------------------ #
+    # 预演
+    # ------------------------------------------------------------------ #
+    def start_dry_run(self, sub_id: str, event_type: str, version: str,
+                      from_seq: int = 1, to_seq: Optional[int] = None,
+                      idem_key: Optional[str] = None) -> dict:
+        self._require_sub(sub_id)
+        crow = self.store.query_one(
+            "SELECT spec_json FROM contracts WHERE event_type=? AND version=?",
+            (event_type, version))
+        if not crow:
+            raise Reject(404, "contract_not_found", {"version": version})
+        sub = self.store.query_one(
+            "SELECT stable_seq FROM subscriptions WHERE id=?", (sub_id,))
+        stable = sub["stable_seq"]
+        if to_seq is None:
+            to_seq = stable
+        if from_seq < 1 or to_seq < from_seq - 1:
+            raise Reject(400, "invalid_range", {"from_seq": from_seq, "to_seq": to_seq})
+        if to_seq > stable:
+            raise Reject(
+                422, "dryrun_range_beyond_stable",
+                {"to_seq": to_seq, "stable_seq": stable,
+                 "reason": "预演范围不能越过稳定历史：未来事件尚不可变，结论会失效"})
+        scope = f"dryrun:{sub_id}"
+        with self.store.lock:
+            if idem_key:
+                hit = self.store.idem_get(scope, idem_key)
+                if hit is not None:
+                    dr_id = hit["response"]["dry_run_id"]
+                    cached = self.get_dry_run(dr_id)
+                    return {"replayed": True, **cached}
+            self.store.begin()
+            cur = self.store.conn.execute(
+                "INSERT INTO dry_runs(sub_id, event_type, version, spec_json, "
+                "from_seq, to_seq, status, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (sub_id, event_type, version, crow["spec_json"],
+                 from_seq, to_seq, "running", time.time()))
+            dr_id = cur.lastrowid
+            self.audit("dryrun_started", {
+                "dry_run_id": dr_id, "event_type": event_type, "version": version,
+                "from_seq": from_seq, "to_seq": to_seq}, sub_id)
+            if idem_key:
+                self.store.idem_put(scope, idem_key,
+                                    {"response": {"dry_run_id": dr_id}})
+            self.store.commit()
+            self._run_dry_run_locked(dr_id)
+        return self.get_dry_run(dr_id)
+
+    def _run_dry_run_locked(self, dr_id: int) -> None:
+        """逐条校验历史事件；处理进度随落库，重启后可续跑。
+
+        合法事件写一条 severity=ok 的进度标记，使“处理到哪一条”不依赖
+        是否产生 finding；block/info 是真正的预演结论。
+        """
+        dr = self.store.query_one("SELECT * FROM dry_runs WHERE id=?", (dr_id,))
+        if dr["status"] != "running":
+            return
+        spec = json.loads(dr["spec_json"])
+        done_seqs = {r["seq"] for r in self.store.query(
+            "SELECT DISTINCT seq FROM dry_run_findings WHERE dry_run_id=?", (dr_id,))}
+        events = self.store.query(
+            "SELECT * FROM events WHERE sub_id=? AND event_type=? AND seq BETWEEN ? AND ? "
+            "ORDER BY seq",
+            (dr["sub_id"], dr["event_type"], dr["from_seq"], dr["to_seq"]))
+        # 倒序处理，使崩溃钩子落在第一条（序号最小）事件之前，
+        # 已落库的都是高序号结论，对“续跑”同样成立。
+        events = list(reversed(events))
+        interrupted = False
+        first_unprocessed = True
+        for ev in events:
+            if ev["seq"] in done_seqs:
+                first_unprocessed = False
+                continue
+            payload = json.loads(ev["raw_payload"])
+            _, errors, infos = C.check_and_normalize(spec, payload)
+            self.store.begin()
+            if not errors and not infos:
+                # 进度标记（不算结论）
+                self.store.conn.execute(
+                    "INSERT INTO dry_run_findings(dry_run_id, seq, severity, path, reason) "
+                    "VALUES (?,?,?,?,?)",
+                    (dr_id, ev["seq"], "ok", "$", "符合契约"))
+            for e in errors:
+                self.store.conn.execute(
+                    "INSERT INTO dry_run_findings(dry_run_id, seq, severity, path, reason) "
+                    "VALUES (?,?,?,?,?)",
+                    (dr_id, ev["seq"], "block", e["path"], e["reason"]))
+            for i in infos:
+                self.store.conn.execute(
+                    "INSERT INTO dry_run_findings(dry_run_id, seq, severity, path, reason) "
+                    "VALUES (?,?,?,?,?)",
+                    (dr_id, ev["seq"], "info", i["path"], i["reason"]))
+            self.store.commit()
+            if self.dryrun_interrupt and first_unprocessed:
+                interrupted = True
+                break
+            first_unprocessed = False
+        if interrupted:
+            return
+        self._finish_dry_run(dr_id)
+
+    def _resume_dry_run(self, dr_id: int) -> None:
+        with self.store.lock:
+            self._run_dry_run_locked(dr_id)
+
+    def _finish_dry_run(self, dr_id: int) -> None:
+        with self.store.lock:
+            self.store.begin()
+            blocks = self.store.conn.execute(
+                "SELECT COUNT(*) c FROM dry_run_findings WHERE dry_run_id=? AND severity='block'",
+                (dr_id,)).fetchone()["c"]
+            status = "passed" if blocks == 0 else "failed"
+            self.store.conn.execute(
+                "UPDATE dry_runs SET status=?, blocking_errors=?, finished_at=? WHERE id=?",
+                (status, blocks, time.time(), dr_id))
+            dr = self.store.conn.execute(
+                "SELECT * FROM dry_runs WHERE id=?", (dr_id,)).fetchone()
+            self.audit("dryrun_finished", {
+                "dry_run_id": dr_id, "event_type": dr["event_type"],
+                "version": dr["version"], "from_seq": dr["from_seq"],
+                "to_seq": dr["to_seq"], "status": status,
+                "blocking_errors": blocks}, dr["sub_id"])
+            self.store.commit()
+
+    def get_dry_run(self, dr_id: int) -> dict:
+        dr = self.store.query_one("SELECT * FROM dry_runs WHERE id=?", (dr_id,))
+        if not dr:
+            raise Reject(404, "dryrun_not_found", {"dry_run_id": dr_id})
+        findings = [dict(seq=r["seq"], severity=r["severity"],
+                         path=r["path"], reason=r["reason"])
+                    for r in self.store.query(
+                        "SELECT * FROM dry_run_findings WHERE dry_run_id=? "
+                        "AND severity IN ('block','info') ORDER BY seq, path",
+                        (dr_id,))]
+        blocked_events = sorted({f["seq"] for f in findings if f["severity"] == "block"})
+        return {
+            "dry_run_id": dr_id, "sub_id": dr["sub_id"],
+            "event_type": dr["event_type"], "version": dr["version"],
+            "from_seq": dr["from_seq"], "to_seq": dr["to_seq"],
+            "status": dr["status"], "blocking_errors": dr["blocking_errors"],
+            "blocked_events": blocked_events, "findings": findings,
+        }
+
+    # ------------------------------------------------------------------ #
+    # 激活门禁
+    # ------------------------------------------------------------------ #
+    def activate(self, sub_id: str, event_type: str, version: str,
+                 effective_seq: Optional[int] = None,
+                 expected_version: Optional[str] = None,
+                 expected_absent: bool = False,
+                 idem_key: Optional[str] = None) -> dict:
+        self._require_sub(sub_id)
+        if not self.store.query_one(
+                "SELECT 1 FROM contracts WHERE event_type=? AND version=?",
+                (event_type, version)):
+            raise Reject(404, "contract_not_found", {"version": version})
+
+        sub = self.store.query_one(
+            "SELECT scan_seq, stable_seq FROM subscriptions WHERE id=?", (sub_id,))
+        scan_seq, stable_seq = sub["scan_seq"], sub["stable_seq"]
+        if effective_seq is None:
+            effective_seq = scan_seq + 1
+
+        checks: List[str] = []
+        # 门禁 1：必须存在覆盖生效点、且无阻断错误的已完成预演
+        gate = self.store.query_one(
+            "SELECT * FROM dry_runs WHERE sub_id=? AND event_type=? AND version=? "
+            "AND status='passed' AND from_seq<=? AND to_seq>=? "
+            "ORDER BY id DESC LIMIT 1",
+            (sub_id, event_type, version, effective_seq, effective_seq))
+        if not gate:
+            dr = self.store.query_one(
+                "SELECT * FROM dry_runs WHERE sub_id=? AND event_type=? AND version=? "
+                "ORDER BY id DESC LIMIT 1",
+                (sub_id, event_type, version))
+            if not dr:
+                checks.append("尚未进行预演（dry_run_missing）：候选版本必须先在稳定历史上预演")
+            elif dr["status"] != "passed":
+                checks.append(
+                    f"预演未通过（dry_run_failed, blocking_errors={dr['blocking_errors']}）："
+                    f"仍有阻断错误的候选版本不能生效")
+            else:
+                checks.append(
+                    f"预演范围 [{dr['from_seq']},{dr['to_seq']}] 未覆盖生效点 "
+                    f"{effective_seq}（dry_run_not_covering_effective_seq）")
+        # 门禁 2：生效序号不能越过稳定历史
+        if effective_seq > stable_seq:
+            checks.append(
+                f"生效序号 {effective_seq} 越过稳定历史水位 {stable_seq}"
+                f"（effective_seq_beyond_stable）：该位置的事件尚不可变，拒绝生效")
+        # 门禁 3：生效序号不能早于（<=）订阅扫描位置
+        if effective_seq <= scan_seq:
+            checks.append(
+                f"生效序号 {effective_seq} 不晚于订阅扫描位置 {scan_seq}"
+                f"（effective_seq_before_scan_position）：这些事件已按旧契约冻结，"
+                f"不能换约，拒绝生效")
+        if checks:
+            with self.store.lock:
+                self.store.begin()
+                self.audit("activation_rejected", {
+                    "event_type": event_type, "version": version,
+                    "effective_seq": effective_seq, "reasons": checks}, sub_id)
+                self.store.commit()
+            raise Reject(409, "activation_rejected", {"reasons": checks})
+
+        scope = f"activate:{sub_id}"
+        with self.store.lock:
+            if idem_key:
+                hit = self.store.idem_get(scope, idem_key)
+                if hit is not None:
+                    cached = hit["response"] if "response" in hit else hit
+                    return {"replayed": True, **cached}
+            try:
+                self.store.begin()
+                # CAS：并发激活只允许一个版本成功
+                cur = self.store.conn.execute(
+                    "SELECT version FROM activations WHERE sub_id=? AND event_type=? AND active=1",
+                    (sub_id, event_type)).fetchone()
+                current_version = cur["version"] if cur else None
+                if expected_version is not None and expected_version != current_version:
+                    self.store.rollback()
+                    raise Reject(409, "activation_conflict", {
+                        "reason": "并发激活冲突：当前生效版本与 expected_version 不一致，"
+                                  "只有一个版本能成功",
+                        "current_version": current_version,
+                        "expected_version": expected_version})
+                if expected_absent and cur is not None:
+                    self.store.rollback()
+                    raise Reject(409, "activation_conflict", {
+                        "reason": "并发激活冲突：expected_absent=true 但已存在生效版本，"
+                                  "只有一个版本能成功",
+                        "current_version": current_version})
+                # 头阻塞：有隔离挡住的位置时，生效点不能落入被挡区域
+                head = self.store.conn.execute(
+                    "SELECT seq FROM quarantines WHERE sub_id=? AND status='blocked' "
+                    "ORDER BY seq LIMIT 1", (sub_id,)).fetchone()
+                if head and effective_seq > head["seq"]:
+                    self.store.rollback()
+                    raise Reject(409, "activation_blocked_by_quarantine", {
+                        "blocked_seq": head["seq"], "effective_seq": effective_seq,
+                        "reason": "隔离队列正挡住后续通知，无法在其后切换契约"})
+                if cur:
+                    self.store.conn.execute(
+                        "UPDATE activations SET active=0 WHERE id=?",
+                        (self._activation_id(sub_id, event_type),))
+                self.store.conn.execute(
+                    "INSERT INTO activations(sub_id, event_type, version, "
+                    "effective_seq, active, created_at, idem_key) VALUES (?,?,?,?,1,?,?)",
+                    (sub_id, event_type, version, effective_seq,
+                     time.time(), idem_key))
+                d = self.diff(event_type, current_version, version)
+                self.audit("activated", {
+                    "event_type": event_type, "version": version,
+                    "previous_version": current_version,
+                    "effective_seq": effective_seq,
+                    "verdict": d["verdict"], "counts": d["counts"],
+                    "field_changes": d["fields"]}, sub_id)
+                result = {
+                    "sub_id": sub_id, "event_type": event_type,
+                    "version": version, "previous_version": current_version,
+                    "effective_seq": effective_seq, "activated": True}
+                if idem_key:
+                    self.store.idem_put(scope, idem_key, {"response": result})
+                self.store.commit()
+            except Reject:
+                raise
+            except Exception as e:
+                self.store.rollback()
+                # SQLite 唯一索引竞争：并发激活的落败方
+                raise Reject(409, "activation_conflict",
+                             {"reason": "并发激活冲突，只有一个版本成功",
+                              "error": str(e)})
+            # 激活只登记生效点；不自动扫描。扫描由显式 /scan（投递循环）驱动，
+            # 这样管理员可以在 scan_seq 与 stable_seq 之间连续登记多个生效点，
+            # 且“生效序号早于扫描位置”的门禁保持确定语义。
+        return result
+
+    def _activation_id(self, sub_id: str, event_type: str) -> int:
+        return self.store.query_one(
+            "SELECT id FROM activations WHERE sub_id=? AND event_type=? AND active=1",
+            (sub_id, event_type))["id"]
+
+    def revoke(self, sub_id: str, event_type: str,
+               idem_key: Optional[str] = None) -> dict:
+        """撤销生效契约。撤销点之后（未扫描）的事件不再受该契约约束。"""
+        self._require_sub(sub_id)
+        scope = f"revoke:{sub_id}"
+        with self.store.lock:
+            if idem_key:
+                hit = self.store.idem_get(scope, idem_key)
+                if hit is not None:
+                    cached = hit["response"] if "response" in hit else hit
+                    return {"replayed": True, **cached}
+            self.store.begin()
+            cur = self.store.conn.execute(
+                "SELECT * FROM activations WHERE sub_id=? AND event_type=? AND active=1",
+                (sub_id, event_type)).fetchone()
+            if not cur:
+                self.store.rollback()
+                raise Reject(404, "no_active_activation", {"event_type": event_type})
+            # 撤销点：下一个未扫描序号。撤销点之前已冻结的通知继续保留该版本，
+            # 撤销点及之后的事件不再由该契约治理。
+            scan_now = self.store.conn.execute(
+                "SELECT scan_seq FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
+            revoke_seq = scan_now["scan_seq"] + 1
+            self.store.conn.execute(
+                "UPDATE activations SET active=0, revoked_at=?, revoke_seq=? WHERE id=?",
+                (time.time(), revoke_seq, cur["id"]))
+            self.audit("activation_revoked", {
+                "event_type": event_type, "version": cur["version"],
+                "revoke_seq": revoke_seq}, sub_id)
+            result = {"sub_id": sub_id, "event_type": event_type,
+                      "version": cur["version"], "revoke_seq": revoke_seq,
+                      "revoked": True}
+            if idem_key:
+                self.store.idem_put(scope, idem_key, {"response": result})
+            self.store.commit()
+        return result
+
+    def _contract_at(self, sub_id: str, event_type: str, seq: int) -> Optional[dict]:
+        """解析 seq 位置适用的契约版本。
+
+        取 effective_seq<=seq 的最近一条激活历史行（包括换约/撤销后 active=0
+        的行）：激活历史不可变，它解释了当时的入队决定。若该行被撤销且
+        seq 已到达撤销点（revoke_seq<=seq），则该位置不再受任何契约治理，
+        返回 None（撤销点之前的位置仍由其解释）。
+        """
+        row = self.store.query_one(
+            "SELECT version, revoked_at, revoke_seq FROM activations "
+            "WHERE sub_id=? AND event_type=? AND effective_seq<=? "
+            "ORDER BY effective_seq DESC, id DESC LIMIT 1",
+            (sub_id, event_type, seq))
+        if not row:
+            return None
+        if row["revoke_seq"] is not None and row["revoke_seq"] <= seq:
+            return None
+        crow = self.store.query_one(
+            "SELECT spec_json FROM contracts WHERE event_type=? AND version=?",
+            (event_type, row["version"]))
+        return {"version": row["version"], "spec": json.loads(crow["spec_json"]),
+                "revoked": row["revoked_at"] is not None}
+
+    def active_activation(self, sub_id: str, event_type: Optional[str] = None) -> Any:
+        if event_type is None:
+            rows = self.store.query(
+                "SELECT * FROM activations WHERE sub_id=? AND active=1", (sub_id,))
+            return [{"event_type": r["event_type"], "version": r["version"],
+                     "effective_seq": r["effective_seq"]} for r in rows]
+        row = self.store.query_one(
+            "SELECT * FROM activations WHERE sub_id=? AND event_type=? AND active=1",
+            (sub_id, event_type))
+        if not row:
+            return None
+        return {"event_type": event_type, "version": row["version"],
+                "effective_seq": row["effective_seq"]}
+
+    # ------------------------------------------------------------------ #
+    # 扫描泵：冻结入队 / 验证失败隔离（HOL）
+    # ------------------------------------------------------------------ #
+    def _pump_locked(self, sub_id: str) -> None:
+        """从 scan_seq+1 开始顺序处理，遇阻即停（头阻塞）。
+
+        每个事件处理时冻结：契约版本、规范化载荷（canonical+digest）、验证摘要。
+        """
+        while True:
+            sub = self.store.query_one(
+                "SELECT scan_seq, stable_seq FROM subscriptions WHERE id=?", (sub_id,))
+            nxt = sub["scan_seq"] + 1
+            ev = self.store.query_one(
+                "SELECT * FROM events WHERE sub_id=? AND seq=?", (sub_id, nxt))
+            if not ev:
+                return
+            # 幂等护栏：重启后泵不应重复冻结（恢复路径除外，恢复走 UPDATE）
+            if self.store.query_one(
+                    "SELECT 1 FROM notifications WHERE sub_id=? AND seq=?",
+                    (sub_id, nxt)):
+                blocked = self.store.query_one(
+                    "SELECT 1 FROM quarantines WHERE sub_id=? AND seq=? AND status='blocked'",
+                    (sub_id, nxt))
+                if blocked:
+                    return  # 仍在隔离：保持 HOL
+                self.store.begin()
+                self.store.conn.execute(
+                    "UPDATE subscriptions SET scan_seq=? WHERE id=?", (nxt, sub_id))
+                self.store.commit()
+                continue
+            contract = self._contract_at(sub_id, ev["event_type"], nxt)
+            raw = json.loads(ev["raw_payload"])
+            if contract is None:
+                revoked_here = self.store.query_one(
+                    "SELECT 1 FROM activations WHERE sub_id=? AND event_type=? "
+                    "AND effective_seq<=? AND revoke_seq IS NOT NULL "
+                    "AND revoke_seq<=? ORDER BY id LIMIT 1",
+                    (sub_id, ev["event_type"], nxt, nxt))
+                if revoked_here:
+                    # 契约在该位置已撤销：事件不再受契约约束，原样冻结并入队
+                    self.store.begin()
+                    self._freeze_notification(
+                        sub_id, ev, None, raw,
+                        {"valid": True, "ungoverned": True,
+                         "reason": "契约已撤销，事件不再受约束",
+                         "errors": [], "infos": []},
+                        "queued")
+                    self.store.conn.execute(
+                        "UPDATE subscriptions SET scan_seq=? WHERE id=?", (nxt, sub_id))
+                    self.audit("notification_enqueued", {
+                        "seq": nxt, "event_type": ev["event_type"],
+                        "contract_version": None,
+                        "reason": "契约撤销后无约束入队"}, sub_id)
+                    self.store.commit()
+                    continue
+                # 从未生效过契约：不校验、不入队、不推进扫描位置。
+                # 事件留在稳定历史中等待契约生效（预演正是针对它们）。
+                return
+
+            normalized, errors, infos = C.check_and_normalize(contract["spec"], raw)
+            if errors:
+                self.store.begin()
+                notif_id = self._freeze_notification(
+                    sub_id, ev, contract["version"], raw,
+                    {"valid": False, "errors": errors, "infos": infos},
+                    "blocked")
+                self.store.conn.execute(
+                    "INSERT INTO quarantines(sub_id, seq, notification_id, event_type, "
+                    "expected_version, raw_digest, errors_json, status, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,'blocked',?)",
+                    (sub_id, nxt, notif_id, ev["event_type"], contract["version"],
+                     C.digest(C.canonical_payload(raw)),
+                     json.dumps(errors, ensure_ascii=False), time.time()))
+                self.audit("event_quarantined", {
+                    "seq": nxt, "event_type": ev["event_type"],
+                    "contract_version": contract["version"],
+                    "errors": errors}, sub_id)
+                self.store.commit()
+                return  # HOL：scan_seq 不推进，后续通知全部挡住
+
+            self.store.begin()
+            self._freeze_notification(
+                sub_id, ev, contract["version"], normalized,
+                {"valid": True, "errors": [], "infos": infos}, "queued")
+            self.store.conn.execute(
+                "UPDATE subscriptions SET scan_seq=? WHERE id=?", (nxt, sub_id))
+            self.audit("notification_enqueued", {
+                "seq": nxt, "event_type": ev["event_type"],
+                "contract_version": contract["version"],
+                "digest": C.digest(C.canonical_payload(normalized))}, sub_id)
+            self.store.commit()
+
+    def _freeze_notification(self, sub_id: str, ev, version: Optional[str],
+                             payload: Any, validation: dict, status: str) -> str:
+        notif_id = f"ntf_{uuid.uuid4().hex}"
+        frozen = C.canonical_payload(payload)
+        self.store.conn.execute(
+            "INSERT INTO notifications(sub_id, seq, notification_id, event_type, "
+            "contract_version, frozen_payload, digest, validation, status, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (sub_id, ev["seq"], notif_id, ev["event_type"], version,
+             frozen.decode("utf-8"), C.digest(frozen),
+             json.dumps(validation, ensure_ascii=False), status, time.time()))
+        return notif_id
+
+    def list_notifications(self, sub_id: str) -> dict:
+        rows = self.store.query(
+            "SELECT * FROM notifications WHERE sub_id=? ORDER BY seq", (sub_id,))
+        return {"sub_id": sub_id, "notifications": [{
+            "seq": r["seq"], "notification_id": r["notification_id"],
+            "event_type": r["event_type"], "contract_version": r["contract_version"],
+            "frozen_payload": json.loads(r["frozen_payload"]),
+            "digest": r["digest"], "validation": json.loads(r["validation"]),
+            "status": r["status"],
+        } for r in rows]}
+
+    # ------------------------------------------------------------------ #
+    # 隔离查询
+    # ------------------------------------------------------------------ #
+    def list_quarantine(self, sub_id: str) -> dict:
+        rows = self.store.query(
+            "SELECT * FROM quarantines WHERE sub_id=? ORDER BY seq", (sub_id,))
+        items = []
+        for r in rows:
+            ev = self.store.query_one(
+                "SELECT raw_payload FROM events WHERE sub_id=? AND seq=?",
+                (sub_id, r["seq"]))
+            contract_now = self.active_activation(sub_id, r["event_type"])
+            items.append({
+                "seq": r["seq"], "notification_id": r["notification_id"],
+                "event_type": r["event_type"],
+                "expected_version": r["expected_version"],
+                "status": r["status"], "retry_count": r["retry_count"],
+                "raw_event_summary": {
+                    "digest": r["raw_digest"],
+                    "payload": json.loads(ev["raw_payload"]),
+                },
+                "failed_fields": json.loads(r["errors_json"]),
+                "current_contract": contract_now,
+                "created_at": r["created_at"],
+                "recovered_at": r["recovered_at"],
+            })
+        head = next((i["seq"] for i in items if i["status"] == "blocked"), None)
+        return {"sub_id": sub_id, "head_blocked_seq": head, "items": items}
+
+    # ------------------------------------------------------------------ #
+    # 映射规则
+    # ------------------------------------------------------------------ #
+    def register_mapping(self, sub_id: str, event_type: str, op: str,
+                         src_path: Optional[str] = None,
+                         dst_path: Optional[str] = None,
+                         value: Any = None,
+                         seq: Optional[int] = None,
+                         idem_key: Optional[str] = None) -> dict:
+        self._require_sub(sub_id)
+        if op not in ("rename", "default", "drop"):
+            raise Reject(400, "invalid_mapping_op", {"op": op})
+        activation = self.active_activation(sub_id, event_type)
+        if not activation:
+            raise Reject(409, "no_active_contract",
+                         {"reason": "映射必须针对一个生效契约版本登记"})
+        version = activation["version"]
+        spec_row = self.store.query_one(
+            "SELECT spec_json FROM contracts WHERE event_type=? AND version=?",
+            (event_type, version))
+        spec = json.loads(spec_row["spec_json"])
+        leaves = C.flatten(spec)
+
+        # 登记时校验：只允许重命名 / 补固定默认值 / 删除明确允许忽略的字段
+        if op == "rename":
+            if not src_path or not dst_path:
+                raise Reject(400, "mapping_need_paths", {"op": "rename"})
+            s = leaves.get(_norm_path(src_path))
+            d = leaves.get(_norm_path(dst_path))
+            if not s or s["kind"] != "leaf":
+                raise Reject(404, "mapping_src_unknown",
+                             {"path": src_path,
+                              "reason": "源字段必须是当前契约中的已知叶子字段"})
+            if not d or d["kind"] != "leaf":
+                raise Reject(404, "mapping_dst_unknown",
+                             {"path": dst_path,
+                              "reason": "目标字段必须是当前契约中的已知叶子字段"})
+            if s["type"] != d["type"]:
+                raise Reject(409, "mapping_type_mismatch",
+                             {"src": src_path, "dst": dst_path,
+                              "src_type": s["type"], "dst_type": d["type"],
+                              "reason": "重命名只能改字段名，不能改类型"})
+        elif op == "default":
+            if not dst_path:
+                raise Reject(400, "mapping_need_dst", {"op": "default"})
+            d = leaves.get(_norm_path(dst_path))
+            if not d or d["kind"] != "leaf":
+                raise Reject(404, "mapping_dst_unknown",
+                             {"path": dst_path,
+                              "reason": "默认值只能补到已知叶子字段"})
+            if not C._value_matches_type(value, d["type"], d["enum"]):
+                raise Reject(409, "mapping_value_type_mismatch",
+                             {"path": dst_path, "value": value,
+                              "type": d["type"], "enum": d["enum"]})
+        else:  # drop
+            if not src_path:
+                raise Reject(400, "mapping_need_src", {"op": "drop"})
+            s = leaves.get(_norm_path(src_path))
+            if not s or s["kind"] != "leaf":
+                raise Reject(404, "mapping_src_unknown",
+                             {"path": src_path, "reason": "只能删除已知叶子字段"})
+            if not s["ignorable"]:
+                raise Reject(409, "drop_not_allowed",
+                             {"path": src_path,
+                              "reason": "映射只能删除明确标记 ignorable（允许忽略）的字段"})
+
+        scope = f"mapping:{sub_id}"
+        with self.store.lock:
+            if idem_key:
+                hit = self.store.idem_get(scope, idem_key)
+                if hit is not None:
+                    cached = hit["response"] if "response" in hit else hit
+                    return {"replayed": True, **cached}
+            # 幂等冲突：同一 (事件类型,序号,op,src,dst) 已存在（路径先规范化）
+            norm_src = _norm_path(src_path) if src_path else None
+            norm_dst = _norm_path(dst_path) if dst_path else None
+            dup = self.store.query_one(
+                "SELECT id FROM mappings WHERE sub_id=? AND event_type=? "
+                "AND COALESCE(seq,-1)=COALESCE(?, -1) AND op=? "
+                "AND COALESCE(src_path,'')=COALESCE(?, '') "
+                "AND COALESCE(dst_path,'')=COALESCE(?, '')",
+                (sub_id, event_type, seq, op, norm_src, norm_dst))
+            if dup:
+                result = {"mapping_id": dup["id"], "registered": False,
+                          "replayed": True,
+                          "reason": "相同映射规则已存在，幂等返回既有规则"}
+                if idem_key:
+                    self.store.idem_put(scope, idem_key, {"response": result})
+                return result
+            self.store.begin()
+            cur = self.store.conn.execute(
+                "INSERT INTO mappings(sub_id, event_type, seq, op, src_path, dst_path, "
+                "value, contract_version, created_at, idem_key) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (sub_id, event_type, seq, op,
+                 _norm_path(src_path) if src_path else None,
+                 _norm_path(dst_path) if dst_path else None,
+                 json.dumps(value, ensure_ascii=False) if value is not None else None,
+                 version, time.time(), idem_key))
+            mid = cur.lastrowid
+            self.audit("mapping_registered", {
+                "mapping_id": mid, "event_type": event_type, "seq": seq,
+                "op": op, "src_path": src_path, "dst_path": dst_path,
+                "value": value, "contract_version": version}, sub_id)
+            result = {"mapping_id": mid, "registered": True}
+            if idem_key:
+                self.store.idem_put(scope, idem_key, {"response": result})
+            self.store.commit()
+        return result
+
+    def list_mappings(self, sub_id: str, seq: Optional[int] = None) -> dict:
+        if seq is None:
+            rows = self.store.query(
+                "SELECT * FROM mappings WHERE sub_id=? ORDER BY id", (sub_id,))
+        else:
+            rows = self.store.query(
+                "SELECT * FROM mappings WHERE sub_id=? AND (seq=? OR seq IS NULL) ORDER BY id",
+                (sub_id, seq))
+        return {"sub_id": sub_id, "mappings": [{
+            "id": r["id"], "event_type": r["event_type"], "seq": r["seq"],
+            "op": r["op"], "src_path": r["src_path"], "dst_path": r["dst_path"],
+            "value": json.loads(r["value"]) if r["value"] is not None else None,
+            "contract_version": r["contract_version"],
+        } for r in rows]}
+
+    # ------------------------------------------------------------------ #
+    # 隔离重试：映射重生成载荷；保留身份与顺序；不重复
+    # ------------------------------------------------------------------ #
+    def retry(self, sub_id: str, seq: int,
+              idem_key: Optional[str] = None) -> dict:
+        self._require_sub(sub_id)
+        scope = f"retry:{sub_id}:{seq}"
+        with self.store.lock:
+            if idem_key:
+                hit = self.store.idem_get(scope, idem_key)
+                if hit is not None:
+                    cached = hit["response"] if "response" in hit else hit
+                    return {"replayed": True, **cached}
+            q = self.store.query_one(
+                "SELECT * FROM quarantines WHERE sub_id=? AND seq=?", (sub_id, seq))
+            if not q:
+                raise Reject(404, "quarantine_not_found", {"seq": seq})
+            # 顺序保证：必须是队头，前面不能还有 blocked
+            head = self.store.query_one(
+                "SELECT seq FROM quarantines WHERE sub_id=? AND status='blocked' "
+                "ORDER BY seq LIMIT 1", (sub_id,))
+            if head and head["seq"] < seq:
+                raise Reject(409, "head_of_line_blocked", {
+                    "seq": seq, "head_blocked_seq": head["seq"],
+                    "reason": "必须保持投递顺序：前面仍有被隔离通知"})
+            if q["status"] != "blocked":
+                # 已恢复事件的重试是幂等的：返回既有结果，不生成重复通知
+                result = {"seq": seq, "replayed": True, "status": q["status"],
+                          "notification_id": q["notification_id"],
+                          "reason": "该事件已恢复，重试不生成重复通知"}
+                if idem_key:
+                    self.store.idem_put(scope, idem_key, {"response": result})
+                return result
+
+            ev = self.store.query_one(
+                "SELECT * FROM events WHERE sub_id=? AND seq=?", (sub_id, seq))
+            original = json.loads(ev["raw_payload"])
+            # 重试基准：该序号位置当前生效的契约（管理员可能登记映射修复，
+            # 也可能在阻断点激活修复版契约）；expected_version 保留隔离时的冻结版本
+            current = self._contract_at(sub_id, ev["event_type"], seq)
+            if current is None:
+                raise Reject(409, "no_governing_contract",
+                             {"seq": seq, "reason": "该序号当前没有生效契约，无法重试验证"})
+            version = current["version"]
+            spec = current["spec"]
+
+            rules = self.store.query(
+                "SELECT * FROM mappings WHERE sub_id=? AND event_type=? "
+                "AND contract_version=? AND (seq=? OR seq IS NULL) ORDER BY id",
+                (sub_id, ev["event_type"], version, seq))
+
+            # 映射只作用于派生载荷；原始审计事件绝不改写（从事件表重读一份作为输入）
+            derived = _deepcopy(original)
+            applied: List[dict] = []
+            for r in rules:
+                if r["op"] == "rename":
+                    if _get_path(derived, r["src_path"], _MISSING) is not _MISSING:
+                        val = _pop_path(derived, r["src_path"])
+                        _set_path(derived, r["dst_path"], val)
+                    applied.append({"op": "rename", "src": r["src_path"], "dst": r["dst_path"]})
+                elif r["op"] == "default":
+                    if _get_path(derived, r["dst_path"], _MISSING) is _MISSING:
+                        _set_path(derived, r["dst_path"], json.loads(r["value"]))
+                    applied.append({"op": "default", "dst": r["dst_path"],
+                                    "value": json.loads(r["value"])})
+                elif r["op"] == "drop":
+                    if _get_path(derived, r["src_path"], _MISSING) is not _MISSING:
+                        _pop_path(derived, r["src_path"])
+                    applied.append({"op": "drop", "src": r["src_path"]})
+
+            normalized, errors, infos = C.check_and_normalize(spec, derived)
+            if errors:
+                self.store.begin()
+                self.store.conn.execute(
+                    "UPDATE quarantines SET retry_count=retry_count+1 WHERE sub_id=? AND seq=?",
+                    (sub_id, seq))
+                self.audit("retry_failed", {
+                    "seq": seq, "expected_version": version,
+                    "applied_mappings": applied, "errors": errors}, sub_id)
+                self.store.commit()
+                raise Reject(422, "retry_still_invalid",
+                             {"seq": seq, "errors": errors,
+                              "applied_mappings": applied})
+
+            # 恢复成功：复用同一 notification_id（身份不变）、顺序由 pump 保持
+            self.store.begin()
+            frozen = C.canonical_payload(normalized)
+            self.store.conn.execute(
+                "UPDATE notifications SET contract_version=?, frozen_payload=?, "
+                "digest=?, validation=?, status='queued' WHERE sub_id=? AND seq=?",
+                (version, frozen.decode("utf-8"), C.digest(frozen),
+                 json.dumps({"valid": True, "recovered": True,
+                             "frozen_at_failure_version": q["expected_version"],
+                             "errors": [], "infos": infos}, ensure_ascii=False),
+                 sub_id, seq))
+            self.store.conn.execute(
+                "UPDATE quarantines SET status='recovered', recovered_at=?, "
+                "retry_count=retry_count+1 WHERE sub_id=? AND seq=?",
+                (time.time(), sub_id, seq))
+            self.store.conn.execute(
+                "UPDATE subscriptions SET scan_seq=? WHERE id=?", (seq, sub_id))
+            self.audit("retry_recovered", {
+                "seq": seq, "notification_id": q["notification_id"],
+                "contract_version": version, "applied_mappings": applied,
+                "digest": C.digest(frozen)}, sub_id)
+            self.store.commit()
+            # 恢复队头后继续泵送后续被挡住的通知（保持顺序）
+            self._pump_locked(sub_id)
+
+        result = {"seq": seq, "status": "recovered",
+                  "notification_id": q["notification_id"],
+                  "contract_version": version,
+                  "frozen_payload": normalized,
+                  "reason": "已保留原投递身份并恢复入队，未生成重复通知"}
+        if idem_key:
+            with self.store.lock:
+                self.store.begin()
+                self.store.idem_put(scope, idem_key, {"response": result})
+                self.store.commit()
+        return result
+
+
+_MISSING = object()
+
+
+def _norm_path(p: str) -> str:
+    return p if p.startswith("$") else "$." + p.lstrip(".")
+
+
+def _path_parts(path: str) -> List[str]:
+    body = path[1:] if path.startswith("$") else path
+    return [p for p in body.split(".") if p]
+
+
+def _deepcopy(v: Any) -> Any:
+    return json.loads(json.dumps(v, ensure_ascii=False))
+
+
+def _get_path(obj: Any, path: str, default: Any = None) -> Any:
+    cur = obj
+    for part in _path_parts(path):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return default
+    return cur
+
+
+def _set_path(obj: Any, path: str, value: Any) -> None:
+    parts = _path_parts(path)
+    cur = obj
+    for part in parts[:-1]:
+        cur = cur.setdefault(part, {})
+    cur[parts[-1]] = value
+
+
+def _pop_path(obj: Any, path: str) -> Any:
+    parts = _path_parts(path)
+    cur = obj
+    for part in parts[:-1]:
+        cur = cur[part]
+    return cur.pop(parts[-1])
