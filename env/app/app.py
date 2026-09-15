@@ -396,6 +396,10 @@ from .batching import (
     BatchSourceNotFound,
     BatchVerifyFailed,
 )
+from .batchqueue import (
+    BatchQueueError,
+    BatchQueueManager,
+)
 from .audit import (
     AuditBadRequest,
     AuditError,
@@ -493,6 +497,14 @@ def create_app(
     # 通知；只写 audit_batch_* 自有表
     batching = BatchManager(store)
     app.extensions["batching"] = batching
+    # 批次通知额度与优先级排队：封存通知时同事务按冻结接收端入队发送任务，
+    # 接收端额度策略/事件优先级版本化，领取带租约（并发唯一、过期可接管），
+    # 发送失败不扣额度、重试保持原排队身份；只写 audit_batch_quota_policies /
+    # audit_batch_priorities / audit_batch_send_tasks / audit_batch_quota_usage
+    batch_queue = BatchQueueManager(
+        store, claim_lease_ms=_env_int("BATCH_QUEUE_CLAIM_LEASE_MS", 60_000))
+    batching.attach_queue(batch_queue)
+    app.extensions["batch_queue"] = batch_queue
     if enable_debug_api is None:
         enable_debug_api = os.environ.get("ENABLE_DEBUG_API", "1") == "1"
 
@@ -1726,6 +1738,93 @@ def create_app(
         # 服务重启/手工恢复：续跑未封存窗口、复位在途通知并重投
         return jsonify(batching.recover_interrupted())
 
+    # -- 接收端额度策略（版本化） ------------------------------------------
+    @app.post("/audit/batch/quota-policies")
+    def batch_quota_policy_create():
+        # 配置接收端额度：窗口内允许的成功发送数；每次配置产生递增版本，
+        # 同幂等键回放 200、同键换规格 409
+        data = body()
+        view, created = batch_queue.configure_quota_policy(
+            require(data, "recipient_id"),
+            max_sends=require(data, "max_sends"),
+            window_ms=require(data, "window_ms"),
+            idempotency_key=data.get("idempotency_key"),
+        )
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/batch/quota-policies")
+    def batch_quota_policy_list():
+        return jsonify(batch_queue.list_quota_policies(
+            request.args.get("recipient_id")))
+
+    @app.get("/audit/batch/quota-policies/<recipient_id>")
+    def batch_quota_policy_get(recipient_id):
+        # 当前生效（最新版本）的额度策略；未配置 404
+        return jsonify(batch_queue.get_quota_policy(recipient_id))
+
+    # -- 事件优先级（版本化） ----------------------------------------------
+    @app.post("/audit/batch/priorities")
+    def batch_priority_create():
+        # 配置事件类型优先级（越大越先被领取）；策略变化只重排未发送任务
+        data = body()
+        view, created = batch_queue.configure_priority(
+            require(data, "event_type"),
+            priority=require(data, "priority"),
+            idempotency_key=data.get("idempotency_key"),
+        )
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/batch/priorities")
+    def batch_priority_list():
+        return jsonify(batch_queue.list_priorities(
+            request.args.get("event_type")))
+
+    @app.get("/audit/batch/priorities/<event_type>")
+    def batch_priority_get(event_type):
+        return jsonify(batch_queue.get_priority(event_type))
+
+    # -- 发送任务队列：排队状态 / 领取 / 完成 / 失败 -------------------------
+    @app.get("/audit/batch/queue")
+    def batch_queue_status_all():
+        # 全部接收端的排队状态（计数 + 额度 + 按优先级排序的队列头部）
+        return jsonify(batch_queue.queue_status(
+            limit=request.args.get("limit", 20)))
+
+    @app.get("/audit/batch/queue/<recipient_id>")
+    def batch_queue_status(recipient_id):
+        return jsonify(batch_queue.queue_status(
+            recipient_id, limit=request.args.get("limit", 20)))
+
+    @app.post("/audit/batch/queue/claim")
+    def batch_queue_claim():
+        # 领取可发送任务：优先级高者优先、同优先级按排队身份；并发领取
+        # 唯一（条件更新），认领带租约，租约过期后其他领取者可接管
+        data = body()
+        return jsonify(batch_queue.claim(
+            require(data, "recipient_id"), require(data, "worker_id"),
+            max_tasks=data.get("max_tasks", 1),
+            lease_ms=data.get("lease_ms")))
+
+    @app.get("/audit/batch/queue/tasks/<task_id>")
+    def batch_queue_task_get(task_id):
+        return jsonify(batch_queue.get_task(task_id))
+
+    @app.post("/audit/batch/queue/tasks/<task_id>/complete")
+    def batch_queue_task_complete(task_id):
+        # 发送成功：扣一次额度；同令牌重复完成幂等回放不重复计
+        data = body()
+        return jsonify(batch_queue.complete_task(
+            task_id, require(data, "claim_token")))
+
+    @app.post("/audit/batch/queue/tasks/<task_id>/fail")
+    def batch_queue_task_fail(task_id):
+        # 发送失败：不扣额度，任务回到 pending 且保持原排队身份
+        data = body()
+        return jsonify(batch_queue.fail_task(
+            task_id, require(data, "claim_token"), error=data.get("error")))
+
     # -- 调试：直接篡改事件载荷以演示校验值可发现 -------------------------
     @app.post("/debug/batch/events/<event_id>/tamper")
     def debug_batch_tamper(event_id):
@@ -1884,6 +1983,13 @@ def create_app(
         # 批次聚合显式错误：来源/批次不存在 404、无生效规则/状态前提 409、
         # watermark 回退/序号冲突/幂等冲突 409、篡改核验失败 409；
         # 其余参数错误（BatchError 基类）400
+        return jsonify(exc.to_response()), exc.status
+
+    @app.errorhandler(BatchQueueError)
+    def _batch_queue_error(exc: BatchQueueError):
+        # 额度/优先级/发送队列显式错误（基类注册，子类按 MRO 命中）：
+        # 任务/策略/队列不存在 404、幂等规格/认领令牌冲突 409、
+        # 状态前提（未认领就完成等）409；其余参数错误 400
         return jsonify(exc.to_response()), exc.status
 
     @app.errorhandler(GenerationTooSmall)

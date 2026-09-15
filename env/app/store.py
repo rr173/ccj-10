@@ -831,6 +831,72 @@ CREATE TABLE IF NOT EXISTS audit_batch_notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_ab_notification_status
     ON audit_batch_notifications(status);
+-- 接收端额度策略（按接收端版本化）：窗口内允许的成功发送数。每次配置产生
+-- 新的递增版本；领取与完成判定永远读当前最新版本，旧版本只留痕。
+CREATE TABLE IF NOT EXISTS audit_batch_quota_policies (
+    policy_id         TEXT PRIMARY KEY,
+    recipient_id      TEXT NOT NULL,
+    version           INTEGER NOT NULL,
+    max_sends         INTEGER NOT NULL,        -- 窗口内允许的成功发送数
+    window_ms         INTEGER NOT NULL,        -- 额度窗口（按墙钟滑动）
+    idempotency_key   TEXT,
+    created_at_ms     INTEGER NOT NULL,
+    UNIQUE(recipient_id, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ab_quota_idem
+    ON audit_batch_quota_policies(recipient_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+-- 事件优先级策略（按事件类型版本化）：priority 越大越先被领取。策略变化
+-- 只重排未发送（pending）任务的冻结优先级，已认领/已发送任务保持原值。
+CREATE TABLE IF NOT EXISTS audit_batch_priorities (
+    priority_id       TEXT PRIMARY KEY,
+    event_type        TEXT NOT NULL,
+    version           INTEGER NOT NULL,
+    priority          INTEGER NOT NULL,        -- 越大越优先，缺省 0
+    idempotency_key   TEXT,
+    created_at_ms     INTEGER NOT NULL,
+    UNIQUE(event_type, version)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ab_priority_idem
+    ON audit_batch_priorities(event_type, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+-- 发送任务队列：每条批次通知 × 每个冻结接收端一个任务，与通知创建同事务
+-- 入队。queue_seq 是接收端内单调递增的排队身份，发送失败回到 pending 不
+-- 改变它（重试保持原排队身份）；priority 入队时冻结。认领是带令牌的条
+-- 件更新：并发领取同一任务只有一个成功；认领带租约，租约过期后其他领
+-- 取者可接管（旧令牌即刻失效）。
+CREATE TABLE IF NOT EXISTS audit_batch_send_tasks (
+    task_id           TEXT PRIMARY KEY,
+    notification_id   TEXT NOT NULL,
+    batch_id          TEXT NOT NULL,
+    event_type        TEXT NOT NULL,
+    recipient_id      TEXT NOT NULL,
+    priority          INTEGER NOT NULL DEFAULT 0, -- 入队时冻结（或重排）的优先级
+    queue_seq         INTEGER NOT NULL,        -- 接收端内排队身份（单调递增）
+    status            TEXT NOT NULL DEFAULT 'pending', -- pending/claimed/sent
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT,
+    claimed_by        TEXT,
+    claim_token       TEXT,
+    claim_expires_at_ms INTEGER,               -- 认领租约到期墙钟
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL,
+    sent_at_ms        INTEGER,
+    UNIQUE(notification_id, recipient_id),
+    UNIQUE(recipient_id, queue_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_ab_task_recipient_queue
+    ON audit_batch_send_tasks(recipient_id, status, priority, queue_seq);
+-- 额度消耗记录：只有发送成功才落一行（发送失败不扣额度）；
+-- PRIMARY KEY (recipient_id, task_id) 保证同一任务重复成功也只计一次。
+CREATE TABLE IF NOT EXISTS audit_batch_quota_usage (
+    recipient_id      TEXT NOT NULL,
+    task_id           TEXT NOT NULL,
+    consumed_at_ms    INTEGER NOT NULL,
+    PRIMARY KEY (recipient_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ab_quota_usage_time
+    ON audit_batch_quota_usage(recipient_id, consumed_at_ms);
 """
 
 

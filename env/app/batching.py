@@ -29,7 +29,9 @@
    创建的批次，已存在（哪怕仍 open）的批次继续按旧版本聚合与封存。
 7. **通知发件箱**：通知与封存同事务落库，实际"发送"在事务外执行；发送
    失败标记 failed 可重试，重启把可能在途（sending）的通知复位为 pending
-   重新投递，批次始终只关联同一条通知。
+   重新投递，批次始终只关联同一条通知。挂接发送队列后，同一事务还会按
+   冻结接收端列表为每个接收端入队一个发送任务（额度/优先级排队，见
+   ``batchqueue`` 模块）。
 
 只写 ``audit_batch_*`` 自有表，绝不修改租约、委托、审计历史、归档、证据
 包、因果索引、发布计划、订阅或多端投递的任何表。
@@ -132,6 +134,12 @@ class BatchManager:
         self._store = store
         # 仅用于故障演练：当次请求内让"发送"抛错（不影响事务结果）
         self._fail_delivery = threading.local()
+        # 发送任务队列（attach_queue 挂接）：封存创建通知时同事务入队
+        self._queue: Any = None
+
+    def attach_queue(self, queue: Any) -> None:
+        """挂接接收端额度/优先级发送队列（同事务入队，可空则不挂）。"""
+        self._queue = queue
 
     # ---- 连接/锁/时钟 ---------------------------------------------------
     @property
@@ -833,6 +841,10 @@ class BatchManager:
         except sqlite3.IntegrityError:
             # 极端并发下另一事务已建通知：不会有第二条
             return None
+        if self._queue is not None:
+            # 同事务为每个冻结接收端入队一个发送任务（额度/优先级排队）
+            self._queue.enqueue_tasks_locked(
+                notification_id, batch_id, b["event_type"], recipients, now)
         return notification_id
 
     # ---- 校验值与摘要（确定性、可独立复算） -----------------------------

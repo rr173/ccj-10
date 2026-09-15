@@ -1048,6 +1048,52 @@ POST /audit/index-releases
 接口的惰性结算。期限以绝对墙钟落库，**服务重启后按原期限继续**，切换
 历史原样保留。
 
+## 批次通知额度与优先级排队（recipient quota & priority queue）
+
+窗口批次封存生成通知（事务发件箱）后，系统在**同一事务**里按冻结接收端
+列表为每个接收端入队一个**发送任务**：接收端有独立的额度策略（窗口内
+允许的成功发送数），事件类型有独立的优先级策略，发送方通过领取接口
+主动拉取可发送任务并上报结果。
+
+### 额度策略与事件优先级（均版本化）
+
+```
+POST /audit/batch/quota-policies
+{"recipient_id":"sec-a","max_sends":100,"window_ms":60000,"idempotency_key":"q1"}
+POST /audit/batch/priorities
+{"event_type":"login","priority":10,"idempotency_key":"p1"}
+```
+
+- 两种策略都按对象（接收端 / 事件类型）版本化：每次配置产生递增版本，
+  当前策略永远是最新版本；同幂等键同规格回放 200，同键换规格 409；
+- **优先级决定领取顺序**：任务入队时冻结当前优先级（缺省 0，越大越
+  优先）；**策略变化只重排未发送任务**——优先级新版本生效时只更新
+  `pending` 任务的冻结优先级，已认领（正在发送）与已发送任务保持
+  入队时的值；
+- **额度只约束成功发送**：领取时按 `窗口内成功数 + 未过期认领数`
+  预留额度，防止并发超额领取；**发送失败不扣额度**——失败上报只记
+  一次尝试并释放认领，不落任何额度消耗记录，任务可立即被重新领取。
+
+### 排队身份、领取与租约接管
+
+- 每个任务在接收端维度持有单调递增的 `queue_seq`（排队身份），队列按
+  `priority DESC, queue_seq ASC` 排序；**重试保持原排队身份**：发送
+  失败后任务回到 `pending`，`task_id` 与 `queue_seq` 都不变；
+- `POST /audit/batch/queue/claim` `{recipient_id, worker_id,
+  max_tasks?, lease_ms?}` 领取可发送任务：认领是带唯一 `claim_token`
+  的条件 UPDATE，**并发领取同一任务只有一个成功**；认领带租约
+  （默认 60s，`BATCH_QUEUE_CLAIM_LEASE_MS`），**租约过期后其他领取者
+  可接管**该任务并获发新令牌，旧令牌的迟到完成/失败上报一律 409；
+- 结果上报：`POST /audit/batch/queue/tasks/<id>/complete`
+  `{claim_token}`（成功，扣一次额度；同令牌重复完成幂等回放、不重复
+  计额度）与 `POST .../fail` `{claim_token, error?}`（失败，不扣额度、
+  保持排队身份回到 pending）；
+- `GET /audit/batch/queue[/<recipient_id>]` 查看各接收端排队状态：
+  pending/claimed/sent 计数、额度使用（used/reserved/remaining）与按
+  优先级排序的队列头部；`GET /audit/batch/queue/tasks/<task_id>` 查
+  单个任务。任务、认领、额度消耗全部落库，**服务重启后原样恢复**，
+  未过期的认领租约继续有效。
+
 ## 持久性
 
 SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库中包含：
@@ -1072,6 +1118,9 @@ pending/inflight/awaiting_confirm/confirmed/dead_letter/discarded 状态机、
 **审计通知多端投递（策略版本、通知冻结策略快照、接收端集合与状态、
 逐次尝试记录、回执幂等记录与终态判定快照；投递席位的有序候选、
 切换期限、切换原因与完整历史、手动切换幂等记录）**、
+**批次通知发送队列（接收端额度策略与事件优先级策略的版本、
+每接收端发送任务的排队身份/冻结优先级/认领令牌与租约到期时刻、
+尝试次数与失败原因、成功发送的额度消耗记录）**、
 逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
 正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放，
 **审计回放、节点比较与一致性诊断对同一份历史给出逐字节一致的结果**；
@@ -1206,6 +1255,15 @@ pending/inflight/awaiting_confirm/confirmed/dead_letter/discarded 状态机、
 | POST | `/audit/batch/notifications/<id>/retry` | **发送失败恢复**：复用同一条通知重试，绝不创建第二条（已 sent 幂等回放） |
 | POST | `/audit/batch/process` | 管理/演练入口：封存所有来源到点批次并投递待发通知 |
 | POST | `/audit/batch/recover` | 重启/手工恢复：续跑未封存窗口、复位在途通知并重投待发通知（幂等，不产生重复通知） |
+| POST | `/audit/batch/quota-policies` | **配置接收端额度策略**（按接收端版本化）：`{recipient_id, max_sends, window_ms, idempotency_key?}`；每次配置产生递增版本，同键回放 200、同键换规格 409 |
+| GET | `/audit/batch/quota-policies` / `/audit/batch/quota-policies/<rid>` | 列策略版本（`?recipient_id=`）/ 查接收端当前生效策略（未配置 404） |
+| POST | `/audit/batch/priorities` | **配置事件优先级**（按事件类型版本化）：`{event_type, priority, idempotency_key?}`；策略变化只重排未发送（pending）任务的冻结优先级 |
+| GET | `/audit/batch/priorities` / `/audit/batch/priorities/<event_type>` | 列优先级版本（`?event_type=`）/ 查事件类型当前优先级（未配置 404） |
+| GET | `/audit/batch/queue` / `/audit/batch/queue/<rid>` | **各接收端排队状态**：pending/claimed/sent 计数、额度 used/reserved/remaining、按 `priority DESC, queue_seq ASC` 排序的队列头部（`?limit=`） |
+| POST | `/audit/batch/queue/claim` | **领取可发送任务** `{recipient_id, worker_id, max_tasks?, lease_ms?}`：并发领取唯一（条件更新+唯一令牌），受额度预留约束；认领带租约，租约过期后其他领取者可接管 |
+| GET | `/audit/batch/queue/tasks/<task_id>` | 查单个发送任务（排队身份、冻结优先级、状态、尝试次数；不含认领令牌） |
+| POST | `/audit/batch/queue/tasks/<task_id>/complete` | **发送成功** `{claim_token}`：扣一次额度；同令牌重复完成幂等回放不重复计，令牌不符/未认领 409 |
+| POST | `/audit/batch/queue/tasks/<task_id>/fail` | **发送失败** `{claim_token, error?}`：不扣额度，任务保持原排队身份回到 pending |
 | POST | `/debug/batch/events/<id>/tamper` | 演练：直接篡改成员事件载荷，随后 `/verify` 返回 409（生产关闭调试接口） |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
@@ -1273,6 +1331,7 @@ curl -s localhost:8080/writes/1
 | `SUBSCRIPTION_BACKOFF_BASE_MS` | 1000 | 回调失败指数退避的基础等待（第 n 次失败后 `base*2^(n-1)`） |
 | `SUBSCRIPTION_BACKOFF_MAX_MS` | 300000 | 回调失败退避上限 |
 | `SUBSCRIPTION_CLAIM_LEASE_MS` | 60000 | 投递认领租约：超过此时长的 inflight/awaiting 行视为投递器崩溃，回收重试（启动时无条件回收） |
+| `BATCH_QUEUE_CLAIM_LEASE_MS` | 60000 | 批次发送任务认领租约：超过此时长的 claimed 任务可被其他领取者接管 |
 | `ENABLE_DEBUG_API` | 1 | 是否开放 `/debug/*` 故障演练接口 |
 
 ## 测试
@@ -1400,3 +1459,12 @@ retry 成功、worker 批量发布时单计划失败不影响其它、
 连带取消所有版本、版本创建/激活/取消/重试与全部拒绝原因只追加进订阅
 自己的审计历史（分页/事件过滤）、版本流程不改写租约/委托/
 `lease_events`/已有投递记录、事务中途故障注入不留半切换。
+
+批次通知额度与优先级排队覆盖：封存通知同事务按冻结接收端入队发送任务、
+排队状态（计数/额度/优先级序）与任务详情查询、额度策略与优先级的版本化
+与同键回放/同键换规格 409、领取受额度预留约束（成功+未过期认领占额度）、
+优先级决定领取顺序且策略变化只重排未发送任务（已认领/已发送保持冻结值）、
+多线程并发领取恰好一个成功、租约未过期不可抢与拨表过期后接管（旧令牌
+完成/失败一律 409）、发送失败不扣额度且重试保持原排队身份（queue_seq
+不变）、完成幂等回放不重复计额度、未认领/令牌不符/不存在等显式错误、
+服务重启后队列/认领/优先级/额度消耗全部恢复。
