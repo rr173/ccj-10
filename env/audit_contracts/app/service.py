@@ -109,6 +109,18 @@ class Service:
         self.dryrun_interrupt = False
         self._resume_on_startup()
 
+    @staticmethod
+    def _reject(status: int, reason: str, detail: Any = None):
+        raise Reject(status, reason, detail)
+
+    @staticmethod
+    def _fingerprint(parts: dict) -> str:
+        return _fingerprint(parts)
+
+    @staticmethod
+    def _idem_cached(hit: Any) -> dict:
+        return _idem_cached(hit)
+
     # ------------------------------------------------------------------ #
     # 重启恢复：恢复中断的预演；其余状态（冻结版本/映射/隔离位置）均在表里
     # ------------------------------------------------------------------ #
@@ -121,6 +133,76 @@ class Service:
                 self._resume_dry_run(row["id"])
             except Exception:  # pragma: no cover - 续跑失败保留 running，等下次重试
                 pass
+        # 续跑未终结的处置：发送中的保持挂起等 ack/nack；其余按当前状态裁决
+        from . import disposition as D
+        D.resume_on_startup(self)
+
+    # ------------------------------------------------------------------ #
+    # 处置（更正/撤回）与发送状态机：见 disposition.py
+    # ------------------------------------------------------------------ #
+    def create_disposition(self, **kw):
+        from . import disposition as D
+        return D.create_disposition(self, **kw)
+
+    def get_disposition(self, disp_id: str) -> dict:
+        from . import disposition as D
+        return D.get_disposition(self, disp_id)
+
+    def event_dispositions(self, sub_id: str, seq: int) -> dict:
+        from . import disposition as D
+        return D.event_dispositions(self, sub_id, seq)
+
+    def delivery_queue(self, sub_id: str) -> dict:
+        from . import disposition as D
+        return D.delivery_queue(self, sub_id)
+
+    def claim_notification(self, sub_id: str, seq: int,
+                           force: bool = False) -> dict:
+        from . import disposition as D
+        return D.claim_notification(self, sub_id, seq, force)
+
+    def ack_notification(self, sub_id: str, seq: int, token: str) -> dict:
+        from . import disposition as D
+        return D._finish_notification(self, sub_id, seq, token, True)
+
+    def nack_notification(self, sub_id: str, seq: int, token: str) -> dict:
+        from . import disposition as D
+        return D._finish_notification(self, sub_id, seq, token, False)
+
+    def claim_notice(self, sub_id: str, notice_id: str,
+                     force: bool = False) -> dict:
+        from . import disposition as D
+        return D.claim_notice(self, sub_id, notice_id, force)
+
+    def ack_notice(self, sub_id: str, notice_id: str, token: str) -> dict:
+        from . import disposition as D
+        return D._finish_notice(self, sub_id, notice_id, token, True)
+
+    def nack_notice(self, sub_id: str, notice_id: str, token: str) -> dict:
+        from . import disposition as D
+        return D._finish_notice(self, sub_id, notice_id, token, False)
+
+    def verify_notice_signature(self, sub_id: str, notice_id: str) -> dict:
+        from . import disposition as D
+        return D.verify_notice_signature(self, sub_id, notice_id)
+
+    def rotate_signing_key(self, idem_key: Optional[str] = None) -> dict:
+        """轮换当前签名密钥：旧密钥失活但保留验签能力，历史签名仍可验证。"""
+        scope = "signing_rotation"
+        fingerprint = _fingerprint({"op": "rotate_signing_key"})
+        with self.store.lock:
+            replayed = _idem_replay(self.store, scope, idem_key,
+                                    fingerprint, "rotate_signing_key")
+            if replayed is not None:
+                return replayed
+            self.store.begin()
+            kid = self.store.signer.rotate_key()
+            self.audit("signing_key_rotated", {"kid": kid})
+            result = {"kid": kid, "rotated": True}
+            if idem_key:
+                self.store.idem_put(scope, idem_key, result, fingerprint)
+            self.store.commit()
+        return result
 
     # ------------------------------------------------------------------ #
     # 审计
@@ -873,13 +955,31 @@ class Service:
         frozen = C.canonical_payload(payload)
         origin_digest = C.digest(C.canonical_payload(
             source_payload if source_payload is not None else payload))
+        # 排队位置：原通知与后续通知共享同一条单调队列（调用方须已 begin）
+        pos_row = self.store.conn.execute(
+            "SELECT next_queue_pos FROM subscriptions WHERE id=?",
+            (sub_id,)).fetchone()
+        queue_pos = pos_row["next_queue_pos"]
+        self.store.conn.execute(
+            "UPDATE subscriptions SET next_queue_pos=? WHERE id=?",
+            (queue_pos + 1, sub_id))
         self.store.conn.execute(
             "INSERT INTO notifications(sub_id, seq, notification_id, event_type, "
-            "contract_version, frozen_payload, digest, validation, status, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "contract_version, frozen_payload, digest, validation, status, created_at, "
+            "queue_position) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (sub_id, ev["seq"], notif_id, ev["event_type"], version,
              frozen.decode("utf-8"), C.digest(frozen),
-             json.dumps(validation, ensure_ascii=False), status, time.time()))
+             json.dumps(validation, ensure_ascii=False), status, time.time(),
+             queue_pos))
+        # 首次修订留档（revision 1）：原位更正时通知行原地更新，历史在此可溯
+        self.store.conn.execute(
+            "INSERT INTO notification_revisions(sub_id, seq, notification_id, "
+            "revision_no, contract_version, frozen_payload, digest, validation, "
+            "signature_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (sub_id, ev["seq"], notif_id, 1, version,
+             frozen.decode("utf-8"), C.digest(frozen),
+             json.dumps(validation, ensure_ascii=False), None, time.time()))
         # 首次冻结 = attempt_no 1：同时落尝试记录与来源说明（只追加、不可变）
         self._append_attempt_locked(
             sub_id, ev["seq"], notif_id, ev["event_type"], 1, "initial_freeze",
@@ -940,6 +1040,9 @@ class Service:
             "frozen_payload": json.loads(r["frozen_payload"]),
             "digest": r["digest"], "validation": json.loads(r["validation"]),
             "status": r["status"],
+            "queue_position": r["queue_position"],
+            "claimed_at": r["claimed_at"], "delivered_at": r["delivered_at"],
+            "cancelled_at": r["cancelled_at"], "superseded": bool(r["superseded"]),
         } for r in rows]}
 
     # ------------------------------------------------------------------ #

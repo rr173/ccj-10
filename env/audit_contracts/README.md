@@ -164,3 +164,69 @@ changed_fields / unchanged_fields` 给出新增、删除、改名（优先配对
 | GET | `/subscriptions/{s}/audit-history`、`/audit-history` | 审计历史 |
 
 错误统一为 `{"error": "<machine_reason>", "detail": {...}}`。
+
+## 更正 / 撤回处置（disposition）
+
+管理员对**已经进入通知链路**的审计事件发布更正（`correct`）或撤回（`retract`）。
+创建处置时必须引用原事件（`sub_id`+`seq`，可带 `event_type` 二次核对）、给出
+非空 `reason`；每个**接收端**（一个订阅即一个接收端）独立决策、独立落结果，
+一个接收端失败不影响、也不回滚其他接收端已成功的处置。
+
+### 按原通知发送状态决定结果
+
+发送状态机：`queued → sending → delivered`（发送失败 `nack` 退回 `queued`），
+`claim` 发放一次性 `delivery_token`，`ack/nack` 必须出示同一令牌。
+
+| 原通知状态 | 撤回 retract | 更正 correct |
+|---|---|---|
+| `queued` / `blocked`（未开始发送） | **原子取消**原任务（→`cancelled`，无新通知） | **同一排队位置原位替换**为新通知：同一 `notification_id`，旧载荷在 `notification_revisions` 留档 |
+| `delivered`（已确认送达） | 原通知**绝不删除/改写**，在其后**追加**带关联的撤回通知 | 同样**追加**一条更正通知（携带新载荷、字段来源与签名） |
+| `sending`（正在发送） | 处置挂起 `pending`，与发送结果竞争：ack 先生效→追加；nack 先生效→取消/替换。最终稳定落到两种结果之一，不漏发、不重复、不颠倒 | 同左 |
+
+- 后续通知（`disposition_notices`）有独立投递身份与**严格更大**的排队位置，
+  必须按位置顺序领取（跳领返回 `409 followup_out_of_order`）；信封 `relation`
+  固定关联原通知身份、原事件摘要、处置编号与处置方式，验签后关联不可调换；
+- 发送端在 `sending` 状态崩溃时，可用 `claim` 的 `{"force_reclaim": true}`
+  接管（旧令牌立即作废）；
+- 更正内容必须依次通过**当前生效载荷契约校验 → 逐字段字段来源说明
+  （origin=`correction_supplied`）→ 当前签名密钥签名**，任一步失败都返回
+  该接收端 `failed`（`failure_stage` 为 `validation`/`signing`/`precondition`），
+  原通知保持不变；
+
+### 签名
+
+- HMAC-SHA256，密钥持久化在 `signing_keys` 表、只存服务端永不下发；
+- 当前生效密钥为启用中序号最大者；`POST /signing/rotate` 原子轮换后，
+  旧密钥失活但保留验签能力，历史通知签名仍可验证（`GET .../notices/{id}/verify`）；
+- 原位替换的修订（`notification_revisions`）与追加通知（`disposition_notices`）
+  都落签名块（kid/alg/signature）。
+
+### 查询（按原事件）
+
+`GET /subscriptions/{s}/events/{seq}/dispositions` 返回：原通知发送状态与全部
+修订留档、每次处置及该接收端结果（`cancelled/replaced/followup_queued/failed`
+及失败阶段/原因）、关联后续通知（kind/位置/签名 kid）、**完整时间线**
+（请求、挂起、claim/ack/nack、取消、替换、追加，按发生顺序）。
+统一队列视图 `GET /subscriptions/{s}/delivery-queue` 把原通知与后续通知按
+排队位置合并，直接反映先后顺序与各自身份。
+
+### 处置相关接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/subscriptions/{s}/events/{seq}/dispositions` | 创建处置 `{action,reason,corrected_payload?,event_type?,actor?}` |
+| GET | `/subscriptions/{s}/events/{seq}/dispositions` | 按原事件查看状态/处置/关联通知/失败原因/时间线 |
+| GET | `/dispositions/{id}` | 单次处置结果 |
+| GET | `/subscriptions/{s}/delivery-queue` | 原通知+后续通知的统一有序队列 |
+| POST | `/subscriptions/{s}/notifications/{seq}/claim` | 领取原通知（可 `force_reclaim`） |
+| POST | `/subscriptions/{s}/notifications/{seq}/ack` / `nack` | 确认送达 / 发送失败退回（`{delivery_token}`） |
+| POST | `/subscriptions/{s}/notices/{id}/claim` / `ack` / `nack` | 后续通知的领取与发送结果 |
+| GET | `/subscriptions/{s}/notices/{id}/verify` | 重算后续通知信封签名（密钥轮换后也可验） |
+| POST | `/signing/rotate` | 轮换当前签名密钥（旧签名仍可验证） |
+
+处置幂等键为**全局作用域**：同键同内容重放返回首次结果（含失败结果，带
+`replayed: true`）；同一键改变原事件、处置方式、原因或更正内容，一律
+`409 idempotency_request_conflict`（同时给出首次与本次指纹）。服务重启后自动
+续跑 `pending` 处置：已送达→追加、已退回→取消/替换、仍 `sending`→继续等
+ack/nack；排队身份、关联关系与先后顺序全部落库，重启后一致。
+

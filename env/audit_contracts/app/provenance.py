@@ -33,6 +33,7 @@ ORIGIN_UNKNOWN_ALLOWED = "unknown_allowed"  # unknown_policy=allow 放行
 ORIGIN_VALIDATION_FAILED = "validation_failed"  # 验证失败进入隔离
 ORIGIN_MISSING_REQUIRED = "missing_required"    # 必填缺失（未恢复）
 ORIGIN_UNGOVERNED = "ungoverned_passthrough"    # 契约撤销后无约束原样冻结
+ORIGIN_CORRECTION = "correction_supplied"       # 管理员更正：值来自更正请求而非原事件
 
 
 # --------------------------------------------------------------------------- #
@@ -179,6 +180,89 @@ def build_entries(spec: Optional[dict], source: Any, normalized: Any,
 
     _walk_node(spec, source, normalized, "$", entries, effects,
                err_by_path, info_by_path)
+    return _sorted_entries(entries)
+
+
+def build_correction_entries(spec: Optional[dict], normalized: Any,
+                             infos: List[dict]) -> List[dict]:
+    """更正载荷的逐字段来源说明：每个字段都标记为管理员更正提供。
+
+    更正内容不是从原始审计事件派生的，因此不能记 direct_value——必须能从
+    来源说明上区分"这是管理员更正后的值"。契约默认补入的字段记契约默认，
+    strip/allow 的未知字段仍按策略记录。
+    """
+    entries: List[dict] = []
+    info_by_path = _index_reasons(infos)
+
+    def walk(node_spec: Optional[dict], value: Any, path: str) -> None:
+        if node_spec is None:
+            # 无治理契约（仅撤回追加不走这里；更正无契约在调用前已拒绝），
+            # 兜底按更正提供逐叶子记录
+            _walk_plain(value, path)
+            return
+        t = node_spec["type"]
+        if t == "object":
+            if not isinstance(value, dict):
+                return
+            policy = node_spec.get("unknown_policy", "strict")
+            for key in value:
+                child = _join(path, key)
+                if key in node_spec.get("properties", {}):
+                    walk(node_spec["properties"][key], value[key], child)
+                elif policy == "strip":
+                    entries.append(_entry(
+                        path=child, src_path=None, origin=ORIGIN_STRIPPED,
+                        value_type=_json_type(value[key]),
+                        summary=value_summary(value[key]),
+                        rule_id="policy:unknown_strip",
+                        reason=info_by_path.get(child)
+                        or "更正载荷中的未知字段已按 strip 策略删除"))
+                elif policy == "allow":
+                    entries.append(_entry(
+                        path=child, src_path=None, origin=ORIGIN_UNKNOWN_ALLOWED,
+                        value_type=_json_type(value[key]),
+                        summary=value_summary(value[key]),
+                        rule_id="policy:unknown_allow",
+                        reason=info_by_path.get(child)
+                        or "更正载荷中的未知字段按 allow 策略保留"))
+            for name, child_spec in node_spec.get("properties", {}).items():
+                if name not in value and "default" in child_spec:
+                    child = _join(path, name)
+                    entries.append(_entry(
+                        path=child, src_path=None,
+                        origin=ORIGIN_CONTRACT_DEFAULT,
+                        value_type=child_spec["type"],
+                        summary=value_summary(child_spec["default"]),
+                        rule_id=f"contract_default:{child_spec['type']}",
+                        validation={"valid": True}))
+            return
+        if t == "array":
+            if not isinstance(value, list):
+                return
+            for i, item in enumerate(value):
+                walk(node_spec.get("items"), item, f"{path}[{i}]")
+            return
+        entries.append(_entry(
+            path=path, src_path=None, origin=ORIGIN_CORRECTION,
+            value_type=t, summary=value_summary(value),
+            rule_id="disposition:correction",
+            validation={"valid": True}))
+
+    def _walk_plain(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            for k in value:
+                _walk_plain(value[k], _join(path, k))
+        elif isinstance(value, list):
+            for i, it in enumerate(value):
+                _walk_plain(it, f"{path}[{i}]")
+        else:
+            entries.append(_entry(
+                path=path, src_path=None, origin=ORIGIN_CORRECTION,
+                value_type=_json_type(value), summary=value_summary(value),
+                rule_id="disposition:correction",
+                validation={"valid": True}))
+
+    walk(spec, normalized, "$")
     return _sorted_entries(entries)
 
 

@@ -14,6 +14,25 @@
   GET    /subscriptions/{sub}/notifications/{seq}/compare?from=1&to=2
          两次尝试逐字段比较：新增/删除/改名/值摘要变化与对应规则
 
+  发送状态机（投递循环驱动；claim 发放令牌，ack/nack 必须出示同一令牌）：
+  POST   /subscriptions/{sub}/notifications/{seq}/claim   领取下一条待发原通知
+  POST   /subscriptions/{sub}/notifications/{seq}/ack     确认送达 {delivery_token}
+  POST   /subscriptions/{sub}/notifications/{seq}/nack    发送失败退回队列 {delivery_token}
+  POST   /subscriptions/{sub}/notices/{notice_id}/claim   领取撤回/更正后续通知
+  POST   /subscriptions/{sub}/notices/{notice_id}/ack     后续通知确认送达
+  POST   /subscriptions/{sub}/notices/{notice_id}/nack    后续通知发送失败
+  GET    /subscriptions/{sub}/notices/{notice_id}/verify  重算后续通知信封签名
+
+  处置（管理员对已进入通知链路的事件更正/撤回）：
+  POST   /subscriptions/{sub}/events/{seq}/dispositions
+         {action: retract|correct, reason, corrected_payload?, event_type?, actor?}
+  GET    /subscriptions/{sub}/events/{seq}/dispositions
+         按原事件查看原通知状态、处置方式、关联通知、失败原因、完整时间线
+  GET    /dispositions/{id}                               单次处置结果
+  GET    /subscriptions/{sub}/delivery-queue              原通知+后续通知的统一有序队列
+
+  POST   /signing/rotate                                  轮换当前签名密钥（旧签名仍可验）
+
   PUT    /contracts/{event_type}/versions/{version}     契约登记（幂等键可选）
   GET    /contracts/{event_type}/versions               版本列表
   GET    /contracts/{event_type}/versions/{version}     契约详情
@@ -48,6 +67,13 @@ from urllib.parse import urlparse, parse_qs as urllib_parse_qs
 
 from .service import Reject, Service
 from .contracts import ContractError, VersionError
+
+
+def _require_token(body: dict) -> str:
+    token = body.get("delivery_token")
+    if not token:
+        raise Reject(400, "missing_fields", {"required": ["delivery_token"]})
+    return token
 
 
 def _make_handler(svc: Service) -> type:
@@ -227,6 +253,57 @@ def _make_handler(svc: Service) -> type:
         def global_audit(self, body, query=None):
             return {"history": svc.audit_history(None)}
 
+        # 发送状态机
+        def claim(self, body, sub, seq, query=None):
+            return svc.claim_notification(
+                sub, int(seq), bool(body.get("force_reclaim", False)))
+
+        def ack(self, body, sub, seq, query=None):
+            return svc.ack_notification(sub, int(seq), _require_token(body))
+
+        def nack(self, body, sub, seq, query=None):
+            return svc.nack_notification(sub, int(seq), _require_token(body))
+
+        def claim_notice(self, body, sub, nid, query=None):
+            return svc.claim_notice(
+                sub, nid, bool(body.get("force_reclaim", False)))
+
+        def ack_notice(self, body, sub, nid, query=None):
+            return svc.ack_notice(sub, nid, _require_token(body))
+
+        def nack_notice(self, body, sub, nid, query=None):
+            return svc.nack_notice(sub, nid, _require_token(body))
+
+        def verify_notice(self, body, sub, nid, query=None):
+            return svc.verify_notice_signature(sub, nid)
+
+        # 处置
+        def create_disposition(self, body, sub, seq, query=None):
+            for f in ("action", "reason"):
+                if f not in body:
+                    raise Reject(400, "missing_fields",
+                                 {"required": ["action", "reason"]})
+            return svc.create_disposition(
+                sub_id=sub, seq=int(seq), action=body["action"],
+                reason=body["reason"],
+                corrected_payload=body.get("corrected_payload"),
+                event_type=body.get("event_type"),
+                actor=body.get("actor"),
+                idem_key=self._idempotency_key(body))
+
+        def event_dispositions(self, body, sub, seq, query=None):
+            return svc.event_dispositions(sub, int(seq))
+
+        def get_disposition(self, body, did, query=None):
+            return svc.get_disposition(did)
+
+        def delivery_queue(self, body, sub, query=None):
+            return svc.delivery_queue(sub)
+
+        # 签名密钥轮换
+        def rotate_signing(self, body, query=None):
+            return svc.rotate_signing_key(self._idempotency_key(body))
+
     # ------------------------------------------------------------------ #
     # 路由表（method, regex）-> (handler, kwargs 名)
     # ------------------------------------------------------------------ #
@@ -239,6 +316,35 @@ def _make_handler(svc: Service) -> type:
         ("GET",  re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notifications/(?P<seq>\d+)/provenance$"), "provenance", ["sub", "seq"]),
         ("GET",  re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notifications/(?P<seq>\d+)/attempts$"), "attempts", ["sub", "seq"]),
         ("GET",  re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notifications/(?P<seq>\d+)/compare$"), "compare", ["sub", "seq"]),
+
+        # 发送状态机
+        ("POST", re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notifications/(?P<seq>\d+)/claim$"),
+         "claim", ["sub", "seq"]),
+        ("POST", re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notifications/(?P<seq>\d+)/ack$"),
+         "ack", ["sub", "seq"]),
+        ("POST", re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notifications/(?P<seq>\d+)/nack$"),
+         "nack", ["sub", "seq"]),
+        ("POST", re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notices/(?P<nid>[^/]+)/claim$"),
+         "claim_notice", ["sub", "nid"]),
+        ("POST", re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notices/(?P<nid>[^/]+)/ack$"),
+         "ack_notice", ["sub", "nid"]),
+        ("POST", re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notices/(?P<nid>[^/]+)/nack$"),
+         "nack_notice", ["sub", "nid"]),
+        ("GET",  re.compile(r"^/subscriptions/(?P<sub>[^/]+)/notices/(?P<nid>[^/]+)/verify$"),
+         "verify_notice", ["sub", "nid"]),
+
+        # 处置
+        ("POST", re.compile(r"^/subscriptions/(?P<sub>[^/]+)/events/(?P<seq>\d+)/dispositions$"),
+         "create_disposition", ["sub", "seq"]),
+        ("GET",  re.compile(r"^/subscriptions/(?P<sub>[^/]+)/events/(?P<seq>\d+)/dispositions$"),
+         "event_dispositions", ["sub", "seq"]),
+        ("GET",  re.compile(r"^/dispositions/(?P<did>[^/]+)$"),
+         "get_disposition", ["did"]),
+        ("GET",  re.compile(r"^/subscriptions/(?P<sub>[^/]+)/delivery-queue$"),
+         "delivery_queue", ["sub"]),
+
+        ("POST", re.compile(r"^/signing/rotate$"),
+         "rotate_signing", []),
 
         ("PUT",  re.compile(r"^/contracts/(?P<etype>[^/]+)/versions/(?P<version>[^/]+)$"),
          "put_contract", ["etype", "version"]),

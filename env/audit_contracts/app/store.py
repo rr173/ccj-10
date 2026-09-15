@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     id           TEXT PRIMARY KEY,
     created_at   REAL NOT NULL,
     scan_seq     INTEGER NOT NULL DEFAULT 0,   -- 已扫描到的最后一个序号（下一个为 scan_seq+1）
-    stable_seq   INTEGER NOT NULL DEFAULT 0    -- 稳定历史水位（最后一个不可变事件序号）
+    stable_seq   INTEGER NOT NULL DEFAULT 0,   -- 稳定历史水位（最后一个不可变事件序号）
+    next_queue_pos INTEGER NOT NULL DEFAULT 1  -- 接收端自己的单调排队位置（原通知与后续通知共享）
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -85,9 +86,117 @@ CREATE TABLE IF NOT EXISTS notifications (
     frozen_payload   TEXT NOT NULL,
     digest           TEXT NOT NULL,
     validation       TEXT NOT NULL,           -- {valid, errors, infos}
-    status           TEXT NOT NULL,           -- queued / delivered / blocked
+    status           TEXT NOT NULL,           -- queued / sending / delivered / blocked / cancelled
     created_at       REAL NOT NULL,
+    queue_position   INTEGER,                 -- 接收端单调排队位置（与后续通知共享一条队列）
+    delivery_token   TEXT,                    -- 发送租约令牌：claim 发放，ack/nack 必须出示
+    claimed_at       REAL,
+    delivered_at     REAL,
+    cancelled_at     REAL,
+    superseded       INTEGER NOT NULL DEFAULT 0,  -- 原通知是否被更正原位替换（1=行内保留最新载荷，历史在 revisions）
     PRIMARY KEY (sub_id, seq)
+);
+
+-- 通知原位修订（只追加）：未发送更正"用同一排队位置替换"时，通知行原地更新
+-- 为新载荷，但每一代载荷、契约版本、摘要与签名都在此留档，旧内容不丢失。
+CREATE TABLE IF NOT EXISTS notification_revisions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    sub_id            TEXT NOT NULL,
+    seq               INTEGER NOT NULL,
+    notification_id   TEXT NOT NULL,          -- 始终是同一投递身份
+    revision_no       INTEGER NOT NULL,       -- 1 = 首次冻结；每次原位更正 +1
+    contract_version  TEXT,
+    frozen_payload    TEXT NOT NULL,
+    digest            TEXT NOT NULL,
+    validation        TEXT NOT NULL,
+    signature_json    TEXT,
+    created_at        REAL NOT NULL,
+    UNIQUE (sub_id, seq, revision_no)
+);
+
+-- 管理员处置请求（撤回/撤回原事件通知）。同一 (sub_id,seq) 同时至多一个
+-- 未终结处置；终结后可再发起（链式处置），每次独立留档。
+CREATE TABLE IF NOT EXISTS dispositions (
+    id              TEXT PRIMARY KEY,         -- disp_<uuid>
+    sub_id          TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    action          TEXT NOT NULL,            -- retract / correct
+    reason          TEXT NOT NULL,
+    event_type      TEXT,                     -- 非空时校验必须与原事件类型一致
+    corrected_payload TEXT,                   -- 更正的新载荷（JSON）；撤回为 NULL
+    actor           TEXT,
+    status          TEXT NOT NULL,            -- pending / applied / failed
+    idem_key        TEXT,
+    fingerprint     TEXT,
+    created_at      REAL NOT NULL,
+    finished_at     REAL
+);
+CREATE INDEX IF NOT EXISTS ix_dispositions_event
+    ON dispositions(sub_id, seq, created_at);
+
+-- 处置在每个接收端上的独立结果（本实现中一个订阅即一个接收端；
+-- 批量按接收端逐条独立落库，互不回滚）。
+CREATE TABLE IF NOT EXISTS disposition_targets (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    disposition_id    TEXT NOT NULL,
+    sub_id            TEXT NOT NULL,
+    seq               INTEGER NOT NULL,
+    state             TEXT NOT NULL,          -- pending / cancelled / replaced / followup_queued / failed
+    outcome_action    TEXT NOT NULL,          -- retract / correct
+    original_status   TEXT NOT NULL,          -- 决策时读到的原通知发送状态
+    original_notification_id TEXT,
+    result_notification_id TEXT,              -- 追加的后续通知 id（followup_queued）
+    failure_stage     TEXT,                   -- validation / provenance / signing / precondition
+    failure_reason    TEXT,
+    fail_detail_json  TEXT,
+    created_at        REAL NOT NULL,
+    finished_at       REAL,
+    UNIQUE (disposition_id, sub_id, seq)
+);
+
+-- 处置时间线（只追加）：原通知状态迁移、处置决策、后续通知入队全部在此，
+-- 管理员按原事件可重建完整先后顺序。
+CREATE TABLE IF NOT EXISTS disposition_timeline (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    sub_id        TEXT NOT NULL,
+    seq           INTEGER NOT NULL,
+    at            REAL NOT NULL,
+    event         TEXT NOT NULL,              -- 见下方事件名约定
+    detail_json   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_disposition_timeline
+    ON disposition_timeline(sub_id, seq, id);
+
+-- 已送达/已确认后只能追加的后续通知（撤回通知或更正通知）。
+-- 它们排在原通知之后、各自有独立投递身份与签名；原通知行绝不删除/改写。
+CREATE TABLE IF NOT EXISTS disposition_notices (
+    id                 TEXT PRIMARY KEY,      -- ntf_<uuid>（独立投递身份）
+    sub_id             TEXT NOT NULL,
+    seq                INTEGER NOT NULL,      -- 锚定的原事件序号
+    disposition_id     TEXT NOT NULL,
+    kind               TEXT NOT NULL,         -- retraction / correction
+    event_type         TEXT NOT NULL,
+    envelope_json      TEXT NOT NULL,         -- 待投递信封（含 relation 关联）
+    payload_digest     TEXT NOT NULL,
+    contract_version   TEXT,                  -- 更正：当前生效契约版本；撤回可为 NULL
+    signature_json     TEXT NOT NULL,
+    status             TEXT NOT NULL,         -- queued / sending / delivered
+    queue_position     INTEGER NOT NULL,      -- 严格大于原通知的排队位置
+    delivery_token     TEXT,
+    claimed_at         REAL,
+    delivered_at       REAL,
+    created_at         REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_disposition_notices_queue
+    ON disposition_notices(sub_id, queue_position);
+
+CREATE TABLE IF NOT EXISTS signing_keys (
+    kid        TEXT PRIMARY KEY,
+    key_no     INTEGER NOT NULL UNIQUE,
+    secret     TEXT NOT NULL,                 -- 仅服务端持有，绝不外发
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    rotated_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS quarantines (
@@ -188,6 +297,10 @@ class Store:
         self.conn.executescript(SCHEMA)
         self._migrate()
         self.conn.commit()
+        # 签名器与库同生命周期（密钥持久化在 signing_keys 表）
+        from .signing import Signer
+        self.signer = Signer(self.conn)
+        self.conn.commit()
 
     def _migrate(self) -> None:
         cols = {r["name"] for r in self.conn.execute(
@@ -200,6 +313,58 @@ class Store:
         if "fingerprint" not in idem_cols:
             self.conn.execute(
                 "ALTER TABLE idempotency ADD COLUMN fingerprint TEXT")
+        # 发送状态机 / 排队位置 / 处置锚定列（旧库迁移）
+        notif_cols = {r["name"] for r in self.conn.execute(
+            "PRAGMA table_info(notifications)").fetchall()}
+        for name, decl in (
+                ("queue_position", "INTEGER"),
+                ("delivery_token", "TEXT"),
+                ("claimed_at", "REAL"),
+                ("delivered_at", "REAL"),
+                ("cancelled_at", "REAL"),
+                ("superseded", "INTEGER NOT NULL DEFAULT 0")):
+            if name not in notif_cols:
+                self.conn.execute(
+                    f"ALTER TABLE notifications ADD COLUMN {name} {decl}")
+        sub_cols = {r["name"] for r in self.conn.execute(
+            "PRAGMA table_info(subscriptions)").fetchall()}
+        if "next_queue_pos" not in sub_cols:
+            self.conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN "
+                "next_queue_pos INTEGER NOT NULL DEFAULT 1")
+        # 排队位置回填：旧库已冻结的原通知按 (sub, seq) 顺序占住 1..N，
+        # 保证重启恢复后后续通知的位置严格在原通知之后。
+        for r in self.conn.execute(
+                "SELECT id FROM subscriptions ORDER BY id").fetchall():
+            sub_id = r["id"]
+            missing = self.conn.execute(
+                "SELECT COUNT(*) c FROM notifications "
+                "WHERE sub_id=? AND queue_position IS NULL", (sub_id,)).fetchone()
+            if missing["c"]:
+                pos = 1
+                for n in self.conn.execute(
+                        "SELECT seq FROM notifications WHERE sub_id=? "
+                        "ORDER BY seq", (sub_id,)).fetchall():
+                    self.conn.execute(
+                        "UPDATE notifications SET queue_position=? "
+                        "WHERE sub_id=? AND seq=? AND queue_position IS NULL",
+                        (pos, sub_id, n["seq"]))
+                    pos += 1
+                self.conn.execute(
+                    "UPDATE subscriptions SET next_queue_pos=? WHERE id=?",
+                    (pos, sub_id))
+        # 计数器必须严格大于已分配的最大位置（原通知与后续通知一并考虑），
+        # 否则回填/旧库恢复后新入队的通知会撞号、破坏先后顺序
+        for r in self.conn.execute(
+                "SELECT s.id AS sid, COALESCE(MAX(q.pos), 0) AS max_pos "
+                "FROM subscriptions s LEFT JOIN ("
+                "  SELECT sub_id, queue_position AS pos FROM notifications "
+                "  UNION ALL SELECT sub_id, queue_position FROM disposition_notices"
+                ") q ON q.sub_id = s.id GROUP BY s.id").fetchall():
+            self.conn.execute(
+                "UPDATE subscriptions SET next_queue_pos=? "
+                "WHERE id=? AND next_queue_pos<=?",
+                (r["max_pos"] + 1, r["sid"], r["max_pos"]))
 
     # -- 基础工具 ----------------------------------------------------------- #
     def begin(self) -> sqlite3.Connection:
