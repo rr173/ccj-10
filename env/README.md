@@ -1187,6 +1187,26 @@ pending/inflight/awaiting_confirm/confirmed/dead_letter/discarded 状态机、
 | GET | `/audit/fanout/notifications/<id>/seats/<sid>` | 单席位状态（含全部候选的期限/状态/替换原因） |
 | GET | `/audit/fanout/notifications/<id>/seats/<sid>/history` | **席位完整历史**：启用/替换（含原因）/回执受理与拒绝/失败/席位成败 |
 | POST | `/audit/fanout/notifications/<id>/seats/<sid>/switch` | **手动放弃当前接收端** `{reason?, expected_recipient_id?, idempotency_key?}`：按顺序启用下一位备用；同键重放 200，席位已成功/已终止 409（带胜负信息），期望接收端不符 409 |
+| POST | `/audit/batch/rules` | **配置聚合规则（按事件类型版本化）**：`{event_type, window_ms, group_field, allowed_lateness_ms, recipients:[rid], effective_at_ms?, idempotency_key?}`；同类型每次配置产生递增版本，切换只影响事件发生时间在新生效点（含）之后的批次；同键回放 200、同键换规格 409 |
+| GET | `/audit/batch/rules` / `/audit/batch/rules/<id>` | 列规则版本（`?event_type=`）/ 查单条规则 |
+| POST | `/audit/batch/sources` | **登记事件来源** `{source_id, initial_watermark_ms?}`（重复登记 200 回放） |
+| GET | `/audit/batch/sources` / `/audit/batch/sources/<id>` | 列来源 / 查来源（独立 `last_seq` 与 `watermark_ms`） |
+| POST | `/audit/batch/sources/<id>/watermark` | **推进来源 watermark** `{watermark_ms, seq?}`：只进不退（回退 409 且状态不变），推进后惰性封存到点批次 |
+| POST | `/audit/batch/sources/<id>/events/scan` | **从稳定序号持续读取事件** `{events:[{seq?, event_id?, event_type, occurred_at_ms, payload}]}`：同分组+同窗口+同规则版本归入同一批次，重复扫描同段历史返回 `duplicates` 而不重复归批；持续返回每事件的 `batch_id/late/window_start_ms` 与新封存批次 |
+| GET | `/audit/batch/sources/<id>/events` | 查来源事件（`?from_seq=&to_seq=&limit=`） |
+| GET | `/audit/batch/batches` | 列批次（`?source_id=&event_type=&group_key=&status=open/sealed&batch_type=primary/supplement&limit=`） |
+| GET | `/audit/batch/batches/<id>` | **批次状态**：事件数量、序号范围、时间范围、窗口区间、内容摘要、校验值与关联通知（封存前 `checksum` 为 null） |
+| GET | `/audit/batch/batches/<id>/members` | 批次成员事件（按窗口内位置排序） |
+| POST | `/audit/batch/batches/<id>/verify` | **独立核验**：从成员重算摘要与 SHA-256 与封存冻结值比对，通过 200 `valid:true`，被篡改 409 `batch_verify_failed` 并给出首个差异路径 |
+| POST | `/audit/batch/batches/<id>/checksum` | 只重算返回当前校验值，不改写封存冻结值（open 批次亦可查） |
+| GET | `/audit/batch/late-events` | 列迟到区事件（`?source_id=&status=pending/retained/forwarded/supplemented&limit=`，含所属已封存批次与原因） |
+| POST | `/audit/batch/late-events/handle` | **处理单个迟到事件** `{source_id, event_id, action: retain/forward/supplement, note?}`：retain 保留隔离；forward 放入同分组下一个未封存窗口；supplement 立即封存只含该事件的补充批次（带 `parent_batch_id` 与独立通知）；三种方式都不改写原批次；重复处理 409 |
+| GET | `/audit/batch/notifications` | 列批次通知（`?status=pending/sent/failed&source_id=&batch_id=`），每批次至多一条 |
+| GET | `/audit/batch/notifications/<id>` | 查通知：冻结接收端列表、冻结载荷（含摘要/校验值）、尝试次数、失败原因、发送时间 |
+| POST | `/audit/batch/notifications/<id>/retry` | **发送失败恢复**：复用同一条通知重试，绝不创建第二条（已 sent 幂等回放） |
+| POST | `/audit/batch/process` | 管理/演练入口：封存所有来源到点批次并投递待发通知 |
+| POST | `/audit/batch/recover` | 重启/手工恢复：续跑未封存窗口、复位在途通知并重投待发通知（幂等，不产生重复通知） |
+| POST | `/debug/batch/events/<id>/tamper` | 演练：直接篡改成员事件载荷，随后 `/verify` 返回 409（生产关闭调试接口） |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
 | GET | `/debug/now` | 两种时钟当前读数 |

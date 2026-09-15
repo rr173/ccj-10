@@ -386,6 +386,16 @@ from .fanout import (
     FanoutError,
     FanoutManager,
 )
+from .batching import (
+    BatchBadState,
+    BatchConflict,
+    BatchError,
+    BatchManager,
+    BatchNotFound,
+    BatchRuleNotFound,
+    BatchSourceNotFound,
+    BatchVerifyFailed,
+)
 from .audit import (
     AuditBadRequest,
     AuditError,
@@ -478,6 +488,11 @@ def create_app(
     # 自有表，绝不修改其他模块的表
     fanout = FanoutManager(store)
     app.extensions["fanout"] = fanout
+    # 审计事件窗口批次聚合：按事件类型配置固定窗口/分组字段/允许迟到，
+    # 每来源独立 watermark，封存冻结成员/摘要/校验值并只创建一条多接收端
+    # 通知；只写 audit_batch_* 自有表
+    batching = BatchManager(store)
+    app.extensions["batching"] = batching
     if enable_debug_api is None:
         enable_debug_api = os.environ.get("ENABLE_DEBUG_API", "1") == "1"
 
@@ -1551,6 +1566,174 @@ def create_app(
             201 if created else 200
 
     # ------------------------------------------------------------------
+    # 审计事件窗口批次聚合
+    #
+    # 管理员按事件类型配置固定窗口时长/分组字段/允许迟到时长/通知接收端
+    # （规则版本化，切换只影响之后创建的批次）。系统从每来源独立的稳定
+    # 序号持续读取事件，同分组+同窗口+同规则版本归入同一批次；批次持续
+    # 暴露事件数量、序号范围、时间范围与内容摘要。仅当
+    # window_end + allowed_lateness <= source.watermark 时封存，封存冻结
+    # 成员/摘要/sha256 并在同事务创建唯一一条多接收端通知。成员表全局
+    # 唯一归属保证并发/重复扫描不会让事件进两个批次。迟到事件三选一
+    # 处理且绝不改写原批次。只写 audit_batch_* 自有表。
+    # ------------------------------------------------------------------
+    def _fail_delivery() -> bool:
+        # 演练故障：让本次触发的通知发送失败（封存仍成功，可事后重试）
+        return request.headers.get("X-Fail-Delivery", "").lower() in (
+            "1", "true", "yes")
+
+    # -- 聚合规则 ---------------------------------------------------------
+    @app.post("/audit/batch/rules")
+    def batch_rule_create():
+        data = body()
+        view, created = batching.configure_rule(
+            require(data, "event_type"),
+            window_ms=require(data, "window_ms"),
+            group_field=require(data, "group_field"),
+            allowed_lateness_ms=require(data, "allowed_lateness_ms"),
+            recipients=require(data, "recipients"),
+            effective_at_ms=data.get("effective_at_ms"),
+            idempotency_key=data.get("idempotency_key"),
+        )
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/batch/rules")
+    def batch_rule_list():
+        return jsonify(batching.list_rules(request.args.get("event_type")))
+
+    @app.get("/audit/batch/rules/<rule_id>")
+    def batch_rule_get(rule_id):
+        return jsonify(batching.get_rule(rule_id))
+
+    # -- 来源与 watermark -------------------------------------------------
+    @app.post("/audit/batch/sources")
+    def batch_source_create():
+        data = body()
+        view, created = batching.create_source(
+            require(data, "source_id"),
+            initial_watermark_ms=data.get("initial_watermark_ms"),
+        )
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.get("/audit/batch/sources")
+    def batch_source_list():
+        return jsonify(batching.list_sources())
+
+    @app.get("/audit/batch/sources/<source_id>")
+    def batch_source_get(source_id):
+        return jsonify(batching.get_source(source_id))
+
+    @app.post("/audit/batch/sources/<source_id>/watermark")
+    def batch_watermark(source_id):
+        # watermark 只进不退；回退 409 且不改变任何状态。推进后尝试封存
+        data = body()
+        return jsonify(batching.advance_watermark(
+            source_id, require(data, "watermark_ms"),
+            seq=data.get("seq"), fail_delivery=_fail_delivery()))
+
+    # -- 事件读取与查询 ---------------------------------------------------
+    @app.post("/audit/batch/sources/<source_id>/events/scan")
+    def batch_events_scan(source_id):
+        # 从稳定序号持续读取；重复扫描同段历史返回 duplicates 而不重复归批
+        data = body()
+        return jsonify(batching.ingest_events(
+            source_id, require(data, "events"),
+            fail_delivery=_fail_delivery()))
+
+    @app.get("/audit/batch/sources/<source_id>/events")
+    def batch_events_list(source_id):
+        return jsonify(batching.list_events(
+            source_id,
+            from_seq=request.args.get("from_seq"),
+            to_seq=request.args.get("to_seq"),
+            limit=request.args.get("limit", 1000)))
+
+    # -- 批次与成员 -------------------------------------------------------
+    @app.get("/audit/batch/batches")
+    def batch_list():
+        return jsonify(batching.list_batches(
+            source_id=request.args.get("source_id"),
+            event_type=request.args.get("event_type"),
+            group_key=request.args.get("group_key"),
+            status=request.args.get("status"),
+            batch_type=request.args.get("batch_type"),
+            limit=request.args.get("limit", 200)))
+
+    @app.get("/audit/batch/batches/<batch_id>")
+    def batch_get(batch_id):
+        return jsonify(batching.get_batch(batch_id))
+
+    @app.get("/audit/batch/batches/<batch_id>/members")
+    def batch_members(batch_id):
+        return jsonify(batching.list_members(batch_id))
+
+    @app.post("/audit/batch/batches/<batch_id>/verify")
+    def batch_verify(batch_id):
+        # 独立重算成员/摘要/校验值；被篡改返回 409 batch_verify_failed
+        return jsonify(batching.verify_batch(batch_id))
+
+    @app.post("/audit/batch/batches/<batch_id>/checksum")
+    def batch_recompute(batch_id):
+        # 只重算返回，不改写冻结值（open 批次也可查看当前值）
+        return jsonify(batching.recompute_checksum(batch_id))
+
+    # -- 迟到区 -----------------------------------------------------------
+    @app.get("/audit/batch/late-events")
+    def batch_late_list():
+        return jsonify(batching.list_late_events(
+            source_id=request.args.get("source_id"),
+            status=request.args.get("status"),
+            limit=request.args.get("limit", 200)))
+
+    @app.post("/audit/batch/late-events/handle")
+    def batch_late_handle():
+        # retain 保留隔离 / forward 放入下一未封存窗口 / supplement
+        # 只含迟到事件的补充批次（任何处理都不改写原批次）
+        data = body()
+        return jsonify(batching.handle_late_event(
+            require(data, "source_id"), require(data, "event_id"),
+            require(data, "action"), note=data.get("note"),
+            fail_delivery=_fail_delivery()))
+
+    # -- 关联通知 ---------------------------------------------------------
+    @app.get("/audit/batch/notifications")
+    def batch_notification_list():
+        return jsonify(batching.list_notifications(
+            status=request.args.get("status"),
+            source_id=request.args.get("source_id"),
+            batch_id=request.args.get("batch_id"),
+            limit=request.args.get("limit", 200)))
+
+    @app.get("/audit/batch/notifications/<notification_id>")
+    def batch_notification_get(notification_id):
+        return jsonify(batching.get_notification(notification_id))
+
+    @app.post("/audit/batch/notifications/<notification_id>/retry")
+    def batch_notification_retry(notification_id):
+        # 通知发送失败恢复：复用同一条通知，绝不创建第二条
+        return jsonify(batching.retry_notification(
+            notification_id, fail_delivery=_fail_delivery()))
+
+    @app.post("/audit/batch/process")
+    def batch_process():
+        # 管理/演练入口：封存所有来源到点批次并投递待发通知
+        return jsonify(batching.process(fail_delivery=_fail_delivery()))
+
+    @app.post("/audit/batch/recover")
+    def batch_recover():
+        # 服务重启/手工恢复：续跑未封存窗口、复位在途通知并重投
+        return jsonify(batching.recover_interrupted())
+
+    # -- 调试：直接篡改事件载荷以演示校验值可发现 -------------------------
+    @app.post("/debug/batch/events/<event_id>/tamper")
+    def debug_batch_tamper(event_id):
+        data = body()
+        return jsonify(batching.debug_tamper_event(
+            event_id, data.get("payload", {"tampered": True})))
+
+    # ------------------------------------------------------------------
     # 调试：手动驱动两种时钟，演练"拨表/逻辑卡死"故障
     # ------------------------------------------------------------------
     @app.post("/debug/tick")
@@ -1691,6 +1874,18 @@ def create_app(
         # 回执/迟到失败上报）409、接收端暂停/终止/已成功 409
         return jsonify(exc.to_response()), exc.status
 
+    @app.errorhandler(BatchSourceNotFound)
+    @app.errorhandler(BatchNotFound)
+    @app.errorhandler(BatchRuleNotFound)
+    @app.errorhandler(BatchBadState)
+    @app.errorhandler(BatchConflict)
+    @app.errorhandler(BatchVerifyFailed)
+    def _batch_error(exc: BatchError):
+        # 批次聚合显式错误：来源/批次不存在 404、无生效规则/状态前提 409、
+        # watermark 回退/序号冲突/幂等冲突 409、篡改核验失败 409；
+        # 其余参数错误（BatchError 基类）400
+        return jsonify(exc.to_response()), exc.status
+
     @app.errorhandler(GenerationTooSmall)
     def _gen_conflict(exc):
         return jsonify({"error": "generation_fence", "message": str(exc)}), 409
@@ -1779,6 +1974,11 @@ def create_app(
                 fanout.process_due_seats()
             except Exception:  # noqa: BLE001
                 app.logger.exception("席位切换期限后台结算失败")
+            try:
+                # 窗口批次：封存到点批次并发送发件箱待发通知
+                batching.process()
+            except Exception:  # noqa: BLE001
+                app.logger.exception("窗口批次后台处理失败")
 
     if start_archive_worker:
         archive.process_pending()  # 启动即续跑重启前未完成的归档
@@ -1796,6 +1996,11 @@ def create_app(
             fanout.process_due_seats()  # 重启即按原期限结算错过的切换
         except Exception:  # noqa: BLE001
             app.logger.exception("席位切换期限启动结算失败")
+        try:
+            # 重启后续跑：封存已到点的未封存窗口，重投中断的批次通知
+            batching.recover_interrupted()
+        except Exception:  # noqa: BLE001
+            app.logger.exception("窗口批次启动恢复失败")
         t = threading.Thread(target=_run_archive_worker,
                              name="archive-worker", daemon=True)
         t.start()

@@ -685,6 +685,152 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sigver_dedupe
 CREATE INDEX IF NOT EXISTS idx_sigver_key_time
     ON audit_subscription_signature_verifications(
         subscription_id, key_id, created_at_ms, event_seq);
+
+-- ===========================================================================
+-- 审计事件窗口批次聚合（只写下列 audit_batch_* 自有表，绝不修改租约/委托/
+-- 审计历史/归档/证据包/因果索引/发布计划/订阅/多端投递的任何表）
+-- ===========================================================================
+-- 事件来源：每个来源维护完全独立的稳定序号 (source_id, seq) 与 watermark。
+CREATE TABLE IF NOT EXISTS audit_batch_sources (
+    source_id         TEXT PRIMARY KEY,
+    -- 已读取的最大稳定审计序号；seq 从 1 起按来源单调分配
+    last_seq          INTEGER NOT NULL DEFAULT 0,
+    -- 事件时间水位（毫秒）：来源已确认不会再看到 occurred_at_ms < watermark
+    -- 的事件；只进不退，回退由服务层显式拒绝
+    watermark_ms      INTEGER,
+    watermark_seq     INTEGER,                  -- 推进 watermark 时对应的源序号
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL
+);
+-- 聚合规则（按事件类型版本化）：固定窗口时长 / 分组字段 / 允许迟到时长 /
+-- 通知接收端快照。同事件类型每次配置产生新的递增版本；批次冻结当时的窗口
+-- 时长、分组字段与迟到时长，因此规则切换只影响之后创建的批次。
+CREATE TABLE IF NOT EXISTS audit_batch_rules (
+    rule_id           TEXT PRIMARY KEY,
+    event_type        TEXT NOT NULL,
+    version           INTEGER NOT NULL,
+    window_ms         INTEGER NOT NULL,        -- 固定时长窗口（相对 Unix 纪元对齐）
+    group_field       TEXT NOT NULL,           -- 分组字段（点路径取事件载荷）
+    allowed_lateness_ms INTEGER NOT NULL,      -- 允许迟到时长
+    effective_at_ms   INTEGER NOT NULL,        -- 生效时间（事件发生时间 >= 该值）
+    recipients_json   TEXT NOT NULL,           -- 通知接收端冻结快照
+    created_at_ms     INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ab_rule_type_version
+    ON audit_batch_rules(event_type, version);
+CREATE INDEX IF NOT EXISTS idx_ab_rule_effective
+    ON audit_batch_rules(event_type, effective_at_ms);
+-- 审计事件（从稳定序号持续读取）：来源内序号唯一。
+CREATE TABLE IF NOT EXISTS audit_batch_events (
+    event_id          TEXT PRIMARY KEY,
+    source_id         TEXT NOT NULL,
+    seq               INTEGER NOT NULL,        -- 来源内稳定审计序号
+    event_type        TEXT NOT NULL,
+    occurred_at_ms    INTEGER NOT NULL,        -- 事件发生时间（分窗口依据）
+    ingested_at_ms    INTEGER NOT NULL,        -- 进入系统的时间（判定迟到）
+    payload_json      TEXT NOT NULL,
+    group_key         TEXT NOT NULL,
+    rule_id           TEXT NOT NULL,           -- 读取时命中的规则版本
+    UNIQUE(source_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_ab_event_source_seq
+    ON audit_batch_events(source_id, seq);
+-- 批次：同来源 + 同规则版本 + 同分组 + 同固定窗口。主批次每键至多一个；
+-- 迟到事件补充批次 (batch_type='supplement') 可多个，由成员表唯一约束防重。
+CREATE TABLE IF NOT EXISTS audit_batch_batches (
+    batch_id          TEXT PRIMARY KEY,
+    source_id         TEXT NOT NULL,
+    event_type        TEXT NOT NULL,
+    rule_id           TEXT NOT NULL,
+    group_key         TEXT NOT NULL,
+    window_start_ms   INTEGER NOT NULL,
+    window_end_ms     INTEGER NOT NULL,        -- 半开区间 [start, end)
+    allowed_lateness_ms INTEGER NOT NULL,
+    batch_type        TEXT NOT NULL DEFAULT 'primary', -- primary / supplement
+    parent_batch_id   TEXT,                    -- supplement 关联的原主批次
+    status            TEXT NOT NULL DEFAULT 'open',    -- open / sealed
+    event_count       INTEGER NOT NULL DEFAULT 0,
+    min_seq           INTEGER,
+    max_seq           INTEGER,
+    min_occurred_at_ms INTEGER,
+    max_occurred_at_ms INTEGER,
+    summary_json      TEXT,                    -- 封存时冻结的内容摘要
+    checksum          TEXT,                    -- 封存时冻结的校验值 sha256
+    checksum_alg      TEXT,
+    sealed_at_ms      INTEGER,
+    created_at_ms     INTEGER NOT NULL,
+    updated_at_ms     INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ab_batch_primary_key
+    ON audit_batch_batches(source_id, rule_id, group_key, window_start_ms)
+    WHERE batch_type='primary';
+CREATE INDEX IF NOT EXISTS idx_ab_batch_source_status
+    ON audit_batch_batches(source_id, status, window_end_ms);
+CREATE INDEX IF NOT EXISTS idx_ab_batch_parent
+    ON audit_batch_batches(parent_batch_id);
+-- 批次成员：冻结批次与事件的归属。两个唯一约束分别保证：
+--   1) 同一事件在整个系统内至多属于一个批次（并发扫描/重复处理历史安全）；
+--   2) 批次内成员顺序位置不重复。
+CREATE TABLE IF NOT EXISTS audit_batch_members (
+    batch_id          TEXT NOT NULL,
+    source_id         TEXT NOT NULL,
+    event_id          TEXT NOT NULL,
+    seq               INTEGER NOT NULL,
+    position          INTEGER NOT NULL,
+    added_at_ms       INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, event_id),
+    UNIQUE(source_id, event_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ab_member_position
+    ON audit_batch_members(batch_id, position);
+-- 补充批次成员：迟到事件已经在 audit_batch_members 里属于（或本不属于）
+-- 原窗口，不能再进主成员表的全局唯一归属约束，因此单独存放；
+-- UNIQUE(source_id,event_id) 仍保证一条迟到事件至多进一个补充批次。
+CREATE TABLE IF NOT EXISTS audit_batch_supplement_members (
+    batch_id          TEXT NOT NULL,
+    source_id         TEXT NOT NULL,
+    event_id          TEXT NOT NULL,
+    seq               INTEGER NOT NULL,
+    position          INTEGER NOT NULL,
+    added_at_ms       INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, event_id),
+    UNIQUE(source_id, event_id)
+);
+-- 迟到区：封存之后才到达（或属于已封存窗口）的事件在此隔离，等待管理员
+-- 三选一处理：retain 保留隔离 / forward 放入下一未封存窗口 / supplement
+-- 生成只含迟到事件的补充批次。任何处理都不改写原批次。
+CREATE TABLE IF NOT EXISTS audit_batch_late_events (
+    source_id         TEXT NOT NULL,
+    event_id          TEXT NOT NULL,
+    -- pending 待处理 / retained 保留隔离 / forwarded 已并入后续窗口 /
+    -- supplemented 已进补充批次 / discarded 放弃
+    status            TEXT NOT NULL DEFAULT 'pending',
+    sealed_batch_id   TEXT,                    -- 到达时已封存的所属窗口批次
+    target_batch_id   TEXT,                    -- forward/supplement 的去向批次
+    reason            TEXT,                    -- sealed_after_arrival 等
+    handled_at_ms     INTEGER,
+    note              TEXT,
+    PRIMARY KEY (source_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ab_late_status
+    ON audit_batch_late_events(status, source_id);
+-- 关联通知（事务发件箱模式）：封存与通知创建在同一事务，但批次只关联
+-- 唯一一条通知（UNIQUE(batch_id)）。通知冻结接收端列表，发送在事务外
+-- 进行；发送失败可重试，绝不产生第二条通知。
+CREATE TABLE IF NOT EXISTS audit_batch_notifications (
+    notification_id   TEXT PRIMARY KEY,
+    batch_id          TEXT NOT NULL,
+    recipients_json   TEXT NOT NULL,           -- 冻结的多接收端列表
+    payload_json      TEXT NOT NULL,           -- 冻结的通知内容（含摘要/校验值）
+    status            TEXT NOT NULL DEFAULT 'pending', -- pending/sent/failed
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT,
+    created_at_ms     INTEGER NOT NULL,
+    sent_at_ms        INTEGER,
+    UNIQUE(batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ab_notification_status
+    ON audit_batch_notifications(status);
 """
 
 
