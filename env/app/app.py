@@ -271,6 +271,27 @@
                                         暂停已成功接收端不改变完成结论）
   POST   /audit/fanout/notifications/<id>/recipients/<rid>/resume
                                         恢复接收端（幂等）
+  投递席位（seats 替代 recipients：每个席位冻结有序候选——第 1 位主接收端、
+  其余按顺序备用——与切换期限 switch_after_ms；主接收端期限内成功则席位
+  立即成功且永不启用备用；期限到达或管理员手动放弃时按顺序启用下一位；
+  同一席位无论切换多少次只贡献一次成功；候选全部失败/被放弃则席位终止，
+  参与原送达策略可满足性判定；被替换接收端的迟到回执 409 明确拒绝；
+  回执与超时/手动切换并发时先结算者赢，后到者 409 带胜负信息）：
+  POST   /audit/fanout/notifications/process-deadlines
+                                        管理/演练：结算全部到期的切换期限
+  GET    /audit/fanout/notifications/<id>/seats
+                                        全部席位：当前处理人/下一位备用/
+                                        切换期限/最近切换原因
+  GET    /audit/fanout/notifications/<id>/seats/<sid>
+                                        单席位状态（含全部候选与期限）
+  GET    /audit/fanout/notifications/<id>/seats/<sid>/history
+                                        席位完整历史（启用/替换原因/回执
+                                        受理与拒绝/失败/席位成败）
+  POST   /audit/fanout/notifications/<id>/seats/<sid>/switch
+                                        手动放弃当前接收端 {reason?,
+                                        expected_recipient_id?,
+                                        idempotency_key?}；同键重放 200，
+                                        席位已成功/已终止 409（带胜负信息）
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
   POST   /debug/tick           手动推进逻辑钟
   POST   /debug/wall-shift     拨墙钟（可正可负）
@@ -1417,12 +1438,16 @@ def create_app(
 
     @app.post("/audit/fanout/notifications")
     def fanout_notification_create():
-        # 创建通知并冻结策略快照：{payload, recipients:[{recipient_id,
-        # max_attempts?} | "<rid>"], policy_version?（缺省当前策略）}
+        # 创建通知并冻结策略快照：{payload, policy_version?（缺省当前策略）,
+        # recipients:[{recipient_id, max_attempts?} | "<rid>"] 或
+        # seats:[{seat_id?, switch_after_ms,
+        #         candidates:[{recipient_id, max_attempts?} | "<rid>", ...]}]}
+        # （二选一；席位冻结有序候选与切换期限）
         data = body()
         view = fanout.create_notification(
             payload=data.get("payload"),
             recipients=data.get("recipients"),
+            seats=data.get("seats"),
             policy_version=data.get("policy_version"),
         )
         return jsonify(view), 201
@@ -1485,6 +1510,45 @@ def create_app(
     def fanout_resume(notification_id, recipient_id):
         # 恢复接收端（幂等）
         return jsonify(fanout.resume_recipient(notification_id, recipient_id))
+
+    # -- 投递席位：有序备用接收端 + 切换期限 -------------------------------
+    @app.post("/audit/fanout/notifications/process-deadlines")
+    def fanout_process_deadlines():
+        # 管理/演练入口：结算全部到期的切换期限（超时启用下一位备用）。
+        # 后台 worker 与各席位接口的惰性结算走同一路径，结果一致
+        return jsonify(fanout.process_due_seats())
+
+    @app.get("/audit/fanout/notifications/<notification_id>/seats")
+    def fanout_seat_list(notification_id):
+        # 全部席位：当前由谁处理、下一位备用、切换期限、最近切换原因
+        return jsonify(fanout.list_seats(notification_id))
+
+    @app.get("/audit/fanout/notifications/<notification_id>/seats/<seat_id>")
+    def fanout_seat_get(notification_id, seat_id):
+        # 单席位状态：当前候选/下一位备用/期限/全部候选状态
+        return jsonify(fanout.get_seat(notification_id, seat_id))
+
+    @app.get("/audit/fanout/notifications/<notification_id>/seats/<seat_id>/history")
+    def fanout_seat_history(notification_id, seat_id):
+        # 席位完整历史：启用/替换（含原因）/回执受理与拒绝/失败/席位成败
+        return jsonify(fanout.seat_history(
+            notification_id, seat_id,
+            limit=request.args.get("limit", 200)))
+
+    @app.post("/audit/fanout/notifications/<notification_id>/seats/<seat_id>/switch")
+    def fanout_seat_switch(notification_id, seat_id):
+        # 手动放弃当前接收端，按顺序启用下一位备用：
+        # {reason?, expected_recipient_id?, idempotency_key?}
+        # 同幂等键重放 200；席位已成功/已终止/通知已终态 409（带胜负信息）；
+        # expected_recipient_id 与当前接收端不符 409（他人已先切换）
+        data = body()
+        view, created = fanout.switch_seat(
+            notification_id, seat_id,
+            reason=data.get("reason"),
+            expected_recipient_id=data.get("expected_recipient_id"),
+            idempotency_key=data.get("idempotency_key"))
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
 
     # ------------------------------------------------------------------
     # 调试：手动驱动两种时钟，演练"拨表/逻辑卡死"故障
@@ -1710,6 +1774,11 @@ def create_app(
                 subscriptions.process_due()
             except Exception:  # noqa: BLE001
                 app.logger.exception("审计订阅后台处理失败")
+            try:
+                # 投递席位：结算到期的切换期限，按顺序启用下一位备用
+                fanout.process_due_seats()
+            except Exception:  # noqa: BLE001
+                app.logger.exception("席位切换期限后台结算失败")
 
     if start_archive_worker:
         archive.process_pending()  # 启动即续跑重启前未完成的归档
@@ -1723,6 +1792,10 @@ def create_app(
             subscriptions.process_due()
         except Exception:  # noqa: BLE001
             app.logger.exception("审计订阅启动恢复失败")
+        try:
+            fanout.process_due_seats()  # 重启即按原期限结算错过的切换
+        except Exception:  # noqa: BLE001
+            app.logger.exception("席位切换期限启动结算失败")
         t = threading.Thread(target=_run_archive_worker,
                              name="archive-worker", daemon=True)
         t.start()

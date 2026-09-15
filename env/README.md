@@ -1002,6 +1002,52 @@ POST /audit/index-releases
 记录。策略、快照、尝试顺序、幂等记录与最终判定全部落库，进程重启后
 原样保留。
 
+### 投递席位：有序备用接收端 + 切换期限
+
+创建通知时可以用 `seats` 替代扁平的 `recipients`（二选一）。每个
+**投递席位**在创建时冻结一份**有序候选列表**（第 1 位是主接收端，其余
+按顺序为备用接收端，各自可带自己的 `max_attempts`）与**切换期限**
+`switch_after_ms`（当前接收端的处理时长上限）：
+
+```json
+{"payload": {...},
+ "seats": [{"seat_id": "s1", "switch_after_ms": 30000,
+            "candidates": ["primary", {"recipient_id": "backup-1",
+                                       "max_attempts": 2}, "backup-2"]}]}
+```
+
+- 席位先由主接收端处理；主接收端在期限内成功，席位**立即成功**，备用
+  接收端永远不再启用（对已成功席位的切换请求一律 409
+  `fanout_seat_succeeded`）。
+- 期限到达（超时）或管理员手动放弃当前接收端时，系统按顺序启用下一位
+  备用接收端，并以启用时刻重算 `deadline_at_ms = now +
+  switch_after_ms`。同一席位无论切换多少次，最多只给整条通知贡献
+  **一次**成功（完成判定读的是席位状态）。
+- 被替换接收端之后到达的回执/失败上报一律 409
+  `fanout_candidate_superseded` 明确拒绝并记入席位历史，绝不算到当前
+  席位；响应带**胜负信息** `winner`（赢的是哪次成功回执，或哪次切换及
+  其原因与接任者），调用方能据此判断输赢。
+- 当前接收端的成功回执与超时/手动切换并发时，进程锁把两个请求串行化，
+  **先结算者赢**：期限是硬边界（`deadline_at_ms <= now` 一律算超时
+  赢），后到者收到带胜负信息的 409 冲突。
+- 候选失败达到自己的 `max_attempts` 也会被替换（原因
+  `candidate_failed`）并自动启用下一位。一个席位的所有候选都失败或
+  被放弃后，席位进入终止态 `exhausted`，参与原送达策略是否还能满足的
+  判定：仍可能成功的席位数（`席位总数 - 已终止数`）低于冻结的所需
+  成功数时，整条通知明确失败，判定快照冻结每个席位与其候选当时的
+  状态。
+
+管理员视图与操作：`GET .../seats` / `GET .../seats/<sid>` 给出每个席位
+当前由谁处理、下一位备用接收端、切换期限与剩余时间、最近一次切换原因；
+`GET .../seats/<sid>/history` 给出完整历史（启用/替换及原因/回执受理与
+拒绝/失败/席位成败）；`POST .../seats/<sid>/switch` 手动放弃当前接收端
+（`{reason?, expected_recipient_id?, idempotency_key?}`，同幂等键重放
+200，`expected_recipient_id` 与当前接收端不符时 409 防止并发误切）。
+期限结算有三条结果一致的路径：后台 worker、`POST
+/audit/fanout/notifications/process-deadlines` 显式触发、各席位相关
+接口的惰性结算。期限以绝对墙钟落库，**服务重启后按原期限继续**，切换
+历史原样保留。
+
 ## 持久性
 
 SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库中包含：
@@ -1024,7 +1070,8 @@ pending/inflight/awaiting_confirm/confirmed/dead_letter/discarded 状态机、
 尝试次数与退避时刻、失败与死信原因、认领令牌、冻结通知载荷与签名、
 版本操作幂等日志、订阅审计历史）**、
 **审计通知多端投递（策略版本、通知冻结策略快照、接收端集合与状态、
-逐次尝试记录、回执幂等记录与终态判定快照）**、
+逐次尝试记录、回执幂等记录与终态判定快照；投递席位的有序候选、
+切换期限、切换原因与完整历史、手动切换幂等记录）**、
 逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
 正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放，
 **审计回放、节点比较与一致性诊断对同一份历史给出逐字节一致的结果**；
@@ -1032,7 +1079,9 @@ pending/inflight/awaiting_confirm/confirmed/dead_letter/discarded 状态机、
 增量派生生成（暂停中的派生任务不会被自动续跑），
 **错过生效时间的版本发布计划在启动时立即发布（失败保留原因，可 retry）**，
 **订阅在启动时回收崩溃残留的认领行并从已保存游标与退避时刻继续，
-不丢事件、不重复确认**。
+不丢事件、不重复确认**，
+**投递席位在启动时即按原期限结算错过的切换，切换历史与回执幂等记录
+原样保留**。
 旧版本数据库会在启动时自动补列迁移。
 逻辑钟由后台 ticker 每秒 +1（每次推进都 fsync 落库）。
 
@@ -1126,13 +1175,18 @@ pending/inflight/awaiting_confirm/confirmed/dead_letter/discarded 状态机、
 | POST | `/audit/subscriptions/process` | 管理/演练：扫描入队 + 到点投递各跑一轮，返回 `{enqueued, delivered}` |
 | POST | `/audit/fanout/policies` | **创建送达策略**（每次创建产生新的递增版本）：`{mode: all\|any\|quorum, quorum_count?}` |
 | GET | `/audit/fanout/policies` | 列策略版本（version 升序）；`/audit/fanout/policies/current` 查当前版本，`/audit/fanout/policies/<version>` 查指定版本 |
-| POST | `/audit/fanout/notifications` | **创建通知并冻结策略快照**：`{payload, recipients:[{recipient_id, max_attempts?}], policy_version?}`；冻结接收端集合/所需成功数/策略版本，之后改策略只影响新通知 |
+| POST | `/audit/fanout/notifications` | **创建通知并冻结策略快照**：`{payload, policy_version?, recipients:[{recipient_id, max_attempts?}]}` 或 `{payload, policy_version?, seats:[{seat_id?, switch_after_ms, candidates:[...]}]}`（二选一）；冻结接收端集合/席位候选与期限/所需成功数/策略版本，之后改策略只影响新通知 |
 | GET | `/audit/fanout/notifications` | 列通知（`?status=pending/completed/failed&limit=`，带进度摘要） |
-| GET | `/audit/fanout/notifications/<id>` | **送达状态**：冻结快照、每个接收端尝试次数/最后结果/暂停标记、离完成还差多少、终态判定快照 |
+| GET | `/audit/fanout/notifications/<id>` | **送达状态**：冻结快照、每个接收端尝试次数/最后结果/暂停标记（或每个席位当前处理人/备用/期限）、离完成还差多少、终态判定快照 |
 | GET | `/audit/fanout/notifications/<id>/attempts` | 整条通知的尝试记录（全局顺序）；`.../recipients/<rid>/attempts` 查单接收端 |
-| POST | `/audit/fanout/notifications/<id>/receipts` | **成功回执** `{recipient_id, idempotency_key, content?}`：同键同内容 200 回放首次结果，同键不同内容 409，通知已终态 409（迟到不能翻案），接收端暂停/终止 409 |
-| POST | `/audit/fanout/notifications/<id>/recipients/<rid>/failures` | **失败重试** `{detail?}`：记一次失败尝试，达到该接收端 `max_attempts` 进入终止态；策略不再可能满足时整条通知明确失败 |
+| POST | `/audit/fanout/notifications/<id>/receipts` | **成功回执** `{recipient_id, idempotency_key, content?}`：同键同内容 200 回放首次结果，同键不同内容 409，通知已终态 409（迟到不能翻案），接收端暂停/终止 409；席位通知里被替换接收端的迟到回执 409 `fanout_candidate_superseded`（带胜负信息） |
+| POST | `/audit/fanout/notifications/<id>/recipients/<rid>/failures` | **失败重试** `{detail?}`：记一次失败尝试，达到该接收端 `max_attempts` 进入终止态（席位候选则自动启用下一位备用）；策略不再可能满足时整条通知明确失败 |
 | POST | `/audit/fanout/notifications/<id>/recipients/<rid>/pause` / `/resume` | 暂停/恢复接收端（均幂等；不改状态与计数，暂停已成功接收端不改变完成结论） |
+| POST | `/audit/fanout/notifications/process-deadlines` | **结算全部到期的切换期限**（超时按顺序启用下一位备用；与后台 worker、接口惰性结算同一路径） |
+| GET | `/audit/fanout/notifications/<id>/seats` | **全部席位状态**：当前处理人、下一位备用、切换期限与剩余时间、最近切换原因 |
+| GET | `/audit/fanout/notifications/<id>/seats/<sid>` | 单席位状态（含全部候选的期限/状态/替换原因） |
+| GET | `/audit/fanout/notifications/<id>/seats/<sid>/history` | **席位完整历史**：启用/替换（含原因）/回执受理与拒绝/失败/席位成败 |
+| POST | `/audit/fanout/notifications/<id>/seats/<sid>/switch` | **手动放弃当前接收端** `{reason?, expected_recipient_id?, idempotency_key?}`：按顺序启用下一位备用；同键重放 200，席位已成功/已终止 409（带胜负信息），期望接收端不符 409 |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
 | GET | `/debug/now` | 两种时钟当前读数 |
