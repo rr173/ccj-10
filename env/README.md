@@ -956,6 +956,52 @@ POST /audit/index-releases
   `audit_subscription_deliveries` 两张自有表，对租约、委托、原始审计
   历史、因果索引、归档、证据包与发布计划**只读 SELECT，绝不改写**。
 
+## 审计通知多端投递（audit notification fan-out）
+
+一条审计通知可以同时投递给多个**独立接收端**，何时算完成由通知创建时
+**冻结的送达策略快照**决定：冻结内容包含接收端集合（含每个接收端自己的
+`max_attempts`）、所需成功数与策略版本；之后修改策略（创建新版本）只影响
+新通知，在途通知永远按自己的快照判定。
+
+### 三种完成模式与明确失败
+
+- `all`：冻结集合里的接收端全部成功才算完成；
+- `any`：任一接收端成功即完成；
+- `quorum`：成功数达到策略的 `quorum_count` 即完成。
+
+每次状态变化后在锁内按冻结快照重估：仍可能成功的接收端数
+（`总数 - 已终止数`）一旦低于所需成功数，策略**永远不可能满足**，整条
+通知立即置为 `failed`，并把判定快照 `decision`（原因 + 参与判定的每个
+接收端当时的状态/尝试次数/最后结果）冻结落库。判定是终态：迟到回执与
+迟到失败上报一律 409 `fanout_notification_decided`，不能复活已失败的
+通知，也不能改动已完成的通知。
+
+### 接收端生命周期、暂停/恢复
+
+`pending → succeeded`（成功回执）或 `pending → terminal_failed`
+（失败重试达到该接收端自己的 `max_attempts`）。失败可以重试，每次失败
+上报记一次尝试。管理员可暂停/恢复某个接收端（均幂等）：暂停只是拒收新
+回执与失败上报（409 `fanout_recipient_paused`），不改状态、不减计数——
+**暂停已成功的接收端改变不了既有完成结论**（成功计数读的是 `state`，
+不是 `paused`），暂停也不会让策略变得不可满足（被暂停的接收端可以恢复）。
+
+### 回执幂等
+
+成功回执按 `(notification_id, recipient_id, idempotency_key)` 幂等：
+相同回执重复到达只返回首次处理结果（200 回放，不重复计尝试，即使通知
+此后已终态）；同一幂等键配不同内容返回 409 `fanout_receipt_conflict`
+并给出首个差异位置；接收端已成功后又来新键回执，不重复计尝试，返回
+等效成功结果（`already_succeeded`）。
+
+### 送达状态与尝试记录
+
+`GET /audit/fanout/notifications/<id>` 返回冻结快照、每个接收端的尝试
+次数/最后结果/暂停标记、离完成还差多少（`progress.remaining_successes`）、
+策略是否仍可能满足（`progress.satisfiable`）与终态判定快照；
+`.../attempts` 与 `.../recipients/<rid>/attempts` 按顺序给出逐次尝试
+记录。策略、快照、尝试顺序、幂等记录与最终判定全部落库，进程重启后
+原样保留。
+
 ## 持久性
 
 SQLite（WAL 模式）存放在 `DB_PATH`（容器内 `/data/leases.db`），库中包含：
@@ -977,6 +1023,8 @@ scheduled/active/cancelled/failed 状态机与可解释失败原因）**、
 pending/inflight/awaiting_confirm/confirmed/dead_letter/discarded 状态机、
 尝试次数与退避时刻、失败与死信原因、认领令牌、冻结通知载荷与签名、
 版本操作幂等日志、订阅审计历史）**、
+**审计通知多端投递（策略版本、通知冻结策略快照、接收端集合与状态、
+逐次尝试记录、回执幂等记录与终态判定快照）**、
 逻辑钟读数和墙钟偏移。进程/容器重启后全部恢复，
 正在生效的租约与委托不会丢失，历史与审计顺序保持一致，转移结果仍可幂等回放，
 **审计回放、节点比较与一致性诊断对同一份历史给出逐字节一致的结果**；
@@ -1076,6 +1124,15 @@ pending/inflight/awaiting_confirm/confirmed/dead_letter/discarded 状态机、
 | POST | `/audit/subscriptions/<id>/versions/<v>/retry-dead-letters` | 只重试该版本死信（`{idempotency_key}`；回放首次结果，换目标 409） |
 | GET | `/audit/subscriptions/<id>/history` | 订阅自己的审计历史（只追加；`?after_id=&event=&limit=`） |
 | POST | `/audit/subscriptions/process` | 管理/演练：扫描入队 + 到点投递各跑一轮，返回 `{enqueued, delivered}` |
+| POST | `/audit/fanout/policies` | **创建送达策略**（每次创建产生新的递增版本）：`{mode: all\|any\|quorum, quorum_count?}` |
+| GET | `/audit/fanout/policies` | 列策略版本（version 升序）；`/audit/fanout/policies/current` 查当前版本，`/audit/fanout/policies/<version>` 查指定版本 |
+| POST | `/audit/fanout/notifications` | **创建通知并冻结策略快照**：`{payload, recipients:[{recipient_id, max_attempts?}], policy_version?}`；冻结接收端集合/所需成功数/策略版本，之后改策略只影响新通知 |
+| GET | `/audit/fanout/notifications` | 列通知（`?status=pending/completed/failed&limit=`，带进度摘要） |
+| GET | `/audit/fanout/notifications/<id>` | **送达状态**：冻结快照、每个接收端尝试次数/最后结果/暂停标记、离完成还差多少、终态判定快照 |
+| GET | `/audit/fanout/notifications/<id>/attempts` | 整条通知的尝试记录（全局顺序）；`.../recipients/<rid>/attempts` 查单接收端 |
+| POST | `/audit/fanout/notifications/<id>/receipts` | **成功回执** `{recipient_id, idempotency_key, content?}`：同键同内容 200 回放首次结果，同键不同内容 409，通知已终态 409（迟到不能翻案），接收端暂停/终止 409 |
+| POST | `/audit/fanout/notifications/<id>/recipients/<rid>/failures` | **失败重试** `{detail?}`：记一次失败尝试，达到该接收端 `max_attempts` 进入终止态；策略不再可能满足时整条通知明确失败 |
+| POST | `/audit/fanout/notifications/<id>/recipients/<rid>/pause` / `/resume` | 暂停/恢复接收端（均幂等；不改状态与计数，暂停已成功接收端不改变完成结论） |
 | POST | `/debug/tick` | 手动推进逻辑钟 `{steps?}` |
 | POST | `/debug/wall-shift` | 演练拨表 `{delta_ms}`（偏移持久化） |
 | GET | `/debug/now` | 两种时钟当前读数 |

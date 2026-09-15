@@ -232,6 +232,45 @@
                                                 （只追加；?after_id=
                                                  &event=&limit=）
   POST   /audit/subscriptions/process           管理/演练：扫描入队+投递一轮
+审计通知多端投递（只写 audit_fanout_* 自有表，绝不修改租约、委托、审计
+历史、归档、证据包、因果索引、发布计划或订阅投递；一条通知同时投递给
+多个独立接收端，创建时冻结送达策略快照——接收端集合、所需成功数、策略
+版本——之后修改策略只影响新通知）：
+  POST   /audit/fanout/policies         创建送达策略（每次创建产生新的递增
+                                        版本）{mode: all|any|quorum,
+                                        quorum_count?}
+  GET    /audit/fanout/policies         列策略版本（version 升序）
+  GET    /audit/fanout/policies/current 当前（最新）策略
+  GET    /audit/fanout/policies/<version>
+                                        指定版本策略
+  POST   /audit/fanout/notifications    创建通知并冻结策略快照
+                                        {payload, recipients:[{recipient_id,
+                                        max_attempts?}], policy_version?}
+  GET    /audit/fanout/notifications    列通知（?status=&limit=）
+  GET    /audit/fanout/notifications/<id>
+                                        送达状态：冻结快照、每个接收端尝试
+                                        次数/最后结果/暂停标记、离完成还差
+                                        多少、终态判定快照
+  GET    /audit/fanout/notifications/<id>/attempts
+                                        整条通知的尝试记录（全局顺序）
+  GET    /audit/fanout/notifications/<id>/recipients/<rid>/attempts
+                                        单接收端尝试记录（按第几次排序）
+  POST   /audit/fanout/notifications/<id>/receipts
+                                        成功回执 {recipient_id,
+                                        idempotency_key, content?}
+                                        同键同内容 → 200 回放首次结果；
+                                        同键不同内容 → 409；通知已终态 →
+                                        409（迟到回执不能翻案）
+  POST   /audit/fanout/notifications/<id>/recipients/<rid>/failures
+                                        失败重试 {detail?}：记一次失败尝试，
+                                        达到该接收端自己的 max_attempts 进入
+                                        终止态；策略不再可能满足时整条通知
+                                        明确失败并冻结参与判定的接收端状态
+  POST   /audit/fanout/notifications/<id>/recipients/<rid>/pause
+                                        暂停接收端（幂等；不改状态/计数，
+                                        暂停已成功接收端不改变完成结论）
+  POST   /audit/fanout/notifications/<id>/recipients/<rid>/resume
+                                        恢复接收端（幂等）
 调试/演练故障用（生产可通过 ENABLE_DEBUG_API=0 关闭）：
   POST   /debug/tick           手动推进逻辑钟
   POST   /debug/wall-shift     拨墙钟（可正可负）
@@ -322,6 +361,10 @@ from .key_rotation import (
     KeyRotationRangeError,
     KeyVerificationNotFound,
 )
+from .fanout import (
+    FanoutError,
+    FanoutManager,
+)
 from .audit import (
     AuditBadRequest,
     AuditError,
@@ -409,6 +452,11 @@ def create_app(
     key_rotation = KeyRotationManager(store, subscriptions)
     subscriptions.attach_key_rotation(key_rotation)
     app.extensions["key_rotation"] = key_rotation
+    # 审计通知多端投递：创建通知时冻结送达策略快照（接收端集合/所需成功
+    # 数/策略版本），按冻结快照判定完成或明确失败；只写 audit_fanout_*
+    # 自有表，绝不修改其他模块的表
+    fanout = FanoutManager(store)
+    app.extensions["fanout"] = fanout
     if enable_debug_api is None:
         enable_debug_api = os.environ.get("ENABLE_DEBUG_API", "1") == "1"
 
@@ -1335,6 +1383,110 @@ def create_app(
         return jsonify({"enqueued": enqueued, "delivered": delivered})
 
     # ------------------------------------------------------------------
+    # 审计通知多端投递
+    #
+    # 一条通知同时投递给多个独立接收端，创建时冻结送达策略快照（接收端
+    # 集合、所需成功数、策略版本），之后修改策略只影响新通知。完成判定
+    # 只认冻结快照：all 全部成功 / any 任一成功 / quorum 达到指定人数；
+    # 仍可能成功的接收端数低于所需成功数时整条通知明确失败并冻结参与
+    # 判定的接收端状态。回执按 (通知, 接收端, 幂等键) 幂等，失败可按
+    # 每个接收端自己的上限重试。只写 audit_fanout_* 自有表。
+    # ------------------------------------------------------------------
+    @app.post("/audit/fanout/policies")
+    def fanout_policy_create():
+        # 创建送达策略：每次创建产生新的递增版本（修改策略 = 新版本）
+        data = body()
+        view = fanout.create_policy(
+            mode=data.get("mode"),
+            quorum_count=data.get("quorum_count"),
+        )
+        return jsonify(view), 201
+
+    @app.get("/audit/fanout/policies")
+    def fanout_policy_list():
+        return jsonify(fanout.list_policies(
+            limit=request.args.get("limit", 100)))
+
+    @app.get("/audit/fanout/policies/current")
+    def fanout_policy_current():
+        return jsonify(fanout.current_policy())
+
+    @app.get("/audit/fanout/policies/<int:version>")
+    def fanout_policy_get(version):
+        return jsonify(fanout.get_policy(version))
+
+    @app.post("/audit/fanout/notifications")
+    def fanout_notification_create():
+        # 创建通知并冻结策略快照：{payload, recipients:[{recipient_id,
+        # max_attempts?} | "<rid>"], policy_version?（缺省当前策略）}
+        data = body()
+        view = fanout.create_notification(
+            payload=data.get("payload"),
+            recipients=data.get("recipients"),
+            policy_version=data.get("policy_version"),
+        )
+        return jsonify(view), 201
+
+    @app.get("/audit/fanout/notifications")
+    def fanout_notification_list():
+        return jsonify(fanout.list_notifications(
+            status=request.args.get("status"),
+            limit=request.args.get("limit", 100)))
+
+    @app.get("/audit/fanout/notifications/<notification_id>")
+    def fanout_notification_get(notification_id):
+        # 送达状态：冻结快照、每个接收端尝试次数/最后结果/暂停标记、
+        # 离完成还差多少、终态判定快照
+        return jsonify(fanout.get_notification(notification_id))
+
+    @app.get("/audit/fanout/notifications/<notification_id>/attempts")
+    def fanout_attempts_all(notification_id):
+        # 整条通知的尝试记录（全局顺序）
+        return jsonify(fanout.list_attempts(
+            notification_id, limit=request.args.get("limit", 1000)))
+
+    @app.get("/audit/fanout/notifications/<notification_id>/recipients/<recipient_id>/attempts")
+    def fanout_attempts_recipient(notification_id, recipient_id):
+        # 单接收端尝试记录（按第几次尝试排序）
+        return jsonify(fanout.list_attempts(
+            notification_id, recipient_id,
+            limit=request.args.get("limit", 1000)))
+
+    @app.post("/audit/fanout/notifications/<notification_id>/receipts")
+    def fanout_receipt(notification_id):
+        # 成功回执 {recipient_id, idempotency_key, content?}：
+        # 同键同内容 → 200 回放首次结果；同键不同内容 → 409；
+        # 通知已终态 → 409（迟到回执不能翻案）
+        data = body()
+        view, created = fanout.submit_receipt(
+            notification_id,
+            recipient_id=data.get("recipient_id"),
+            idempotency_key=data.get("idempotency_key"),
+            content=data.get("content"),
+        )
+        return jsonify({**view, "replayed": not created}), \
+            201 if created else 200
+
+    @app.post("/audit/fanout/notifications/<notification_id>/recipients/<recipient_id>/failures")
+    def fanout_failure(notification_id, recipient_id):
+        # 失败重试 {detail?}：记一次失败尝试，达到该接收端自己的
+        # max_attempts 进入终止态；策略不再可能满足时整条通知明确失败
+        data = body()
+        return jsonify(fanout.record_failure(
+            notification_id, recipient_id, detail=data.get("detail")))
+
+    @app.post("/audit/fanout/notifications/<notification_id>/recipients/<recipient_id>/pause")
+    def fanout_pause(notification_id, recipient_id):
+        # 暂停接收端（幂等）：拒收新回执/失败上报；不改状态与计数，
+        # 暂停已成功的接收端改变不了既有完成结论
+        return jsonify(fanout.pause_recipient(notification_id, recipient_id))
+
+    @app.post("/audit/fanout/notifications/<notification_id>/recipients/<recipient_id>/resume")
+    def fanout_resume(notification_id, recipient_id):
+        # 恢复接收端（幂等）
+        return jsonify(fanout.resume_recipient(notification_id, recipient_id))
+
+    # ------------------------------------------------------------------
     # 调试：手动驱动两种时钟，演练"拨表/逻辑卡死"故障
     # ------------------------------------------------------------------
     @app.post("/debug/tick")
@@ -1466,6 +1618,13 @@ def create_app(
     def _key_rotation_error(exc):
         # 签名密钥轮换显式错误：密钥/验证不存在 404、幂等冲突/跨命名空间
         # 409、状态前提 409、生效序号越过稳定历史 416
+        return jsonify(exc.to_response()), exc.status
+
+    @app.errorhandler(FanoutError)
+    def _fanout_error(exc):
+        # 多端投递显式错误（基类注册，子类按 MRO 命中）：策略/通知/接收端
+        # 不存在 404、无当前策略 409、幂等键冲突 409、通知已终态（迟到
+        # 回执/迟到失败上报）409、接收端暂停/终止/已成功 409
         return jsonify(exc.to_response()), exc.status
 
     @app.errorhandler(GenerationTooSmall)
